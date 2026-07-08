@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "dbx-dispatch"
+  },
+  "targets": {
+    "dbx-dispatch": {
+      "hosting": {
+        "dbx-dispatch": [
+          "dbx-dispatch"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}

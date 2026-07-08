@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Dispatch users: email/password login via the dispatch app ──
+    function isDispatch() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider != "anonymous";
+    }
+
+    // ── Any authenticated user (dispatch OR driver anonymous auth) ──
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // ── Orders ──────────────────────────────────────────────────────
+    // Dispatch: full access
+    // Drivers (phone app): read assigned orders + update POD/status
+    match /orders/{id} {
+      allow read: if isAuth();
+      allow create, delete: if isDispatch();
+      allow update: if isAuth(); // drivers update status + POD fields
+    }
+
+    // ── Drivers ─────────────────────────────────────────────────────
+    // Dispatch: full access
+    // Drivers (phone app): read-only (for login lookup)
+    match /drivers/{id} {
+      allow read: if isAuth();
+      allow write: if isDispatch();
+    }
+
+    // ── Events ──────────────────────────────────────────────────────
+    // Dispatch: full access
+    // Drivers (phone app): read-only (event selection at clock-in)
+    match /events/{id} {
+      allow read: if isAuth();
+      allow write: if isDispatch();
+    }
+
+    // ── Trucks ──────────────────────────────────────────────────────
+    match /trucks/{id} {
+      allow read: if isAuth();
+      allow write: if isDispatch();
+    }
+
+    // ── Trailers ────────────────────────────────────────────────────
+    match /trailers/{id} {
+      allow read: if isAuth();
+      allow write: if isDispatch();
+    }
+
+    // ── Company Documents ────────────────────────────────────────────
+    // Drivers can read their own compliance docs on the phone app
+    match /company_docs/{id} {
+      allow read: if isAuth();
+      allow write: if isDispatch();
+    }
+
+    // ── Employees ───────────────────────────────────────────────────
+    // Phone app writes its own profile on registration
+    // Dispatch reads/manages all employee records
+    match /employees/{id} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Sessions ────────────────────────────────────────────────────
+    // Phone app manages its own login sessions (PIN verification)
+    match /sessions/{id} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Timesheets ──────────────────────────────────────────────────
+    // Drivers submit their own hours; dispatch reads and manages all
+    match /timesheets/{id} {
+      allow read, write: if isAuth();
+    }
+
+    // ── Clients ─────────────────────────────────────────────────────
+    // Dispatch only — contains rate schedules, contacts, pricing
+    // Drivers should never see client rate data
+    match /clients/{id} {
+      allow read, write: if isDispatch();
+    }
+
+    // ── Locations ───────────────────────────────────────────────────
+    // Dispatch only — contains client location data and km rates
+    match /locations/{id} {
+      allow read, write: if isDispatch();
+    }
+
+    // ── Quotes ──────────────────────────────────────────────────────
+    match /quotes/{id} {
+      allow read, write: if isDispatch();
+    }
+
+    // ── Catch-all ───────────────────────────────────────────────────
+    // Any collection not explicitly listed above requires dispatch auth
+    match /{document=**} {
+      allow read, write: if isDispatch();
+    }
+
+  }
+}
