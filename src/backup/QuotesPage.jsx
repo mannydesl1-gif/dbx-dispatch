@@ -99,6 +99,17 @@ export default function QuotesPage({ clients: clientsProp }) {
 
   useEffect(() => { loadAll(); }, []);
 
+  // Fetch rates whenever form opens or total currency changes
+  useEffect(() => {
+    if(form && Object.keys(fxRates).length === 0) {
+      fetchRates();
+    }
+  }, [form]);
+
+  useEffect(() => {
+    if(form) fetchRates();
+  }, [form?.totalCurrency]);
+
   const loadAll = async () => {
     setLoading(true);
     try {
@@ -128,6 +139,7 @@ export default function QuotesPage({ clients: clientsProp }) {
     quoteNum: nextQuoteNum(),
     divId: "us",
     currency: "USD",
+    totalCurrency: "USD",
     cliId: "",
     cliName: "", cliStreet: "", cliCity: "", cliProvState: "", cliPostalZip: "", cliCountry: "",
     cliContact: "", cliPhone: "", cliEmail: "",
@@ -219,10 +231,12 @@ export default function QuotesPage({ clients: clientsProp }) {
   const generatePDF = async (quoteData) => {
     const f = quoteData || form;
     const div = DIVISIONS.find(d=>d.id===f.divId)||DIVISIONS[0];
-    const cur = f.currency || (f.divId==="us"?"USD":"CAD");
+    const lineCur = f.currency || (f.divId==="us"?"USD":"CAD"); // default for line items
+    const cur = f.totalCurrency || lineCur;                     // grand total currency
     const sym = symFor(cur);
-    const byCurPDF = subtotalByCurrency(f.lines||[], cur);
-    const multiCur = Object.keys(byCurPDF).length > 1;
+    const byCurPDF = subtotalByCurrency(f.lines||[], lineCur);
+    const needsConv = Object.keys(byCurPDF).length > 1 || (Object.keys(byCurPDF).length === 1 && Object.keys(byCurPDF)[0] !== cur);
+    const multiCur = needsConv;
 
     // Fetch live FX rates if multi-currency
     let rates = {};
@@ -579,14 +593,20 @@ export default function QuotesPage({ clients: clientsProp }) {
 
   // ── FORM VIEW ──
   const div = DIVISIONS.find(d=>d.id===form.divId)||DIVISIONS[0];
-  const fcur = form.currency || (form.divId==="us"?"USD":"CAD");
+  const fcur = form.currency || (form.divId==="us"?"USD":"CAD");  // default for line items
+  const totalCur = form.totalCurrency || fcur;                    // grand total currency only
   const fsym = symFor(fcur);
+  const tsym = symFor(totalCur);
   const byCur = subtotalByCurrency(form.lines||[], fcur);
-  const isMulti = Object.keys(byCur).length > 1;
+  const needsConversion = Object.keys(byCur).length > 1 || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== totalCur);
+  const taxRate = parseFloat(form.taxRate)||0;
+  const otherAmt = parseFloat(form.other)||0;
+  const convertedSub = needsConversion && Object.keys(fxRates).length
+    ? convertToTarget(byCur, totalCur, fxRates)
+    : Object.values(byCur).reduce((a,v)=>a+v, 0);
+  const taxAmt = convertedSub !== null ? convertedSub * (taxRate/100) : 0;
+  const total = convertedSub !== null ? convertedSub + taxAmt + otherAmt : null;
   const sub = subtotal(form.lines||[]);
-  const taxAmt = sub*(parseFloat(form.taxRate)||0)/100;
-  const other = parseFloat(form.other)||0;
-  const total = sub+taxAmt+other;
 
   return (
     <div style={{padding:20,maxWidth:900}}>
@@ -614,7 +634,7 @@ export default function QuotesPage({ clients: clientsProp }) {
           <label style={sLbl}>Division</label>
           <div style={{display:"flex",gap:8}}>
             {DIVISIONS.map(d=>(
-              <button key={d.id} onClick={()=>{setF("divId",d.id);setF("currency",d.id==="us"?"USD":"CAD");}} style={{flex:1,padding:"8px",borderRadius:6,border:`1px solid ${form.divId===d.id?T.red:T.border}`,background:form.divId===d.id?T.redDim:"transparent",color:form.divId===d.id?T.red:T.muted,fontSize:11,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
+              <button key={d.id} onClick={()=>{setF("divId",d.id);setF("currency",d.id==="us"?"USD":"CAD");setF("totalCurrency",d.id==="us"?"USD":"CAD");}} style={{flex:1,padding:"8px",borderRadius:6,border:`1px solid ${form.divId===d.id?T.red:T.border}`,background:form.divId===d.id?T.redDim:"transparent",color:form.divId===d.id?T.red:T.muted,fontSize:11,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
                 {d.short}
               </button>
             ))}
@@ -788,14 +808,17 @@ export default function QuotesPage({ clients: clientsProp }) {
           {/* Quote total currency selector */}
           <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,flexShrink:0}}>Total Currency</span>
-            <select style={{...sIn,flex:1,fontSize:11}} value={form.currency||"USD"} onChange={e=>setF("currency",e.target.value)}>
+            <select style={{...sIn,flex:1,fontSize:11}} value={form.totalCurrency||fcur} onChange={e=>setF("totalCurrency",e.target.value)}>
               {CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}
             </select>
           </div>
-          {isMulti && <div style={{fontSize:10,color:"#f97316",marginBottom:6,fontStyle:"italic"}}>⚠ Multiple currencies — grand total requires conversion (fetched on PDF)</div>}
+          {needsConversion && fxLoading && <div style={{fontSize:10,color:T.muted,marginBottom:6,fontStyle:"italic"}}>⏳ Fetching live rates...</div>}
+          {needsConversion && !fxLoading && fxDate && <div style={{fontSize:10,color:T.dim,marginBottom:6,fontStyle:"italic"}}>Rate as of {fxDate}</div>}
           <div style={{borderTop:`2px solid ${T.border}`,paddingTop:10,display:"flex",justifyContent:"space-between"}}>
-            <span style={{fontSize:14,fontWeight:700,color:T.text}}>TOTAL ({fcur})</span>
-            <span style={{fontSize:18,fontWeight:800,color:T.green}}>{isMulti?"~":""}{fsym}{total.toFixed(2)}</span>
+            <span style={{fontSize:14,fontWeight:700,color:T.text}}>TOTAL ({totalCur})</span>
+            <span style={{fontSize:18,fontWeight:800,color:T.green}}>
+              {fxLoading ? "..." : total !== null ? `${tsym}${total.toFixed(2)}` : "—"}
+            </span>
           </div>
         </div>
       </div>
