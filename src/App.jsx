@@ -2012,12 +2012,12 @@ function OrderEdit({data, db, savOrd, go}) {
 
 // ═══ ASSIGN ORDER ═══
 function AssignOrder({o:io, db, savOrd, go}) {
-  const emptyDriver = {drvId:"",drvName:"",drvEmail:"",drvPhone:"",trkId:"",trkUnit:"",trkPlate:"",trlId:"",trlUnit:"",trlPlate:""};
-  const [primary, setPrimary] = useState({drvId:io.drvId||"",drvName:io.drvName||"",drvEmail:io.drvEmail||"",drvPhone:io.drvPhone||"",trkId:io.trkId||"",trkUnit:io.trkUnit||"",trkPlate:io.trkPlate||"",trlId:io.trlId||"",trlUnit:io.trlUnit||"",trlPlate:io.trlPlate||"",pushToApp:io.pushToApp===true});
-  const [extras, setExtras] = useState(io.extraDrivers||[]);
-  const [sendDriverEmail, setSendDriverEmail] = useState(!!io.drvEmail);
+  const emptyDriver = {drvId:"",drvName:"",drvEmail:"",drvPhone:"",trkId:"",trkUnit:"",trkPlate:"",trlId:"",trlUnit:"",trlPlate:"",sendEmail:false};
+  const [primary, setPrimary] = useState({drvId:io.drvId||"",drvName:io.drvName||"",drvEmail:io.drvEmail||"",drvPhone:io.drvPhone||"",trkId:io.trkId||"",trkUnit:io.trkUnit||"",trkPlate:io.trkPlate||"",trlId:io.trlId||"",trlUnit:io.trlUnit||"",trlPlate:io.trlPlate||"",pushToApp:io.pushToApp===true,sendEmail:io.sendEmail!==undefined?io.sendEmail:!!io.drvEmail});
+  const [extras, setExtras] = useState((io.extraDrivers||[]).map(e=>({...e,sendEmail:e.sendEmail!==undefined?e.sendEmail:!!e.drvEmail})));
   const [emailSending, setEmailSending] = useState(false);
   const [emailStatus, setEmailStatus] = useState(""); // "sent" | "failed" | ""
+  const [sentTo, setSentTo] = useState([]); // list of addresses actually emailed
 
   const setP = (k,v) => setPrimary(p=>({...p,[k]:v}));
   const setE = (i,k,v) => setExtras(ex=>ex.map((e,j)=>j===i?{...e,[k]:v}:e));
@@ -2033,45 +2033,77 @@ function AssignOrder({o:io, db, savOrd, go}) {
       <div style={{fontSize:11,fontWeight:600,color:T.muted}}>{label}</div>
       {onRemove && <button onClick={onRemove} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:12,fontWeight:700}}>✕ Remove</button>}
     </div>
-    <Field l="Driver"><select style={sIn} value={drv.drvId} onChange={e=>{const d=db.drivers.find(x=>x.id===e.target.value);setDrv("drvId",e.target.value);setDrv("drvName",d?.name||"");setDrv("drvEmail",d?.email||"");setDrv("drvPhone",d?.phone||"");if(onDriverChange)onDriverChange(d);}}><option value="">Select driver...</option>{drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
+    <Field l="Driver"><select style={sIn} value={drv.drvId} onChange={e=>{const d=db.drivers.find(x=>x.id===e.target.value);setDrv("drvId",e.target.value);setDrv("drvName",d?.name||"");setDrv("drvEmail",d?.email||"");setDrv("drvPhone",d?.phone||"");setDrv("sendEmail",!!(d?.email));if(onDriverChange)onDriverChange(d);}}><option value="">Select driver...</option>{drivers.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></Field>
     <Field l="Truck"><select style={sIn} value={drv.trkId} onChange={e=>{const t=trucks.find(x=>x.id===e.target.value);setDrv("trkId",e.target.value);setDrv("trkUnit",t?.unit||"");setDrv("trkPlate",t?.plate||"")}}><option value="">Select truck...</option>{trucks.map(t=><option key={t.id} value={t.id}>{t.unit} — {t.plate}</option>)}</select></Field>
     <Field l="Trailer"><select style={sIn} value={drv.trlId} onChange={e=>{const t=trailers.find(x=>x.id===e.target.value);setDrv("trlId",e.target.value);setDrv("trlUnit",t?.unit||"");setDrv("trlPlate",t?.plate||"")}}><option value="">Select trailer...</option>{trailers.map(t=><option key={t.id} value={t.id}>{t.unit}{t.plate?` — ${t.plate}`:""}</option>)}</select></Field>
+    {/* Per-driver email toggle */}
+    <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginTop:8,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
+      <div>
+        <div style={{fontSize:12,fontWeight:600,color:T.text}}>✉️ Email this driver</div>
+        <div style={{fontSize:11,color:T.muted,marginTop:2}}>{drv.drvEmail ? `Send BOL to ${drv.drvEmail}` : "No email on file for this driver"}</div>
+      </div>
+      <label style={{display:"flex",alignItems:"center",gap:8,cursor:drv.drvEmail?"pointer":"default"}}>
+        <input type="checkbox" checked={!!drv.sendEmail && !!drv.drvEmail} disabled={!drv.drvEmail}
+          onChange={e=>setDrv("sendEmail",e.target.checked)}
+          style={{width:18,height:18,accentColor:T.red,cursor:drv.drvEmail?"pointer":"not-allowed"}}/>
+        <span style={{fontSize:12,color:drv.drvEmail?T.muted:T.dim}}>{drv.sendEmail&&drv.drvEmail?"Yes":"No"}</span>
+      </label>
+    </div>
   </div>;
 
   const save = async () => {
-    // If email is checked, confirm before sending — you can't unsend it
-    if (sendDriverEmail && primary.drvEmail) {
+    const allDrivers = [primary, ...extras];
+    // Drivers flagged for email that actually have an address
+    const emailTargets = allDrivers.filter(d=>d.sendEmail && d.drvEmail);
+
+    // Confirm before sending — you can't unsend it
+    if (emailTargets.length > 0) {
+      const list = emailTargets.map(d=>`• ${d.drvName||"Driver"} — ${d.drvEmail}`).join("\n");
       const ok = window.confirm(
-        `Send BOL ${io.bol} assignment by email to ${primary.drvEmail}?\n\nThis will email the driver immediately.`
+        `Send BOL ${io.bol} assignment by email to:\n\n${list}\n\nThis will email ${emailTargets.length===1?"this driver":"these drivers"} immediately.`
       );
       if (!ok) return;
     }
-    const allDrivers = [primary, ...extras];
+
     const saved = {...io, ...primary, extraDrivers:extras, status:"assigned",
       drvName: allDrivers.filter(d=>d.drvName).map(d=>d.drvName).join(", ")
     };
     savOrd(saved);
-    // Send assignment email to driver if requested
-    if (sendDriverEmail && primary.drvEmail) {
+
+    // Send an assignment email to each toggled driver individually
+    if (emailTargets.length > 0) {
       setEmailSending(true);
-      try {
-        const senderEmail = auth?.currentUser?.email || REPORTS_EMAIL;
-        await fetch(CF_URLS.sendBolEmail, {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({
-            order: saved,
-            toEmail: primary.drvEmail,
-            senderEmail,
-            subject: `Your assignment — BOL ${io.bol}`,
-            includePod: false,
-            includeAttachments: false,
-          })
-        });
-        setEmailStatus("sent");
-        // Navigate back to order after short delay so the success banner is visible
-        setTimeout(() => go("od", saved), 1500);
-      } catch(e) { console.error("Driver email failed:", e); setEmailStatus("failed"); }
+      const senderEmail = auth?.currentUser?.email || REPORTS_EMAIL;
+      const okSent = [];
+      const failed = [];
+      // driverIndex matches position in [primary, ...extras] so each BOL shows the right unit
+      for (let i = 0; i < allDrivers.length; i++) {
+        const d = allDrivers[i];
+        if (!(d.sendEmail && d.drvEmail)) continue;
+        try {
+          await fetch(CF_URLS.sendBolEmail, {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({
+              order: saved,
+              toEmail: d.drvEmail,
+              driverIndex: i,
+              senderEmail,
+              subject: `Your assignment — BOL ${io.bol}`,
+              includePod: false,
+              includeAttachments: false,
+            })
+          });
+          okSent.push(d.drvEmail);
+        } catch(e) {
+          console.error(`Driver email failed for ${d.drvEmail}:`, e);
+          failed.push(d.drvEmail);
+        }
+      }
+      setSentTo(okSent);
+      setEmailStatus(failed.length===0 ? "sent" : (okSent.length>0 ? "partial" : "failed"));
       setEmailSending(false);
+      // Navigate back to order after short delay so the success banner is visible
+      setTimeout(() => go("od", saved), 1500);
     } else {
       // No email — navigate back to order detail immediately
       go("od", saved);
@@ -2083,7 +2115,7 @@ function AssignOrder({o:io, db, savOrd, go}) {
       <button onClick={()=>go("od",io)} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",display:"flex"}}><Ic n="back"/></button>
       <h1 style={{fontSize:18,fontWeight:700,margin:0}}>Assign BOL {io.bol}</h1>
     </div>
-    <DriverRow drv={primary} setDrv={setP} label="Driver 1 (Primary)" onDriverChange={d=>setSendDriverEmail(!!(d?.email))}/>
+    <DriverRow drv={primary} setDrv={setP} label="Driver 1 (Primary)"/>
     {extras.map((e,i)=><DriverRow key={i} drv={e} setDrv={(k,v)=>setE(i,k,v)} label={`Driver ${i+2}`} onRemove={()=>removeDriver(i)}/>)}
     <button onClick={addDriver} style={{...bS,marginBottom:14,width:"100%",textAlign:"center"}}>+ Add Another Driver</button>
 
@@ -2098,21 +2130,6 @@ function AssignOrder({o:io, db, savOrd, go}) {
         <span style={{fontSize:12,color:T.muted}}>{primary.pushToApp?"Yes":"No"}</span>
       </label>
     </div>
-    {/* Send to driver by email */}
-    <div style={{...sCrd,marginBottom:14,display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-      <div>
-        <div style={{fontSize:13,fontWeight:600,color:T.text}}>✉️ Send Assignment to Driver</div>
-        <div style={{fontSize:11,color:T.muted,marginTop:2}}>
-          {primary.drvEmail ? `Email BOL to ${primary.drvEmail}` : "Select a driver with an email address"}
-        </div>
-      </div>
-      <label style={{display:"flex",alignItems:"center",gap:8,cursor:primary.drvEmail?"pointer":"default"}}>
-        <input type="checkbox" checked={sendDriverEmail && !!primary.drvEmail} disabled={!primary.drvEmail}
-          onChange={e=>setSendDriverEmail(e.target.checked)}
-          style={{width:18,height:18,accentColor:T.red,cursor:primary.drvEmail?"pointer":"not-allowed"}}/>
-        <span style={{fontSize:12,color:primary.drvEmail?T.muted:T.dim}}>{sendDriverEmail&&primary.drvEmail?"Yes":"No"}</span>
-      </label>
-    </div>
     <div style={{display:"flex",gap:8}}>
       <button style={{...sBtn,background:"#3b82f6",opacity:emailSending?0.7:1}} onClick={save} disabled={emailSending}>
         <Ic n="check" s={13}/> {emailSending?"Sending...":"Assign"}
@@ -2120,8 +2137,9 @@ function AssignOrder({o:io, db, savOrd, go}) {
       {io.drvId && <button style={{...sBtn,background:"#64748b"}} onClick={()=>savOrd({...io,drvId:"",drvName:"",drvEmail:"",trkId:"",trkUnit:"",trkPlate:"",trlId:"",trlUnit:"",trlPlate:"",extraDrivers:[],status:"unassigned"})}>Unassign All</button>}
       <button style={bS} onClick={()=>go("od",io)}>Cancel</button>
     </div>
-    {emailStatus==="sent" && <div style={{marginTop:10,padding:"8px 12px",background:"rgba(34,197,94,0.1)",border:"1px solid #22c55e",borderRadius:6,fontSize:12,color:"#15803d",fontWeight:500}}>✅ Assignment email sent to {primary.drvEmail}</div>}
-    {emailStatus==="failed" && <div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:6,fontSize:12,color:"#dc2626",fontWeight:500}}>⚠️ Email failed — check driver email address and try again</div>}
+    {emailStatus==="sent" && <div style={{marginTop:10,padding:"8px 12px",background:"rgba(34,197,94,0.1)",border:"1px solid #22c55e",borderRadius:6,fontSize:12,color:"#15803d",fontWeight:500}}>✅ Assignment email sent to {sentTo.join(", ")}</div>}
+    {emailStatus==="partial" && <div style={{marginTop:10,padding:"8px 12px",background:"rgba(245,158,11,0.1)",border:"1px solid #f59e0b",borderRadius:6,fontSize:12,color:"#b45309",fontWeight:500}}>⚠️ Sent to {sentTo.join(", ")}, but some emails failed — check addresses and re-send.</div>}
+    {emailStatus==="failed" && <div style={{marginTop:10,padding:"8px 12px",background:"rgba(239,68,68,0.1)",border:"1px solid #ef4444",borderRadius:6,fontSize:12,color:"#dc2626",fontWeight:500}}>⚠️ Email failed — check driver email addresses and try again</div>}
   </div>;
 }
 

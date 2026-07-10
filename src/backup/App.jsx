@@ -9,6 +9,7 @@ const CompanyDocsPage = lazy(() => import("./CompanyDocsPage.jsx"));
 const MobileApp = lazy(() => import("./MobileApp.jsx"));
 const EventsPage = lazy(() => import("./EventsPage.jsx"));
 const QuotesPage = lazy(() => import("./QuotesPage.jsx"));
+const IFTAPage = lazy(() => import("./IFTAPage.jsx"));
 import { APP_NAME, APP_VERSION, COMPANY_NAME, DIVISIONS, ACCT_EMAILS as CFG_ACCT_EMAILS, REPORTS_EMAIL, CLOUD_FUNCTIONS, BOL_COMPANY_LABEL } from "./client.config.js";
 
 // ═══ CLOUD FUNCTION URLS (2nd Gen) ═══
@@ -843,7 +844,7 @@ export default function App() {
   }).sort((a,b)=>new Date(b.created)-new Date(a.created));
 
   const cnt = s => dbData.orders.filter(o=>o.status===s).length;
-  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"cl",l:"Clients",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"eq",l:"Equipment",i:"truck"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"ts",l:"Timesheets",i:"calendar"},{id:"sf",l:"Safety",i:"shield"},{id:"ev",l:"Events",i:"calendar"},{id:"qt",l:"Quotes",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sr",l:"Search",i:"search"},{id:"cd",l:"Documents",i:"file"},{id:"ed",l:"Employee Docs",i:"users"}];
+  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"cl",l:"Clients",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"eq",l:"Equipment",i:"truck"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"ts",l:"Timesheets",i:"calendar"},{id:"sf",l:"Safety",i:"shield"},{id:"ifta",l:"IFTA Fuel Tax",i:"chart"},{id:"ev",l:"Events",i:"calendar"},{id:"qt",l:"Quotes",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sr",l:"Search",i:"search"},{id:"cd",l:"Documents",i:"file"},{id:"ed",l:"Employee Docs",i:"users"}];
   const isOrd = pg.startsWith("o");
 
 
@@ -954,6 +955,7 @@ export default function App() {
         {pg==="ed" && <EmployeeDocsPage/>}
         {pg==="rp" && <ReportsPage db={dbData} go={go}/>}
         {pg==="qt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]}/></Suspense>}
+        {pg==="ifta" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><IFTAPage/></Suspense>}
         {pg==="eq" && <EquipPage db={dbData} saveColl={saveColl}/>}
         {pg==="pp" && <PapsParsPage db={dbData} savOrd={savOrd}/>}
       </main>
