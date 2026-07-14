@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from "react";
 import { db } from "./firebase.js";
 import {
   collection, getDocs, addDoc, updateDoc, deleteDoc,
-  doc, setDoc, getDoc, query, orderBy, where
+  doc, setDoc, getDoc, query, orderBy, where, limit, writeBatch
 } from "firebase/firestore";
 import * as XLSX from "xlsx";
 import { jsPDF } from "jspdf";
@@ -1085,6 +1085,86 @@ function FuelCardsTab() {
 }
 
 // ── Main IFTA Page ───────────────────────────────────────────────────────────
+// ── Firestore persistence helpers ────────────────────────────────────────────
+// Each quarter's upload data is stored in iftaUploads/{docId}
+// docId format: "Q2_2026_nomad_can", "Q2_2026_geotab", "Q2_2026_adjustments" etc.
+// Firestore docs have a 1MB limit, so we chunk large arrays (Geotab can have 1400+ rows)
+
+const CHUNK_SIZE = 200; // records per chunk doc
+
+function uploadDocId(quarter, type) {
+  return `${quarter.replace(/\s/g,"_")}_${type}`;
+}
+
+async function saveUploadData(quarter, type, data) {
+  // Store metadata doc + chunked array docs
+  const baseId = uploadDocId(quarter, type);
+  // Delete existing chunks first
+  const existingSnap = await getDocs(
+    query(collection(db,"iftaUploads"), where("baseId","==",baseId))
+  );
+  const batch = writeBatch(db);
+  existingSnap.docs.forEach(d => batch.delete(d.ref));
+  await batch.commit();
+
+  if (!data || (Array.isArray(data) && data.length === 0)) return;
+
+  if (Array.isArray(data) && data.length > CHUNK_SIZE) {
+    // Chunked storage
+    const chunks = [];
+    for (let i = 0; i < data.length; i += CHUNK_SIZE) {
+      chunks.push(data.slice(i, i + CHUNK_SIZE));
+    }
+    const batch2 = writeBatch(db);
+    chunks.forEach((chunk, ci) => {
+      const ref = doc(collection(db,"iftaUploads"), `${baseId}_chunk${ci}`);
+      batch2.set(ref, { baseId, quarter, type, chunkIndex: ci, totalChunks: chunks.length, data: chunk, savedAt: new Date().toISOString() });
+    });
+    // Metadata doc
+    batch2.set(doc(collection(db,"iftaUploads"), baseId), {
+      baseId, quarter, type, isChunked: true, totalChunks: chunks.length,
+      recordCount: data.length, savedAt: new Date().toISOString()
+    });
+    await batch2.commit();
+  } else {
+    // Single doc storage
+    await setDoc(doc(db,"iftaUploads", baseId), {
+      baseId, quarter, type, isChunked: false,
+      data, recordCount: Array.isArray(data) ? data.length : 1,
+      savedAt: new Date().toISOString()
+    });
+  }
+}
+
+async function loadUploadData(quarter, type) {
+  const baseId = uploadDocId(quarter, type);
+  const metaSnap = await getDoc(doc(db,"iftaUploads", baseId));
+  if (!metaSnap.exists()) return null;
+  const meta = metaSnap.data();
+  if (!meta.isChunked) return meta.data;
+
+  // Re-assemble chunks
+  const chunks = new Array(meta.totalChunks).fill(null);
+  const chunkSnap = await getDocs(
+    query(collection(db,"iftaUploads"), where("baseId","==",baseId), where("chunkIndex",">=",0))
+  );
+  chunkSnap.docs.forEach(d => {
+    const {chunkIndex, data} = d.data();
+    if (chunkIndex != null) chunks[chunkIndex] = data;
+  });
+  return chunks.flat().filter(Boolean);
+}
+
+async function listSavedQuarters() {
+  // Find all quarters that have at least a geotab or nomad upload
+  const snap = await getDocs(
+    query(collection(db,"iftaUploads"), where("type","in",["nomad_can","nomad_usa","geotab","adjustments"]))
+  );
+  const quarters = new Set();
+  snap.docs.forEach(d => { if(d.data().quarter) quarters.add(d.data().quarter); });
+  return [...quarters].sort().reverse();
+}
+
 export default function IFTAPage() {
   const [tab, setTab] = useState("guide"); // guide | upload | report | history | setup
 
@@ -1094,6 +1174,8 @@ export default function IFTAPage() {
   const [busyNomad, setBusyNomad] = useState(false);
   const [busyGeotab, setBusyGeotab] = useState(false);
   const [uploadMsg, setUploadMsg] = useState(null);
+  const [loading, setLoading] = useState(true); // loading persisted data on mount
+  const [savedQuarters, setSavedQuarters] = useState([]); // quarters with saved uploads
   const [quarter, setQuarter] = useState(() => {
     const now = new Date();
     const q = Math.ceil((now.getMonth()+1)/3);
@@ -1111,31 +1193,57 @@ export default function IFTAPage() {
   // History
   const [history, setHistory] = useState([]);
 
-  // Load fuel card map, history, and live rates on mount
+  // Load everything on mount — fuel cards, history, rates, AND persisted uploads
   useEffect(() => {
-    getDocs(collection(db,"iftaFuelCards"))
-      .then(snap => setFuelCardMap(snap.docs.map(d=>({id:d.id,...d.data()}))))
-      .catch(console.error);
-    getDocs(query(collection(db,"iftaReports")))
-      .then(snap => {
-        const docs = snap.docs.map(d=>({id:d.id,...d.data()}));
-        docs.sort((a,b)=>(b.savedAt||"").localeCompare(a.savedAt||""));
-        setHistory(docs);
-      })
-      .catch(console.error);
-    // Load live rates from Firestore — each doc is one quarter
-    getDocs(collection(db,"iftaRates"))
-      .then(snap => {
+    const init = async () => {
+      setLoading(true);
+      try {
+        // Fuel cards
+        const fcSnap = await getDocs(collection(db,"iftaFuelCards"));
+        setFuelCardMap(fcSnap.docs.map(d=>({id:d.id,...d.data()})));
+
+        // Report history
+        const repSnap = await getDocs(query(collection(db,"iftaReports")));
+        const repDocs = repSnap.docs.map(d=>({id:d.id,...d.data()}));
+        repDocs.sort((a,b)=>(b.savedAt||"").localeCompare(a.savedAt||""));
+        setHistory(repDocs);
+
+        // Live rates
+        const ratesSnap = await getDocs(collection(db,"iftaRates"));
         const rates={}, surch={};
-        snap.docs.forEach(d => {
+        ratesSnap.docs.forEach(d => {
           const data = d.data();
-          if (data.quarter && data.rates)     rates[data.quarter]  = data.rates;
+          if (data.quarter && data.rates)      rates[data.quarter] = data.rates;
           if (data.quarter && data.surcharges) surch[data.quarter] = data.surcharges;
         });
         setLiveRates(rates);
         setLiveSurch(surch);
-      })
-      .catch(console.error);
+
+        // Saved upload quarters
+        const savedQs = await listSavedQuarters();
+        setSavedQuarters(savedQs);
+
+        // Auto-load most recent quarter's uploads if available
+        if (savedQs.length > 0) {
+          const mostRecent = savedQs[0];
+          setQuarter(mostRecent);
+          const [canTx, usaTx, geoRecs, savedAdj] = await Promise.all([
+            loadUploadData(mostRecent, "nomad_can"),
+            loadUploadData(mostRecent, "nomad_usa"),
+            loadUploadData(mostRecent, "geotab"),
+            loadUploadData(mostRecent, "adjustments"),
+          ]);
+          const files = [];
+          if (canTx) files.push({name:"Nomad CAN (saved)", transactions:canTx, errors:[], isCAN:true});
+          if (usaTx) files.push({name:"Nomad USA (saved)", transactions:usaTx, errors:[], isCAN:false});
+          if (files.length) setNomadFiles(files);
+          if (geoRecs) setGeotabData({name:"Geotab (saved)", records:geoRecs, errors:[]});
+          if (savedAdj) setAdjustments(savedAdj);
+        }
+      } catch(e) { console.error("IFTA init error:", e); }
+      setLoading(false);
+    };
+    init();
   }, []);
 
   // Recalculate whenever uploads change
@@ -1157,11 +1265,20 @@ export default function IFTAPage() {
         setBusyNomad(false); return;
       }
       const parsed = parseNomadFile(wb, fuelCardMap);
-      setNomadFiles(prev => {
-        const others = prev.filter(f=>f.name!==file.name);
-        return [...others, {...parsed, name:file.name}];
-      });
-      setUploadMsg({ok:true, text:`✅ "${file.name}" — ${parsed.transactions.length} diesel transactions imported${parsed.errors.length>0?`, ${parsed.errors.length} unmatched (check report tab)`:"."}`});
+      const updatedFiles = [...nomadFiles.filter(f=>f.name!==file.name),
+        {...parsed, name:file.name}];
+      setNomadFiles(updatedFiles);
+
+      // Persist to Firestore by quarter
+      const type = parsed.isCAN ? "nomad_can" : "nomad_usa";
+      await saveUploadData(quarter, type, parsed.transactions);
+      // Persist errors separately (unmatched list)
+      if (parsed.errors.length > 0) {
+        await saveUploadData(quarter, `${type}_errors`, parsed.errors);
+      }
+      setSavedQuarters(prev => prev.includes(quarter) ? prev : [quarter, ...prev]);
+
+      setUploadMsg({ok:true, text:`✅ "${file.name}" — ${parsed.transactions.length} diesel transactions imported and saved${parsed.errors.length>0?`, ${parsed.errors.length} unmatched`:""}.`});
       setTab("report");
     } catch(e) {
       setUploadMsg({ok:false, text:"Failed to parse file: "+e.message});
@@ -1180,7 +1297,10 @@ export default function IFTAPage() {
       }
       const parsed = parseGeotabFile(wb);
       setGeotabData({...parsed, name:file.name});
-      setUploadMsg({ok:true, text:`✅ "${file.name}" — ${parsed.records.length} jurisdiction records across ${new Set(parsed.records.map(r=>r.truckUnit)).size} vehicles.`});
+      // Persist to Firestore
+      await saveUploadData(quarter, "geotab", parsed.records);
+      setSavedQuarters(prev => prev.includes(quarter) ? prev : [quarter, ...prev]);
+      setUploadMsg({ok:true, text:`✅ "${file.name}" — ${parsed.records.length} jurisdiction records across ${new Set(parsed.records.map(r=>r.truckUnit)).size} vehicles saved permanently.`});
       setTab("report");
     } catch(e) {
       setUploadMsg({ok:false, text:"Failed to parse file: "+e.message});
@@ -1220,27 +1340,99 @@ export default function IFTAPage() {
   };
 
   const setAdj = (truckUnit, field, value) => {
-    setAdjustments(prev=>({...prev, [truckUnit]:{...(prev[truckUnit]||{}), [field]:value}}));
+    setAdjustments(prev => {
+      const next = {...prev, [truckUnit]:{...(prev[truckUnit]||{}), [field]:value}};
+      // Persist adjustments async (don't block UI)
+      saveUploadData(quarter, "adjustments", next).catch(console.error);
+      return next;
+    });
+  };
+
+  // Switch to a different quarter and load its saved data
+  const switchQuarter = async (q) => {
+    setQuarter(q);
+    setNomadFiles([]);
+    setGeotabData(null);
+    setAdjustments({});
+    setResults([]);
+    try {
+      const [canTx, usaTx, geoRecs, savedAdj] = await Promise.all([
+        loadUploadData(q, "nomad_can"),
+        loadUploadData(q, "nomad_usa"),
+        loadUploadData(q, "geotab"),
+        loadUploadData(q, "adjustments"),
+      ]);
+      const files = [];
+      if (canTx) files.push({name:"Nomad CAN (saved)", transactions:canTx, errors:[], isCAN:true});
+      if (usaTx) files.push({name:"Nomad USA (saved)", transactions:usaTx, errors:[], isCAN:false});
+      if (files.length) setNomadFiles(files);
+      if (geoRecs) setGeotabData({name:"Geotab (saved)", records:geoRecs, errors:[]});
+      if (savedAdj) setAdjustments(savedAdj);
+    } catch(e) { console.error("Quarter switch error:", e); }
   };
 
   return (
     <div style={{padding:24, maxWidth:1400, margin:"0 auto"}}>
+
+      {/* Loading overlay */}
+      {loading && (
+        <div style={{position:"fixed",inset:0,background:"rgba(2,8,23,0.85)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",zIndex:2000}}>
+          <div style={{fontSize:32,marginBottom:12}}>⏳</div>
+          <div style={{fontSize:15,fontWeight:700,color:T.text}}>Loading your IFTA data...</div>
+          <div style={{fontSize:12,color:T.muted,marginTop:6}}>Restoring uploads from Firestore</div>
+        </div>
+      )}
       {/* Page header */}
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20,flexWrap:"wrap",gap:12}}>
         <div>
           <h1 style={{fontSize:20,fontWeight:700,color:T.text,margin:0}}>IFTA</h1>
-          <div style={{fontSize:13,color:T.muted,marginTop:2}}>Quarterly fuel tax reporting — upload Nomad + Geotab exports</div>
+          <div style={{fontSize:13,color:T.muted,marginTop:2}}>Quarterly fuel tax reporting — data saved automatically, available anytime</div>
         </div>
-        <div style={{display:"flex",gap:8,alignItems:"center"}}>
-          <label style={{fontSize:11,color:T.muted}}>Quarter:</label>
-          <input value={quarter} onChange={e=>setQuarter(e.target.value)}
-            style={{...sIn, width:100, padding:"6px 10px", fontSize:12}} placeholder="Q2 2026"/>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          {/* Quarter selector — shows saved quarters as options */}
+          <div style={{display:"flex",alignItems:"center",gap:6,background:T.card,border:`1px solid ${T.border}`,borderRadius:8,padding:"4px 10px"}}>
+            <span style={{fontSize:11,color:T.muted,whiteSpace:"nowrap"}}>Quarter:</span>
+            <select value={quarter} onChange={e=>switchQuarter(e.target.value)}
+              style={{background:"transparent",border:"none",color:T.text,fontFamily:"inherit",fontSize:13,fontWeight:700,cursor:"pointer",outline:"none",minWidth:80}}>
+              {/* Always show current quarter, plus all saved ones */}
+              {[...new Set([quarter,...savedQuarters])].sort().reverse().map(q=>(
+                <option key={q} value={q} style={{background:T.card}}>
+                  {q}{savedQuarters.includes(q)?" ✓":""}
+                </option>
+              ))}
+            </select>
+            {savedQuarters.includes(quarter)
+              ? <span style={{fontSize:10,color:T.green,fontWeight:700}}>● SAVED</span>
+              : <span style={{fontSize:10,color:T.dim}}>not saved yet</span>}
+          </div>
+          {/* New quarter button */}
+          <button onClick={()=>{
+            const q = prompt("Enter new quarter name (e.g. Q3 2026):");
+            if(q?.trim()) switchQuarter(q.trim());
+          }} style={{padding:"6px 12px",borderRadius:8,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,fontSize:11,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>
+            + New Quarter
+          </button>
           {results.length>0 && <>
             <button onClick={()=>exportIFTAPDF(results,quarter,allErrors.length)} style={sBtn()}>📄 Export PDF</button>
             <button onClick={saveReport} style={{...sBtn("#0ea5e9")}}>💾 Save Report</button>
           </>}
         </div>
       </div>
+
+      {/* Saved quarters quick-access strip */}
+      {savedQuarters.length > 0 && (
+        <div style={{display:"flex",gap:8,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+          <span style={{fontSize:11,color:T.dim,whiteSpace:"nowrap"}}>Saved quarters:</span>
+          {savedQuarters.map(q=>(
+            <button key={q} onClick={()=>switchQuarter(q)} style={{
+              padding:"4px 12px",borderRadius:20,border:`1px solid ${q===quarter?T.red:T.border}`,
+              background:q===quarter?T.redDim:"transparent",
+              color:q===quarter?T.red:T.muted,fontSize:11,fontWeight:q===quarter?700:400,
+              cursor:"pointer",fontFamily:"inherit",
+            }}>{q}</button>
+          ))}
+        </div>
+      )}
 
       {/* Tabs */}
       <div style={{display:"flex",gap:6,marginBottom:20,borderBottom:`1px solid ${T.border}`,paddingBottom:0}}>
@@ -1502,8 +1694,8 @@ export default function IFTAPage() {
               <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",marginBottom:8}}>
                 Nomad Fuel Card Export
               </div>
-              <div style={{fontSize:11,color:T.dim,marginBottom:10,lineHeight:1.5}}>
-                Upload Nomad CAN and/or USA IFTA reports — you can upload both separately, they'll be combined automatically.
+              <div style={{fontSize:12,color:T.dim,marginBottom:10,lineHeight:1.5}}>
+                Upload Nomad CAN and/or USA IFTA reports — merged automatically. <strong style={{color:T.green}}>Data saves to Firestore permanently</strong> so you never need to re-upload for the same quarter.
               </div>
               <UploadZone onFile={handleNomadFile} busy={busyNomad} label="Upload Nomad CAN or USA report"/>
               {nomadFiles.length>0 && (
@@ -1743,33 +1935,62 @@ export default function IFTAPage() {
       {/* ── HISTORY TAB ── */}
       {tab==="history" && (
         <div style={{maxWidth:800}}>
-          {history.length===0 ? (
-            <div style={{textAlign:"center",padding:48,color:T.muted}}>
-              <div style={{fontSize:32,marginBottom:8}}>🕐</div>
-              <div style={{fontSize:14,fontWeight:600}}>No saved IFTA reports yet</div>
-              <div style={{fontSize:12,color:T.dim,marginTop:4}}>Generate a report and click "Save Report" to archive it here</div>
-            </div>
-          ) : (
-            <div>
-              {history.map(rep=>(
-                <div key={rep.id} style={{...sCard, display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          {/* Saved upload data by quarter */}
+          {savedQuarters.length > 0 && (
+            <div style={{marginBottom:24}}>
+              <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>
+                Raw Upload Data — Available for Audit
+              </div>
+              <div style={{fontSize:12,color:T.dim,marginBottom:12,lineHeight:1.6}}>
+                Every file you've ever uploaded is stored permanently. Click any quarter to reload it into the Report tab — no re-uploading needed.
+              </div>
+              {savedQuarters.map(q=>(
+                <div key={q} style={{...sCard, display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
                   <div>
-                    <div style={{fontSize:15,fontWeight:700,color:T.text}}>{rep.quarter}</div>
-                    <div style={{fontSize:12,color:T.muted,marginTop:3}}>
-                      {rep.results?.length||0} units · {rep.totalKm?.toLocaleString()||"—"} km · {Math.round(rep.totalLitres||0).toLocaleString()} L ·
-                      Net taxable: <span style={{color:rep.totalTaxable>0?T.red:T.green,fontWeight:600}}>{(rep.totalTaxable||0).toFixed(0)} L</span>
-                    </div>
-                    <div style={{fontSize:11,color:T.dim,marginTop:2}}>
-                      Saved {new Date(rep.savedAt).toLocaleString("en-CA")}
-                    </div>
+                    <div style={{fontSize:14,fontWeight:700,color:T.text}}>{q}</div>
+                    <div style={{fontSize:11,color:T.dim,marginTop:2}}>Nomad CAN + USA · Geotab IFTA · Adjustments stored in Firestore</div>
                   </div>
-                  <div style={{display:"flex",gap:8}}>
-                    <button onClick={()=>{loadHistoricReport(rep);}} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Load</button>
-                    <button onClick={()=>exportIFTAPDF(rep.results||[],rep.quarter,rep.unmatchedCount||0)} style={sBtn()}>📄 PDF</button>
-                  </div>
+                  <button onClick={()=>switchQuarter(q)} style={{
+                    padding:"7px 16px",borderRadius:8,
+                    border:`1px solid ${q===quarter?T.red:T.border}`,
+                    background:q===quarter?T.redDim:"transparent",
+                    color:q===quarter?T.red:T.muted,
+                    fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"
+                  }}>{q===quarter?"Currently loaded":"Load"}</button>
                 </div>
               ))}
             </div>
+          )}
+
+          {/* Saved finalized reports */}
+          <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>
+            Finalized Reports (Saved with 💾)
+          </div>
+          {history.length===0 ? (
+            <div style={{textAlign:"center",padding:32,color:T.muted,fontSize:13}}>
+              <div style={{fontSize:32,marginBottom:8}}>🕐</div>
+              <div style={{fontSize:14,fontWeight:600}}>No finalized reports yet</div>
+              <div style={{fontSize:12,color:T.dim,marginTop:4}}>Generate a report and click "💾 Save Report" to archive a snapshot here</div>
+            </div>
+          ) : (
+            history.map(rep=>(
+              <div key={rep.id} style={{...sCard, display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div>
+                  <div style={{fontSize:15,fontWeight:700,color:T.text}}>{rep.quarter}</div>
+                  <div style={{fontSize:12,color:T.muted,marginTop:3}}>
+                    {rep.results?.length||0} units · {rep.totalKm?.toLocaleString()||"—"} km · {Math.round(rep.totalLitres||0).toLocaleString()} L ·
+                    Net taxable: <span style={{color:rep.totalTaxable>0?T.red:T.green,fontWeight:600}}>{(rep.totalTaxable||0).toFixed(0)} L</span>
+                  </div>
+                  <div style={{fontSize:11,color:T.dim,marginTop:2}}>
+                    Saved {new Date(rep.savedAt).toLocaleString("en-CA")}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:8}}>
+                  <button onClick={()=>loadHistoricReport(rep)} style={{padding:"6px 14px",borderRadius:8,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit"}}>Load</button>
+                  <button onClick={()=>exportIFTAPDF(rep.results||[],rep.quarter,rep.unmatchedCount||0)} style={sBtn()}>📄 PDF</button>
+                </div>
+              </div>
+            ))
           )}
         </div>
       )}

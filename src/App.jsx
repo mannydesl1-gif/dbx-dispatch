@@ -955,7 +955,7 @@ export default function App() {
         {pg==="ed" && <EmployeeDocsPage/>}
         {pg==="rp" && <ReportsPage db={dbData} go={go}/>}
         {pg==="qt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]}/></Suspense>}
-        {pg==="ifta" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><IFTAPage/></Suspense>}
+        {pg==="ifta" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><IFTAPage trucks={db.trucks}/></Suspense>}
         {pg==="eq" && <EquipPage db={dbData} saveColl={saveColl}/>}
         {pg==="pp" && <PapsParsPage db={dbData} savOrd={savOrd}/>}
       </main>

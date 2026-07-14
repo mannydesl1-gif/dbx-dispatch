@@ -53,6 +53,50 @@ const SURCHARGE_TABLES = { "Q2 2026": IFTA_SURCHARGES_Q2_2026 };
 function getRatesForQuarter(q, liveRates)      { return liveRates?.[q] || RATE_TABLES[q]      || RATE_TABLES[Object.keys(RATE_TABLES).sort().reverse()[0]]      || {}; }
 function getSurchargesForQuarter(q, liveSurch) { return liveSurch?.[q] || SURCHARGE_TABLES[q] || SURCHARGE_TABLES[Object.keys(SURCHARGE_TABLES).sort().reverse()[0]] || {}; }
 
+
+// ── Seed card assignments (from the Q2 2026 unit-corrections review) ─────────
+// Starting point only — correct these in the Card Assignments tab as you confirm
+// real assignments. "confidence" records how the original match was made:
+//   Confirmed = card label matches a real unit    High/Medium = GPS-corroborated
+//   Assigned  = best-guess fit, verify before relying on the per-truck report
+const SEED_CARD_ASSIGNMENTS = [
+  { cardNumber:"****2137287", truckUnit:"23-18", driverName:"Steve Sahin", nomadLabel:"2318", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****2137295", truckUnit:"23-15", driverName:"Anwer James (usa Card)", nomadLabel:"2315", confidence:"Confirmed", notes:"US-only card" },
+  { cardNumber:"****2147203", truckUnit:"24-20", driverName:"Gaurav Kumar", nomadLabel:"2420", confidence:"Confirmed", notes:"US-only card" },
+  { cardNumber:"****2147211", truckUnit:"26-23", driverName:"Addvalue", nomadLabel:"2623", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****2147229", truckUnit:"24-21", driverName:"Rafeal  Fuel", nomadLabel:"2421", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****2147252", truckUnit:"20-08", driverName:"Rizwan  Haider", nomadLabel:"2008", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****2147260", truckUnit:"25-24", driverName:"Mickay Fuel", nomadLabel:"123", confidence:"High", notes:"Label was \"123\"; Q1 had 23-18 \u2014 GPS contradicts, card follows 25-24 routes in Q2" },
+  { cardNumber:"****8001327", truckUnit:"16-01", driverName:"Nuwan  R", nomadLabel:"1201327", confidence:"Medium", notes:"Pipeline card-ID label 1201327; GPS inconclusive (ON corridor)" },
+  { cardNumber:"****8001328", truckUnit:"17-03", driverName:"Rev Fuel", nomadLabel:"1201328", confidence:"Medium", notes:"Label 1201328; Q1 had 20-09 \u2014 GPS contradicts. \"Rev Fuel\" may be a pool card" },
+  { cardNumber:"****8001329", truckUnit:"21-10", driverName:"Rev Fuel", nomadLabel:"1201329", confidence:"Assigned", notes:"Raw label 1201329; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8001331", truckUnit:"18-14", driverName:"Imran Haider", nomadLabel:"1412431", confidence:"High", notes:"Label 1412431; Q1 had 15-01 (impossible \u2014 0 km in Q2)" },
+  { cardNumber:"****8001336", truckUnit:"22-12", driverName:"Sugan R - Pipeline", nomadLabel:"1201336", confidence:"High", notes:"Label 1201336; Q1 had 17-03 \u2014 Sugan's WEX & Pipeline cards appear swapped vs Q1" },
+  { cardNumber:"****8001340", truckUnit:"23-19", driverName:"Rev Fuel", nomadLabel:"1201340", confidence:"Assigned", notes:"Raw label 1201340; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8001341", truckUnit:"25-24", driverName:"Mickael  Peter Madomel", nomadLabel:"1201341", confidence:"Assigned", notes:"Raw label 1201341; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8001344", truckUnit:"24-20", driverName:"Rev Cap", nomadLabel:"1203406", confidence:"Assigned", notes:"Raw label 1203406; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8001345", truckUnit:"23-19", driverName:"Rev Cap", nomadLabel:"1202344", confidence:"Medium", notes:"Label 1202344; GPS inconclusive" },
+  { cardNumber:"****8001348", truckUnit:"16-02", driverName:"Ashen  Fernando", nomadLabel:"1412427", confidence:"Medium", notes:"Label 1412427; only 4 txns, GPS inconclusive" },
+  { cardNumber:"****8002126", truckUnit:"18-14", driverName:"Edward Imade", nomadLabel:"1814", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8002128", truckUnit:"16-02", driverName:"Isuru N", nomadLabel:"1412426", confidence:"Medium", notes:"Label 1412426; GPS inconclusive" },
+  { cardNumber:"****8002129", truckUnit:"17-03", driverName:"Subash  R", nomadLabel:"1412425", confidence:"Medium", notes:"Label 1412425; Q1 had 18-14 \u2014 GPS contradicts" },
+  { cardNumber:"****8002131", truckUnit:"16-02", driverName:"Johnathan Varley", nomadLabel:"1602", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8157971", truckUnit:"17-03", driverName:"Sugan Fuel", nomadLabel:"1703", confidence:"Confirmed", notes:"Q1 had 22-12 \u2014 Sugan reassigned (his Pipeline card shows the reverse swap)" },
+  { cardNumber:"****8157997", truckUnit:"19-06", driverName:"Ravi Fuel", nomadLabel:"1906", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8167905", truckUnit:"21-10", driverName:"Sheldon  Gayle", nomadLabel:"2110", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8167913", truckUnit:"20-09", driverName:"Jas Fuel", nomadLabel:"2009", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8167921", truckUnit:"20-09", driverName:"Yasar A", nomadLabel:"2009", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8167939", truckUnit:"21-11", driverName:"Sugee  Fuel", nomadLabel:"2111", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8167947", truckUnit:"26-22", driverName:"Ernesto Fuel", nomadLabel:"2622", confidence:"Confirmed", notes:"Q1 had 22-12 \u2014 Ernesto reassigned" },
+  { cardNumber:"****8167988", truckUnit:"20-09", driverName:"Asghar Khan", nomadLabel:"2009", confidence:"Confirmed", notes:"Driver changed from Nalin (Q1) to Asghar Khan" },
+  { cardNumber:"****8177904", truckUnit:"23-15", driverName:"Ramit  Paul", nomadLabel:"23-15", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8177912", truckUnit:"23-18", driverName:"Nathan Fuel", nomadLabel:"2318", confidence:"Confirmed", notes:"" },
+  { cardNumber:"****8177938", truckUnit:"23-18", driverName:"K Kaveena", nomadLabel:"7938", confidence:"Assigned", notes:"Raw label 7938; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8177946", truckUnit:"23-19", driverName:"Isuru N", nomadLabel:"9072", confidence:"Assigned", notes:"Raw label 9072; assigned to best GPS-matching under-fueled truck" },
+  { cardNumber:"****8177953", truckUnit:"20-09", driverName:"Kanthan Fuel", nomadLabel:"0607", confidence:"Medium", notes:"Label \"0607\"; blank in Q1" },
+  { cardNumber:"****8177961", truckUnit:"25-25", driverName:"Amit Pandey", nomadLabel:"5257", confidence:"Assigned", notes:"Raw label 5257; assigned to best GPS-matching under-fueled truck" },
+];
+
 // ── IFTA member jurisdictions (for validation)
 const IFTA_JURISDICTIONS = new Set([
   "AB","BC","MB","NB","NL","NS","ON","PE","QC","SK",
@@ -68,15 +112,49 @@ const fmtL = (n) => n == null || isNaN(n) ? "—" : `${Number(n).toFixed(0)} L`;
 const fmtKm = (n) => n == null || isNaN(n) ? "—" : `${Number(n).toFixed(0)} km`;
 const today = () => new Date().toISOString().slice(0,10);
 
-// Auto-convert Nomad unit ID → Geotab dash format
-// e.g. "1906" → "19-06", "23-15" → "23-15", "1201327" → null (Pipeline card)
-function nomadToGeotab(unitStr) {
-  const u = String(unitStr || "").trim();
+// Auto-convert Nomad unit ID → Geotab dash format, VALIDATED against the real fleet.
+// e.g. "1906" → "19-06" (only if 19-06 is a real truck).
+// Without the fleet check, junk labels like "5257" would silently become "52-57" —
+// an invented truck that quietly corrupts the per-truck report.
+function nomadToGeotab(unitStr, fleetSet) {
+  const u = String(unitStr || "").trim().replace(/\u00a0/g, " ").replace(/\s+/g, "");
   if (!u || u === "nan" || u === "undefined") return null;
-  if (/^\d{2}-\d{2}$/.test(u)) return u; // already correct
-  if (/^\d{4}$/.test(u)) return u.slice(0,2) + "-" + u.slice(2); // 2009 → 20-09
-  if (/^\d{5}$/.test(u)) return u.slice(0,2) + "-" + u.slice(2); // edge case
-  return null; // Pipeline/WEX anomaly IDs — needs manual mapping
+  const ok = (c) => (!fleetSet || fleetSet.size === 0) ? c : (fleetSet.has(c) ? c : null);
+  if (/^\d{2}-\d{2}$/.test(u)) return ok(u);
+  if (/^\d{4}$/.test(u))       return ok(u.slice(0,2) + "-" + u.slice(2));
+  return null; // Pipeline / junk IDs — must go through card assignment
+}
+
+// Last 4 digits of a card — the only part the fuel spreadsheets reliably expose.
+function cardLast4(cardStr) {
+  const digits = String(cardStr || "").replace(/\D/g, "");
+  return digits.length >= 4 ? digits.slice(-4) : null;
+}
+
+// Resolve a card to a truck AS OF a given date.
+// Assignments are date-ranged so a card that moves trucks (truck in the garage,
+// driver swap) resolves correctly for each period. A row with a narrower window
+// wins over an open-ended standing assignment.
+function resolveCardOnDate(last4, dateStr, assignments) {
+  if (!last4 || !assignments?.length) return null;
+  const matches = assignments.filter(a => {
+    if (cardLast4(a.cardNumber) !== last4) return false;
+    const from = a.effectiveFrom || "";
+    const to   = a.effectiveTo   || "";
+    if (from && dateStr < from) return false;
+    if (to   && dateStr > to)   return false;
+    return true;
+  });
+  if (!matches.length) return null;
+  // Prefer the most specific window (a closed range beats an open-ended one),
+  // then the latest start date.
+  matches.sort((a,b) => {
+    const aClosed = a.effectiveTo ? 1 : 0;
+    const bClosed = b.effectiveTo ? 1 : 0;
+    if (aClosed !== bClosed) return bClosed - aClosed;
+    return (b.effectiveFrom || "").localeCompare(a.effectiveFrom || "");
+  });
+  return matches[0].truckUnit || null;
 }
 
 // Parse a date string in MM/DD/YYYY or ISO format
@@ -125,10 +203,10 @@ function detectGeotabFile(wb) {
 }
 
 // Parse Nomad fuel card export (CAN or USA)
-function parseNomadFile(wb, fuelCardMap) {
+function parseNomadFile(wb, fuelCardMap, fleetSet) {
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:"", raw:false });
-  if (!rows.length) return { transactions:[], errors:[] };
+  if (!rows.length) return { transactions:[], errors:[], unmatched:[] };
 
   const header = rows[0].map(v => String(v).trim());
   const col = name => header.findIndex(h => h.toLowerCase() === name.toLowerCase());
@@ -149,6 +227,7 @@ function parseNomadFile(wb, fuelCardMap) {
 
   const transactions = [];
   const errors = [];
+  const unmatched = [];
 
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
@@ -176,35 +255,37 @@ function parseNomadFile(wb, fuelCardMap) {
     const uom = isCAN ? (String(r[idxUoM]||"L").trim()) : "gal";
     const litres = uom === "L" ? volume : volume * GALLONS_TO_LITRES;
 
-    // Resolve truck unit
-    let geotabUnit = nomadToGeotab(unitRaw);
-
-    // Check manual mapping table (for Pipeline cards etc.)
-    if (!geotabUnit && fuelCardMap) {
-      // Try by card number (masked or full)
-      const cardKey = cardRaw.replace(/\*/g, "");
-      const byCard = fuelCardMap.find(m =>
-        m.cardNumber && (m.cardNumber.endsWith(cardKey.slice(-6)) || m.cardNumber === cardRaw)
-      );
-      if (byCard) geotabUnit = byCard.truckUnit;
-      // Try by Nomad unit number directly
-      if (!geotabUnit) {
-        const byUnit = fuelCardMap.find(m => m.nomadUnit === unitRaw);
-        if (byUnit) geotabUnit = byUnit.truckUnit;
-      }
-    }
+    // ── Resolve truck unit ────────────────────────────────────────────────
+    // 1. Unit label on the transaction, but only if it maps to a REAL truck.
+    // 2. Otherwise the card, looked up as of the transaction date.
+    // 3. Otherwise unassigned — kept, never dropped.
+    const last4 = cardLast4(cardRaw);
+    let geotabUnit = nomadToGeotab(unitRaw, fleetSet);
+    let matchedBy  = geotabUnit ? "unit-label" : null;
 
     if (!geotabUnit) {
-      errors.push({ row: i+1, unitRaw, cardRaw, driver, network, litres,
-        msg:`Unit "${unitRaw}" (${network}) could not be matched to a truck — add to Fuel Cards table` });
-      continue;
+      const viaCard = resolveCardOnDate(last4, dateStr, fuelCardMap);
+      if (viaCard) { geotabUnit = viaCard; matchedBy = "card-assignment"; }
     }
 
-    transactions.push({ dateStr, quarter: quarterOf(dateStr), truckUnit: geotabUnit,
-      nomadUnit: unitRaw, cardNumber: cardRaw, driver, state, network, litres, total, currency: isCAN?"CAD":"USD" });
+    // IMPORTANT: an unassigned transaction is STILL taxable fuel. IFTA is owed on
+    // jurisdiction totals, and the fleet bought this fuel regardless of which truck
+    // burned it. Dropping it would forfeit the tax credit on litres already paid for
+    // at the pump. It is flagged for review, not discarded.
+    if (!geotabUnit) {
+      unmatched.push({ row:i+1, dateStr, unitRaw, cardRaw, last4, driver, network,
+        state, litres,
+        msg:`Card ****${last4 || "????"} (label "${unitRaw||"—"}", ${network}) has no truck assignment on ${dateStr}` });
+      matchedBy = "unassigned";
+    }
+
+    transactions.push({ dateStr, quarter: quarterOf(dateStr),
+      truckUnit: geotabUnit || null, matchedBy,
+      nomadUnit: unitRaw, cardNumber: cardRaw, cardLast4: last4,
+      driver, state, network, litres, total, currency: isCAN?"CAD":"USD" });
   }
 
-  return { transactions, errors, isCAN };
+  return { transactions, errors, unmatched, isCAN };
 }
 
 // Parse Geotab IFTA report
@@ -412,8 +493,88 @@ function calculateIFTA(geotabRecords, fuelTransactions, adjustments={}, quarter=
     });
   }
 
-  results.sort((a,b) => a.truckUnit.localeCompare(b.truckUnit));
+  results.sort((a,b) => String(a.truckUnit).localeCompare(String(b.truckUnit)));
   return results;
+}
+
+// ── Fleet-level IFTA return ──────────────────────────────────────────────────
+// THIS is the number you actually file.
+//
+// Why fleet-level rather than per-truck: IFTA tax is owed on TOTAL km driven in a
+// jurisdiction vs TOTAL fuel bought in that jurisdiction. Which specific truck burned
+// which litre does not change what the fleet owes. Per-truck economy in this data is
+// unreliable anyway — fuel cards follow drivers, and drivers rotate trucks, so a single
+// truck can show 7.8 km/L one quarter and 1.1 the next. Pooling washes that noise out.
+//
+// Crucially, fuel that could not be matched to a truck IS INCLUDED here. It is real
+// diesel, really bought, with tax really paid at the pump. Excluding it would forfeit
+// that credit and inflate the tax owed.
+function calculateFleetIFTA(geotabRecords, fuelTransactions, quarter="Q2 2026", liveRates={}, liveSurch={}) {
+  const rates      = getRatesForQuarter(quarter, liveRates);
+  const surcharges = getSurchargesForQuarter(quarter, liveSurch);
+
+  const kmByJuris     = {};
+  const litresByJuris = {};
+  for (const rec of geotabRecords) {
+    if (!IFTA_JURISDICTIONS.has(rec.jurisdiction)) continue;
+    kmByJuris[rec.jurisdiction] = (kmByJuris[rec.jurisdiction]||0) + rec.km;
+  }
+  for (const tx of fuelTransactions) {
+    litresByJuris[tx.state] = (litresByJuris[tx.state]||0) + tx.litres;
+  }
+
+  const totalKm     = Object.values(kmByJuris).reduce((s,v)=>s+v, 0);
+  const totalLitres = fuelTransactions.reduce((s,t)=>s+t.litres, 0);
+  // Fleet fuel economy, L/100km — the basis for how much fuel was CONSUMED per jurisdiction
+  const fleetEcon = totalKm > 0 ? (totalLitres / totalKm) * 100 : 0;
+
+  const unassignedLitres = fuelTransactions
+    .filter(t => !t.truckUnit)
+    .reduce((s,t)=>s+t.litres, 0);
+
+  const rows = [];
+  const allJuris = new Set([...Object.keys(kmByJuris), ...Object.keys(litresByJuris)]);
+  for (const juris of allJuris) {
+    if (!IFTA_JURISDICTIONS.has(juris)) continue;
+    const km              = kmByJuris[juris] || 0;
+    const litresPurchased = litresByJuris[juris] || 0;
+    const litresConsumed  = (fleetEcon / 100) * km;
+    const taxable         = litresConsumed - litresPurchased; // + = owe, − = credit
+
+    const taxRate       = rates[juris] ?? null;
+    const taxDue        = taxRate != null ? Math.round(taxable * taxRate * 100) / 100 : null;
+    // Surcharge (KY, VA) is levied on fuel CONSUMED, not on the net — it is never a credit
+    const surchargeRate = surcharges[juris] ?? null;
+    const surchargeDue  = surchargeRate != null ? Math.round(litresConsumed * surchargeRate * 100) / 100 : null;
+
+    rows.push({
+      jurisdiction: juris, km: Math.round(km),
+      litresConsumed:  Math.round(litresConsumed * 10)/10,
+      litresPurchased: Math.round(litresPurchased * 10)/10,
+      taxable:         Math.round(taxable * 10)/10,
+      taxRate, taxDue, surchargeRate, surchargeDue,
+      noKmWarning:   km === 0 && litresPurchased > 0,
+      noFuelWarning: km > 0 && litresPurchased === 0,
+      missingRate:   taxRate == null,
+    });
+  }
+  rows.sort((a,b) => b.km - a.km);
+
+  const netTax    = rows.reduce((s,r) => s + (r.taxDue || 0), 0);
+  const surcharge = rows.reduce((s,r) => s + (r.surchargeDue || 0), 0);
+
+  return {
+    rows,
+    totalKm:     Math.round(totalKm),
+    totalLitres: Math.round(totalLitres * 10)/10,
+    fleetEcon:   Math.round(fleetEcon * 100)/100,
+    unassignedLitres: Math.round(unassignedLitres * 10)/10,
+    unassignedPct: totalLitres > 0 ? Math.round(unassignedLitres/totalLitres*1000)/10 : 0,
+    netTax:    Math.round(netTax * 100)/100,
+    surcharge: Math.round(surcharge * 100)/100,
+    totalDue:  Math.round((netTax + surcharge) * 100)/100,
+    econFlagged: fleetEcon > 0 && (fleetEcon < FUEL_ECON_MIN || fleetEcon > FUEL_ECON_MAX),
+  };
 }
 
 // ── PDF Export ───────────────────────────────────────────────────────────────
@@ -522,6 +683,10 @@ const sBtn = (col=T.red) => ({
   padding:"8px 16px", borderRadius:8, border:"none", background:col, color:"#fff",
   fontFamily:"inherit", fontWeight:700, fontSize:12, cursor:"pointer",
 });
+const sLbl2 = {
+  fontSize:10, fontWeight:700, color:"#94a3b8", textTransform:"uppercase",
+  display:"block", marginBottom:4, letterSpacing:"0.04em",
+};
 const sCard = {
   background:T.card, border:`1px solid ${T.border}`, borderRadius:10, padding:16, marginBottom:12,
 };
@@ -950,135 +1115,274 @@ function TaxRatesTab({ liveRates, liveSurch, onSave }) {
   );
 }
 
-// ── Fuel Cards Settings ──────────────────────────────────────────────────────
-function FuelCardsTab() {
-  const [cards, setCards] = useState([]);
-  const [form, setForm] = useState({nomadUnit:"", cardNumber:"", truckUnit:"", driverName:"", network:"", notes:""});
+// ── Card Assignments ─────────────────────────────────────────────────────────
+// Maps a fuel card (by its last 4 digits — all the spreadsheets expose) to a truck,
+// OVER A DATE RANGE. Cards follow drivers and drivers rotate trucks, so a fixed
+// card→truck map is wrong the moment a truck goes into the shop. Leave "To" blank
+// for the standing assignment; add a second row with a closed date range to cover
+// a temporary swap, and it wins for those dates.
+function CardAssignmentsTab({ fleetUnits = [] }) {
+  const blank = {cardNumber:"", truckUnit:"", effectiveFrom:"", effectiveTo:"", driverName:"", notes:""};
+  const [cards, setCards]   = useState([]);
+  const [form, setForm]     = useState(blank);
   const [editId, setEditId] = useState(null);
   const [saving, setSaving] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [seeding, setSeeding] = useState(false);
+  const [filter, setFilter] = useState("");
 
   const load = async () => {
     setLoading(true);
     try {
       const snap = await getDocs(collection(db,"iftaFuelCards"));
-      setCards(snap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>a.truckUnit.localeCompare(b.truckUnit)));
-    } catch(e){console.error(e);}
+      setCards(
+        snap.docs.map(d=>({id:d.id,...d.data()}))
+          .sort((a,b)=>{
+            const t = String(a.truckUnit||"").localeCompare(String(b.truckUnit||""));
+            return t !== 0 ? t : String(a.effectiveFrom||"").localeCompare(String(b.effectiveFrom||""));
+          })
+      );
+    } catch(e){ console.error(e); }
     setLoading(false);
   };
-  useEffect(()=>{load();},[]);
+  useEffect(()=>{ load(); },[]);
 
-  const reset = () => { setForm({nomadUnit:"",cardNumber:"",truckUnit:"",driverName:"",network:"",notes:""}); setEditId(null); };
+  const reset = () => { setForm(blank); setEditId(null); };
 
   const save = async () => {
-    if (!form.truckUnit) return;
+    if (!form.cardNumber || !form.truckUnit) {
+      alert("Card number and truck unit are both required."); return;
+    }
+    if (!cardLast4(form.cardNumber)) {
+      alert("Card number must contain at least 4 digits."); return;
+    }
+    if (form.effectiveTo && form.effectiveFrom && form.effectiveTo < form.effectiveFrom) {
+      alert("\"To\" date cannot be before \"From\" date."); return;
+    }
     setSaving(true);
     try {
-      if (editId) {
-        await updateDoc(doc(db,"iftaFuelCards",editId), form);
-      } else {
-        await addDoc(collection(db,"iftaFuelCards"), {...form, createdAt:new Date().toISOString()});
-      }
+      if (editId) await updateDoc(doc(db,"iftaFuelCards",editId), {...form});
+      else        await addDoc(collection(db,"iftaFuelCards"), {...form, createdAt:new Date().toISOString()});
       await load(); reset();
-    } catch(e){console.error(e);}
+    } catch(e){ console.error(e); alert("Save failed — see console."); }
     setSaving(false);
   };
 
   const remove = async (id) => {
-    if (!window.confirm("Remove this fuel card mapping?")) return;
+    if (!window.confirm("Remove this card assignment?")) return;
     await deleteDoc(doc(db,"iftaFuelCards",id));
     await load();
   };
 
-  const startEdit = (card) => { setForm({nomadUnit:card.nomadUnit||"",cardNumber:card.cardNumber||"",truckUnit:card.truckUnit||"",driverName:card.driverName||"",network:card.network||"",notes:card.notes||""}); setEditId(card.id); };
+  const startEdit = (c) => {
+    setForm({
+      cardNumber:c.cardNumber||"", truckUnit:c.truckUnit||"",
+      effectiveFrom:c.effectiveFrom||"", effectiveTo:c.effectiveTo||"",
+      driverName:c.driverName||"", notes:c.notes||"",
+    });
+    setEditId(c.id);
+    window.scrollTo({top:0, behavior:"smooth"});
+  };
+
+  // One-time seed from the Q2 2026 corrections review, so you start with 35 cards
+  // already mapped instead of typing them in by hand.
+  const seedCards = async () => {
+    if (!window.confirm(
+      `Add ${SEED_CARD_ASSIGNMENTS.length} card assignments from the Q2 2026 review?\n\n` +
+      `These are a starting point — several were GPS-inferred rather than confirmed. ` +
+      `Check the Confidence column and correct any that are wrong.`
+    )) return;
+    setSeeding(true);
+    try {
+      const existing = new Set(cards.map(c => `${cardLast4(c.cardNumber)}|${c.effectiveFrom||""}`));
+      let added = 0;
+      for (const s of SEED_CARD_ASSIGNMENTS) {
+        const key = `${cardLast4(s.cardNumber)}|`;
+        if (existing.has(key)) continue;         // don't duplicate a standing assignment
+        await addDoc(collection(db,"iftaFuelCards"), {
+          cardNumber: s.cardNumber,
+          truckUnit:  s.truckUnit,
+          driverName: s.driverName || "",
+          effectiveFrom: "",                      // open-ended = the standing assignment
+          effectiveTo:   "",
+          notes: [s.confidence && `Confidence: ${s.confidence}`, s.nomadLabel && `Nomad label: ${s.nomadLabel}`, s.notes]
+                   .filter(Boolean).join(" · "),
+          seeded: true,
+          createdAt: new Date().toISOString(),
+        });
+        added++;
+      }
+      await load();
+      alert(`Added ${added} card assignment${added===1?"":"s"}.`);
+    } catch(e){ console.error(e); alert("Seeding failed — see console."); }
+    setSeeding(false);
+  };
+
+  const visible = cards.filter(c => {
+    if (!filter) return true;
+    const f = filter.toLowerCase();
+    return [c.cardNumber, c.truckUnit, c.driverName, c.notes]
+      .some(v => String(v||"").toLowerCase().includes(f));
+  });
+
+  // Flag cards whose date windows overlap for the same card — the later row would
+  // silently shadow the earlier one, which is rarely what you want.
+  const overlapIds = new Set();
+  const byCard = {};
+  for (const c of cards) {
+    const l4 = cardLast4(c.cardNumber);
+    if (!l4) continue;
+    (byCard[l4] = byCard[l4] || []).push(c);
+  }
+  for (const list of Object.values(byCard)) {
+    const closed = list.filter(c => c.effectiveFrom && c.effectiveTo);
+    for (let i=0;i<closed.length;i++) for (let j=i+1;j<closed.length;j++) {
+      const a=closed[i], b=closed[j];
+      if (a.effectiveFrom <= b.effectiveTo && b.effectiveFrom <= a.effectiveTo) {
+        overlapIds.add(a.id); overlapIds.add(b.id);
+      }
+    }
+  }
+
+  const sBtnSm = {padding:"4px 10px",borderRadius:5,border:`1px solid ${T.border}`,background:"transparent",
+                  color:T.muted,fontSize:11,cursor:"pointer",fontFamily:"inherit"};
 
   return (
-    <div style={{maxWidth:900}}>
+    <div style={{maxWidth:1100}}>
       <div style={{fontSize:13,color:T.muted,marginBottom:16,lineHeight:1.6}}>
-        Map non-standard Nomad unit IDs (Pipeline card numbers, WEX anomaly IDs) to your Geotab truck units.
-        Standard 4-digit IDs like <code style={{background:T.surface,padding:"1px 5px",borderRadius:4,color:T.amber}}>1906</code> → <code style={{background:T.surface,padding:"1px 5px",borderRadius:4,color:T.green}}>19-06</code> are converted automatically — only add entries here for the ones that don't follow that pattern.
+        Fuel cards are matched to trucks by their <strong style={{color:T.text}}>last 4 digits</strong> — that is all the
+        fuel spreadsheets expose. Assignments are <strong style={{color:T.text}}>date-ranged</strong>, because cards follow
+        drivers and drivers change trucks.
+        <br/><br/>
+        Leave <strong style={{color:T.text}}>To</strong> blank for the standing assignment. If a truck goes into the garage
+        and its card fuels a different truck for ten days, add a second row for that card with those exact
+        dates — it takes priority for that window only.
+        <br/><br/>
+        Labels like <code style={{background:T.surface,padding:"1px 5px",borderRadius:4,color:T.green}}>1906</code> → <code style={{background:T.surface,padding:"1px 5px",borderRadius:4,color:T.green}}>19-06</code> resolve
+        automatically when they match a real truck, so those cards need no entry here.
       </div>
 
-      {/* Add/Edit form */}
+      {/* Add / edit form */}
       <div style={sCard}>
         <div style={{fontSize:12,fontWeight:700,color:T.red,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:12}}>
-          {editId ? "✏️ Edit Mapping" : "+ Add Card Mapping"}
+          {editId ? "✏️ Edit Assignment" : "+ Add Card Assignment"}
         </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:10}}>
+        <div style={{display:"grid",gridTemplateColumns:"1.2fr 1fr 1fr 1fr",gap:10,marginBottom:10}}>
           <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Nomad Unit # <span style={{color:T.dim}}>(as it appears in the file)</span></label>
-            <input style={sIn} value={form.nomadUnit} onChange={e=>setForm(p=>({...p,nomadUnit:e.target.value}))} placeholder="e.g. 1201327"/>
+            <label style={sLbl2}>Card Number <span style={{color:T.dim}}>(last 4 is what matters)</span></label>
+            <input style={sIn} value={form.cardNumber} placeholder="****2137287 or 2137287"
+              onChange={e=>setForm(p=>({...p,cardNumber:e.target.value}))}/>
+            {form.cardNumber && (
+              <div style={{fontSize:10,color:cardLast4(form.cardNumber)?T.green:T.red,marginTop:3}}>
+                {cardLast4(form.cardNumber) ? `→ matches on ${cardLast4(form.cardNumber)}` : "need at least 4 digits"}
+              </div>
+            )}
           </div>
           <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Card Number</label>
-            <input style={sIn} value={form.cardNumber} onChange={e=>setForm(p=>({...p,cardNumber:e.target.value}))} placeholder="e.g. ****8001327"/>
-          </div>
-          <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Geotab Truck Unit <span style={{color:T.red}}>*</span></label>
-            <input style={sIn} value={form.truckUnit} onChange={e=>setForm(p=>({...p,truckUnit:e.target.value}))} placeholder="e.g. 19-06"/>
-          </div>
-        </div>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:12}}>
-          <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Driver Name</label>
-            <input style={sIn} value={form.driverName} onChange={e=>setForm(p=>({...p,driverName:e.target.value}))} placeholder="e.g. Imran Haider"/>
-          </div>
-          <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Network</label>
-            <select style={sIn} value={form.network} onChange={e=>setForm(p=>({...p,network:e.target.value}))}>
-              <option value="">Select...</option>
-              <option>WEX</option><option>PIPELINE</option><option>EFS</option><option>Other</option>
+            <label style={sLbl2}>Truck Unit</label>
+            <select style={sIn} value={form.truckUnit} onChange={e=>setForm(p=>({...p,truckUnit:e.target.value}))}>
+              <option value="">Select truck...</option>
+              {fleetUnits.map(u => <option key={u} value={u}>{u}</option>)}
             </select>
           </div>
           <div>
-            <label style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",display:"block",marginBottom:4}}>Notes</label>
-            <input style={sIn} value={form.notes} onChange={e=>setForm(p=>({...p,notes:e.target.value}))} placeholder="e.g. Reefer unit on 19-06"/>
+            <label style={sLbl2}>From <span style={{color:T.dim}}>(blank = always)</span></label>
+            <input style={sIn} type="date" value={form.effectiveFrom}
+              onChange={e=>setForm(p=>({...p,effectiveFrom:e.target.value}))}/>
+          </div>
+          <div>
+            <label style={sLbl2}>To <span style={{color:T.dim}}>(blank = ongoing)</span></label>
+            <input style={sIn} type="date" value={form.effectiveTo}
+              onChange={e=>setForm(p=>({...p,effectiveTo:e.target.value}))}/>
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 2fr",gap:10,marginBottom:12}}>
+          <div>
+            <label style={sLbl2}>Driver <span style={{color:T.dim}}>(optional)</span></label>
+            <input style={sIn} value={form.driverName} placeholder="e.g. Steve Sahin"
+              onChange={e=>setForm(p=>({...p,driverName:e.target.value}))}/>
+          </div>
+          <div>
+            <label style={sLbl2}>Notes <span style={{color:T.dim}}>(optional)</span></label>
+            <input style={sIn} value={form.notes} placeholder="e.g. 22-12 in garage, card ran on 23-19"
+              onChange={e=>setForm(p=>({...p,notes:e.target.value}))}/>
           </div>
         </div>
         <div style={{display:"flex",gap:8}}>
-          <button onClick={save} disabled={saving||!form.truckUnit} style={sBtn()}>{saving?"Saving...":editId?"Update Mapping":"Add Mapping"}</button>
-          {editId && <button onClick={reset} style={{...sBtn(T.surface),color:T.muted,border:`1px solid ${T.border}`}}>Cancel</button>}
+          <button onClick={save} disabled={saving}
+            style={{padding:"8px 18px",borderRadius:6,border:"none",background:T.red,color:"#fff",
+                    fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",opacity:saving?0.6:1}}>
+            {saving ? "Saving..." : editId ? "Save Changes" : "Add Assignment"}
+          </button>
+          {editId && <button onClick={reset} style={sBtnSm}>Cancel</button>}
         </div>
       </div>
 
-      {/* Cards table */}
-      {loading ? <div style={{color:T.muted,fontSize:13}}>Loading...</div> : (
-        cards.length === 0 ? (
-          <div style={{textAlign:"center",padding:32,color:T.muted,fontSize:13}}>
-            <div style={{fontSize:28,marginBottom:8}}>🃏</div>
-            No manual mappings yet — standard 4-digit unit IDs are handled automatically.
-          </div>
-        ) : (
-          <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:10,overflow:"hidden"}}>
-            <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
-              <thead>
-                <tr style={{background:T.surface}}>
-                  {["Nomad Unit","Card Number","→ Geotab Truck","Driver","Network","Notes",""].map(h=>(
-                    <th key={h} style={{textAlign:"left",padding:"10px 12px",color:T.muted,fontWeight:700,fontSize:10,textTransform:"uppercase"}}>{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {cards.map((c,i)=>(
-                  <tr key={c.id} style={{borderTop:`1px solid ${T.border}`}}>
-                    <td style={{padding:"10px 12px",color:T.amber,fontWeight:600}}>{c.nomadUnit||"—"}</td>
-                    <td style={{padding:"10px 12px",color:T.dim}}>{c.cardNumber||"—"}</td>
-                    <td style={{padding:"10px 12px",color:T.green,fontWeight:700}}>{c.truckUnit}</td>
-                    <td style={{padding:"10px 12px",color:T.text}}>{c.driverName||"—"}</td>
-                    <td style={{padding:"10px 12px",color:T.muted}}>{c.network||"—"}</td>
-                    <td style={{padding:"10px 12px",color:T.dim,fontSize:11}}>{c.notes||""}</td>
-                    <td style={{padding:"10px 12px"}}>
-                      <div style={{display:"flex",gap:6}}>
-                        <button onClick={()=>startEdit(c)} style={{padding:"3px 10px",borderRadius:6,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>Edit</button>
-                        <button onClick={()=>remove(c.id)} style={{padding:"3px 10px",borderRadius:6,border:`1px solid ${T.red}`,background:"transparent",color:T.red,fontSize:11,cursor:"pointer",fontFamily:"inherit"}}>Remove</button>
-                      </div>
+      {/* Toolbar */}
+      <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0 10px"}}>
+        <input style={{...sIn,maxWidth:280}} placeholder="Filter by card, truck, driver..."
+          value={filter} onChange={e=>setFilter(e.target.value)}/>
+        <div style={{flex:1}}/>
+        <span style={{fontSize:11,color:T.muted}}>{cards.length} assignment{cards.length===1?"":"s"}</span>
+        <button onClick={seedCards} disabled={seeding} style={sBtnSm}>
+          {seeding ? "Seeding..." : "⤓ Seed from Q2 2026 review"}
+        </button>
+      </div>
+
+      {overlapIds.size > 0 && (
+        <div style={{padding:"8px 12px",borderRadius:6,marginBottom:10,fontSize:12,
+                     background:"rgba(245,158,11,0.1)",border:"1px solid #f59e0b",color:T.amber}}>
+          ⚠️ Some rows below have overlapping date ranges for the same card. Only one can win — narrow the dates.
+        </div>
+      )}
+
+      {/* Table */}
+      {loading ? <div style={{color:T.muted,fontSize:13,padding:20}}>Loading...</div> : (
+        <div style={sCard}>
+          <table style={{width:"100%",borderCollapse:"collapse",fontSize:12}}>
+            <thead>
+              <tr style={{borderBottom:`1px solid ${T.border}`}}>
+                {["Card","Last 4","Truck","From","To","Driver","Notes",""].map(h=>(
+                  <th key={h} style={{textAlign:"left",padding:"8px 6px",fontSize:10,fontWeight:700,
+                                      color:T.muted,textTransform:"uppercase",letterSpacing:"0.04em"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {visible.length === 0 && (
+                <tr><td colSpan={8} style={{padding:20,color:T.muted,textAlign:"center"}}>
+                  {cards.length === 0
+                    ? "No assignments yet — use “Seed from Q2 2026 review” to start with 35 cards."
+                    : "No rows match that filter."}
+                </td></tr>
+              )}
+              {visible.map(c => {
+                const isTemp = !!(c.effectiveFrom && c.effectiveTo);
+                return (
+                  <tr key={c.id} style={{borderBottom:`1px solid ${T.border}`,
+                        background: overlapIds.has(c.id) ? "rgba(245,158,11,0.06)" : "transparent"}}>
+                    <td style={{padding:"8px 6px",color:T.text,fontFamily:"monospace"}}>{c.cardNumber}</td>
+                    <td style={{padding:"8px 6px",color:T.green,fontFamily:"monospace",fontWeight:700}}>{cardLast4(c.cardNumber)||"—"}</td>
+                    <td style={{padding:"8px 6px",color:T.text,fontWeight:600}}>{c.truckUnit||"—"}</td>
+                    <td style={{padding:"8px 6px",color:c.effectiveFrom?T.text:T.dim}}>{c.effectiveFrom||"always"}</td>
+                    <td style={{padding:"8px 6px",color:c.effectiveTo?T.amber:T.dim}}>
+                      {c.effectiveTo || "ongoing"}
+                      {isTemp && <span style={{marginLeft:6,fontSize:9,padding:"1px 5px",borderRadius:3,
+                                    background:"rgba(245,158,11,0.15)",color:T.amber,fontWeight:700}}>TEMP</span>}
+                    </td>
+                    <td style={{padding:"8px 6px",color:T.muted}}>{c.driverName||"—"}</td>
+                    <td style={{padding:"8px 6px",color:T.dim,fontSize:11,maxWidth:280}}>{c.notes||"—"}</td>
+                    <td style={{padding:"8px 6px",whiteSpace:"nowrap"}}>
+                      <button onClick={()=>startEdit(c)} style={{...sBtnSm,marginRight:4}}>Edit</button>
+                      <button onClick={()=>remove(c.id)}
+                        style={{...sBtnSm,color:"#ef4444",borderColor:"rgba(239,68,68,0.4)"}}>✕</button>
                     </td>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );
@@ -1165,8 +1469,16 @@ async function listSavedQuarters() {
   return [...quarters].sort().reverse();
 }
 
-export default function IFTAPage() {
+export default function IFTAPage({ trucks = [] }) {
   const [tab, setTab] = useState("guide"); // guide | upload | report | history | setup
+
+  // The real fleet, from dispatch. Used to validate unit labels on fuel transactions:
+  // without it, a junk label like "5257" would normalize to the invented truck "52-57".
+  const fleetUnits = useMemo(
+    () => [...new Set(trucks.map(t => String(t.unit||"").trim()).filter(Boolean))].sort(),
+    [trucks]
+  );
+  const fleetSet = useMemo(() => new Set(fleetUnits), [fleetUnits]);
 
   // Upload state
   const [nomadFiles, setNomadFiles] = useState([]); // [{name, transactions, errors, isCAN}]
@@ -1184,6 +1496,7 @@ export default function IFTAPage() {
 
   // Report state
   const [results, setResults] = useState([]);
+  const [fleetReturn, setFleetReturn] = useState(null); // the filed number
   const [adjustments, setAdjustments] = useState({}); // {truckUnit: {adjustedLitres, note}}
   const [expandedTruck, setExpandedTruck] = useState(null);
   const [fuelCardMap, setFuelCardMap] = useState([]);
@@ -1246,12 +1559,19 @@ export default function IFTAPage() {
     init();
   }, []);
 
-  // Recalculate whenever uploads change
+  // Recalculate whenever uploads change.
+  // Two calculations, on purpose:
+  //   fleetReturn — the number you FILE. Jurisdiction totals, fleet-wide economy,
+  //                 every litre counted including fuel with no truck assignment.
+  //   results     — the per-truck breakdown, for the audit trail. Its per-truck fuel
+  //                 economy is unreliable (cards follow drivers, not trucks), so it is
+  //                 a supporting document, not the basis for the tax owed.
   useEffect(() => {
     const allTx = nomadFiles.flatMap(f => f.transactions || []);
     const allGeo = geotabData?.records || [];
     if (allTx.length > 0 || allGeo.length > 0) {
       setResults(calculateIFTA(allGeo, allTx, adjustments, quarter, liveRates, liveSurch));
+      setFleetReturn(calculateFleetIFTA(allGeo, allTx, quarter, liveRates, liveSurch));
     }
   }, [nomadFiles, geotabData, adjustments, quarter, liveRates, liveSurch]);
 
@@ -1264,7 +1584,7 @@ export default function IFTAPage() {
         setUploadMsg({ok:false, text:`"${file.name}" doesn't look like a Nomad fuel card export.`});
         setBusyNomad(false); return;
       }
-      const parsed = parseNomadFile(wb, fuelCardMap);
+      const parsed = parseNomadFile(wb, fuelCardMap, fleetSet);
       const updatedFiles = [...nomadFiles.filter(f=>f.name!==file.name),
         {...parsed, name:file.name}];
       setNomadFiles(updatedFiles);
@@ -1272,13 +1592,20 @@ export default function IFTAPage() {
       // Persist to Firestore by quarter
       const type = parsed.isCAN ? "nomad_can" : "nomad_usa";
       await saveUploadData(quarter, type, parsed.transactions);
-      // Persist errors separately (unmatched list)
-      if (parsed.errors.length > 0) {
-        await saveUploadData(quarter, `${type}_errors`, parsed.errors);
+      // Persist the unassigned list separately, for the review panel
+      const unm = parsed.unmatched || [];
+      if (unm.length > 0) {
+        await saveUploadData(quarter, `${type}_errors`, unm);
       }
       setSavedQuarters(prev => prev.includes(quarter) ? prev : [quarter, ...prev]);
 
-      setUploadMsg({ok:true, text:`✅ "${file.name}" — ${parsed.transactions.length} diesel transactions imported and saved${parsed.errors.length>0?`, ${parsed.errors.length} unmatched`:""}.`});
+      const unmLitres = unm.reduce((s,u)=>s+(u.litres||0),0);
+      setUploadMsg({ok:true, text:
+        `✅ "${file.name}" — ${parsed.transactions.length} diesel transactions imported.` +
+        (unm.length > 0
+          ? ` ${unm.length} (${Math.round(unmLitres).toLocaleString()} L) have no truck assignment — they ARE still counted in the tax, but assign them in Card Assignments for the per-truck report.`
+          : "")
+      });
       setTab("report");
     } catch(e) {
       setUploadMsg({ok:false, text:"Failed to parse file: "+e.message});
@@ -1442,7 +1769,7 @@ export default function IFTAPage() {
           {id:"report",  l:`📊 Report${results.length>0?` (${results.length} units)`:""}` },
           {id:"history", l:`🕐 History${history.length>0?` (${history.length})`:""}` },
           {id:"rates",   l:"💲 Tax Rates"},
-          {id:"setup",   l:"🃏 Fuel Cards"},
+          {id:"setup",   l:"🃏 Card Assignments"},
         ].map(t=>(
           <button key={t.id} onClick={()=>setTab(t.id)} style={{
             padding:"8px 16px", borderRadius:"8px 8px 0 0",
@@ -1542,7 +1869,7 @@ export default function IFTAPage() {
                 "Drop the Geotab IFTA file in the right zone — you'll see vehicle and record counts",
                 "The Report tab will populate automatically once both sides are uploaded",
               ],
-              note:"If you see a yellow warning about unmatched transactions, those are Pipeline card IDs that need to be added to the Fuel Cards table (see Step 5). They are excluded from the calculation until mapped.",
+              note:"If you see a warning about unassigned transactions, those are cards whose truck could not be determined. IMPORTANT: that fuel is STILL counted in the tax owed — the fleet bought it and paid tax on it at the pump, and IFTA is calculated on jurisdiction totals. Assigning it in Card Assignments only improves the per-truck audit report; it does not change the amount you file.",
             },
             {
               num:"05",
@@ -1551,7 +1878,7 @@ export default function IFTAPage() {
               color:"#f97316",
               icon:"🃏",
               steps:[
-                "If the Upload tab shows unmatched transactions, go to the Fuel Cards tab",
+                "If the Upload tab shows unassigned transactions, go to the Card Assignments tab",
                 "Each unmatched row shows a Nomad Unit ID (e.g. 1201329), a driver name, and the network (PIPELINE)",
                 "For each one, add a mapping: Nomad Unit ID → Geotab Truck Unit (e.g. 1201329 → 20-09)",
                 "Once saved, go back to Upload Files and re-upload the Nomad files — those transactions will now resolve",
@@ -1785,7 +2112,99 @@ export default function IFTAPage() {
             </div>
           ) : (
             <>
-              {/* Fleet summary cards */}
+              {/* ── THE FILED RETURN ──────────────────────────────────────── */}
+              {fleetReturn && (
+                <div style={{...sCard, marginBottom:20, borderColor:T.red}}>
+                  <div style={{display:"flex",alignItems:"baseline",justifyContent:"space-between",flexWrap:"wrap",gap:12,marginBottom:14}}>
+                    <div>
+                      <div style={{fontSize:12,fontWeight:700,color:T.red,textTransform:"uppercase",letterSpacing:"0.05em"}}>
+                        IFTA Return — {quarter}
+                      </div>
+                      <div style={{fontSize:11,color:T.muted,marginTop:3}}>
+                        Fleet totals. This is the amount you file.
+                      </div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:26,fontWeight:800,color:fleetReturn.totalDue>=0?T.text:T.green}}>
+                        ${Math.abs(fleetReturn.totalDue).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}
+                        <span style={{fontSize:13,color:T.muted,marginLeft:6,fontWeight:600}}>CAD</span>
+                      </div>
+                      <div style={{fontSize:11,color:T.muted}}>
+                        {fleetReturn.totalDue>=0 ? "owed" : "credit"}
+                        {fleetReturn.surcharge!==0 && ` · incl. $${fleetReturn.surcharge.toFixed(2)} surcharge`}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                    {[
+                      ["Total distance", `${fleetReturn.totalKm.toLocaleString()} km`, null],
+                      ["Total diesel",   `${fleetReturn.totalLitres.toLocaleString()} L`, null],
+                      ["Fleet economy",  `${fleetReturn.fleetEcon} L/100km`, fleetReturn.econFlagged?T.amber:null],
+                      ["Net tax",        `$${fleetReturn.netTax.toFixed(2)}`, null],
+                    ].map(([l,v,c])=>(
+                      <div key={l} style={{flex:"1 1 140px",padding:"10px 12px",background:T.surface,borderRadius:6}}>
+                        <div style={{fontSize:10,color:T.muted,textTransform:"uppercase",letterSpacing:"0.04em"}}>{l}</div>
+                        <div style={{fontSize:15,fontWeight:700,color:c||T.text,marginTop:2}}>{v}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {fleetReturn.unassignedLitres > 0 && (
+                    <div style={{marginTop:12,padding:"9px 12px",borderRadius:6,fontSize:11.5,lineHeight:1.5,
+                                 background:"rgba(14,165,233,0.08)",border:`1px solid ${T.blue}`,color:T.text}}>
+                      <strong>{fleetReturn.unassignedLitres.toLocaleString()} L ({fleetReturn.unassignedPct}%)</strong> of
+                      diesel has no truck assignment — <strong>it is included in the tax above</strong>, because the fleet
+                      bought it and paid tax on it at the pump. Assign the cards in <em>Card Assignments</em> only to
+                      complete the per-truck audit report; the amount you file will not change.
+                    </div>
+                  )}
+
+                  {fleetReturn.econFlagged && (
+                    <div style={{marginTop:8,padding:"9px 12px",borderRadius:6,fontSize:11.5,
+                                 background:"rgba(245,158,11,0.1)",border:"1px solid #f59e0b",color:T.amber}}>
+                      ⚠️ Fleet economy of {fleetReturn.fleetEcon} L/100km is outside the expected {FUEL_ECON_MIN}–{FUEL_ECON_MAX} range.
+                      Usually this means a fuel or distance file is incomplete — check both are the full quarter before filing.
+                    </div>
+                  )}
+
+                  {/* Per-jurisdiction */}
+                  <table style={{width:"100%",borderCollapse:"collapse",fontSize:12,marginTop:14}}>
+                    <thead>
+                      <tr style={{borderBottom:`1px solid ${T.border}`}}>
+                        {["Juris","Km","L consumed","L bought","Net taxable L","Rate","Tax"].map((h,i)=>(
+                          <th key={h} style={{textAlign:i===0?"left":"right",padding:"7px 6px",fontSize:10,
+                                fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.04em"}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {fleetReturn.rows.map(r=>(
+                        <tr key={r.jurisdiction} style={{borderBottom:`1px solid ${T.border}`}}>
+                          <td style={{padding:"6px",fontWeight:700,color:T.text}}>
+                            {r.jurisdiction}
+                            {r.missingRate   && <span style={{marginLeft:6,fontSize:9,color:"#ef4444"}}>NO RATE</span>}
+                            {r.noFuelWarning && <span style={{marginLeft:6,fontSize:9,color:T.dim}}>no fuel bought</span>}
+                            {r.noKmWarning   && <span style={{marginLeft:6,fontSize:9,color:T.amber}}>no km driven</span>}
+                          </td>
+                          <td style={{padding:"6px",textAlign:"right",color:T.muted}}>{r.km.toLocaleString()}</td>
+                          <td style={{padding:"6px",textAlign:"right",color:T.muted}}>{r.litresConsumed.toLocaleString()}</td>
+                          <td style={{padding:"6px",textAlign:"right",color:T.muted}}>{r.litresPurchased.toLocaleString()}</td>
+                          <td style={{padding:"6px",textAlign:"right",color:r.taxable>=0?T.text:T.green}}>{r.taxable.toLocaleString()}</td>
+                          <td style={{padding:"6px",textAlign:"right",color:T.dim}}>{r.taxRate!=null?r.taxRate.toFixed(4):"—"}</td>
+                          <td style={{padding:"6px",textAlign:"right",fontWeight:700,
+                                      color:r.taxDue==null?T.dim:(r.taxDue>=0?T.text:T.green)}}>
+                            {r.taxDue!=null ? `$${r.taxDue.toFixed(2)}` : "—"}
+                            {r.surchargeDue ? <span style={{color:T.amber,fontWeight:500}}> +{r.surchargeDue.toFixed(2)}</span> : null}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Per-truck breakdown (audit support — see note above) */}
               <div style={{display:"flex",gap:10,marginBottom:20,flexWrap:"wrap"}}>
                 <StatCard label="Units" value={results.length}/>
                 <StatCard label="Total KM" value={totalKm.toLocaleString()} sub={`${results.filter(r=>r.totalKm>0).length} with GPS data`}/>
@@ -1996,7 +2415,7 @@ export default function IFTAPage() {
       )}
 
       {/* ── SETUP TAB ── */}
-      {tab==="setup" && <FuelCardsTab/>}
+      {tab==="setup" && <CardAssignmentsTab fleetUnits={fleetUnits}/>}
 
       {/* ── TAX RATES TAB ── */}
       {tab==="rates" && (
