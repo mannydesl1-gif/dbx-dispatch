@@ -129,7 +129,7 @@ async function drawTopHeader(pdfDoc, page, order, client, fonts, opts = {}) {
   const bolStartY = y;
   if (opts.title) {
     page.drawText(opts.title, { x: M, y, size: 11, font: helveticaBold, color: red });
-    y -= 22;
+    y -= 26;
   }
   page.drawText(`BOL ${order.bol}`, { x: M, y, size: 28, font: helveticaBold, color: red });
   y -= 28;
@@ -163,7 +163,7 @@ async function drawTopHeader(pdfDoc, page, order, client, fonts, opts = {}) {
     if (client) {
       const addrLines = [client.street, [client.city, client.provState].filter(Boolean).join(", "), client.postalZip, client.country, client.email].filter(Boolean);
       for (const line of addrLines) {
-        page.drawText(line, { x: M, y, size: 9, font: helvetica, color: grayMid });
+        page.drawText(line, { x: M, y, size: 9, font: helvetica, color: black });
         y -= 11;
       }
     }
@@ -374,34 +374,51 @@ async function generateBolPdf(order, client = null, includePricing = false) {
       y -= 6;
     };
     if (!isMultiStop) {
-      // ── Single pickup + single delivery: original side-by-side layout (unchanged) ──
-      const boxH = 100;
+      // ── Single pickup + single delivery: side-by-side, dynamic height ──
       const ps = pickStops[0], ds = delStops[0];
-      page.drawRectangle({ x: M, y: y - boxH, width: boxW, height: boxH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
-      page.drawText("PICK UP", { x: M + 6, y: y - 12, size: 8, font: helveticaBold, color: gray });
-      if (ps.date) { const pd = fd(ps.date); page.drawText(pd, { x: M + boxW - 6 - helveticaBold.widthOfTextAtSize(pd, 9), y: y - 12, size: 9, font: helveticaBold, color: black }); }
-      let py = y - 26;
-      if (ps.co) { page.drawText(ps.co, { x: M + 6, y: py, size: 9, font: helveticaBold, color: black }); py -= 12; }
-      drawWrapped(page, ps.addr || "—", M + 6, py, boxW - 12, helvetica, 8, black);
-      if (ps.contact || ps.phone) {
-        const cs = [ps.contact, ps.phone].filter(Boolean).join("  ·  ");
-        page.drawText(cs, { x: M + 6, y: y - boxH + 14, size: 7, font: helvetica, color: rgb(0.28, 0.35, 0.42) });
-      }
-      page.drawRectangle({ x: dx, y: y - boxH, width: boxW, height: boxH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
-      page.drawText("DELIVERY", { x: dx + 6, y: y - 12, size: 8, font: helveticaBold, color: gray });
-      if (ds.date) { const dd = fd(ds.date); page.drawText(dd, { x: dx + boxW - 6 - helveticaBold.widthOfTextAtSize(dd, 9), y: y - 12, size: 9, font: helveticaBold, color: black }); }
-      let dy = y - 26;
-      if (ds.co) { page.drawText(ds.co, { x: dx + 6, y: dy, size: 9, font: helveticaBold, color: black }); dy -= 12; }
-      drawWrapped(page, ds.addr || "—", dx + 6, dy, boxW - 12, helvetica, 8, black);
-      if (ds.contact || ds.phone) {
-        const cs = [ds.contact, ds.phone].filter(Boolean).join("  ·  ");
-        page.drawText(cs, { x: dx + 6, y: y - boxH + 14, size: 7, font: helvetica, color: rgb(0.28, 0.35, 0.42) });
-      }
-      y = y - boxH - 8;
-      // Stop notes for single-stop
-      if (ps.notes) { await drawStopNotes(ps.notes); }
-      if (ds.notes) { await drawStopNotes(ds.notes); }
-      y -= 8;
+
+      // Measure content height for each box so both can share the taller height
+      const measureBox = (s) => {
+        let lines = 0;
+        if (s.co) lines += 1;                                  // company name
+        const addrLines = wrapLines(s.addr || "—", boxW - 12, helvetica, 8);
+        lines += addrLines.length;                             // address lines
+        if (s.contact || s.phone) lines += 1;                  // contact/phone line
+        let noteLines = [];
+        if (s.notes && String(s.notes).trim()) {
+          noteLines = wrapLines(String(s.notes), boxW - 16, helvetica, 8);
+          lines += 1 + noteLines.length;                       // "Notes:" label + note lines
+        }
+        return { addrLines, noteLines };
+      };
+      const pm = measureBox(ps), dm = measureBox(ds);
+      // Height = header(26) + content lines*11 + padding(14)
+      const linesFor = (s, m) => (s.co?1:0) + m.addrLines.length + ((s.contact||s.phone)?1:0) + (m.noteLines.length? 1 + m.noteLines.length : 0);
+      const contentLines = Math.max(linesFor(ps, pm), linesFor(ds, dm));
+      const boxH = Math.max(100, 34 + contentLines * 11 + 10);
+
+      // Draw one box
+      const drawBox = (bx, label, s, m) => {
+        page.drawRectangle({ x: bx, y: y - boxH, width: boxW, height: boxH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
+        page.drawText(label, { x: bx + 6, y: y - 12, size: 8, font: helveticaBold, color: gray });
+        if (s.date) { const dd = fd(s.date); page.drawText(dd, { x: bx + boxW - 6 - helveticaBold.widthOfTextAtSize(dd, 9), y: y - 12, size: 9, font: helveticaBold, color: black }); }
+        let ly = y - 28;
+        if (s.co) { page.drawText(s.co, { x: bx + 6, y: ly, size: 9, font: helveticaBold, color: black }); ly -= 12; }
+        for (const ln of m.addrLines) { page.drawText(ln, { x: bx + 6, y: ly, size: 8, font: helvetica, color: black }); ly -= 11; }
+        if (s.contact || s.phone) {
+          const cs = [s.contact, s.phone].filter(Boolean).join("  ·  ");
+          ly -= 2;
+          page.drawText(cs, { x: bx + 6, y: ly, size: 8, font: helveticaBold, color: black }); ly -= 12;
+        }
+        if (m.noteLines.length) {
+          ly -= 2;
+          page.drawText("Notes:", { x: bx + 6, y: ly, size: 7, font: helveticaBold, color: rgb(0.71, 0.33, 0.0) }); ly -= 10;
+          for (const ln of m.noteLines) { page.drawText(ln, { x: bx + 6, y: ly, size: 8, font: helvetica, color: black }); ly -= 11; }
+        }
+      };
+      drawBox(M, "PICK UP", ps, pm);
+      drawBox(dx, "DELIVERY", ds, dm);
+      y = y - boxH - 12;
       await drawItemsTable(delStops[0].items && delStops[0].items.length ? delStops[0].items : order.items);
     } else {
       // ── Multi-stop: stacked PICK UP block(s) then DELIVERY blocks, each with items + sign-off ──
