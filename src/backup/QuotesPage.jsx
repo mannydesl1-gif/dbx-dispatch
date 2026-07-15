@@ -44,8 +44,8 @@ export default function QuotesPage({ clients: clientsProp }) {
   const [fxLoading, setFxLoading] = useState(false);
   const [fxDate, setFxDate] = useState("");
 
-  const CURRENCIES = ["USD","CAD","EUR","GBP","ZAR"];
-  const symFor = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":"$";
+  const CURRENCIES = ["USD","CAD","EUR","GBP","ZAR","SGD","AED"];
+  const symFor = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":c==="SGD"?"S$":c==="AED"?"AED ":"$";
 
   // Returns { USD: 1234.56, CAD: 789.00, ... } — only currencies actually used
   const subtotalByCurrency = (lines, quoteCur) => {
@@ -646,6 +646,8 @@ export default function QuotesPage({ clients: clientsProp }) {
             <option value="USD">USD ($)</option>
             <option value="EUR">EUR (€)</option>
             <option value="GBP">GBP (£)</option>
+            <option value="SGD">SGD (S$)</option>
+            <option value="AED">AED (AED)</option>
           </select>
         </div>
 
