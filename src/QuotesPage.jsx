@@ -477,9 +477,15 @@ export default function QuotesPage({ clients: clientsProp }) {
 
   const [search, setSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
+  const [filterClient, setFilterClient] = useState("all");
   const [filterDiv, setFilterDiv] = useState("all");
   const [filterFrom, setFilterFrom] = useState("");
   const [filterTo, setFilterTo] = useState("");
+
+  // Clients that actually have quotes — keeps the dropdown short and relevant,
+  // rather than listing every client in the system.
+  const quoteClients = [...new Set(quotes.map(q=>(q.cliName||"").trim()).filter(Boolean))]
+    .sort((a,b)=>a.localeCompare(b));
 
   const filteredQuotes = quotes.filter(q => {
     const s = search.toLowerCase().trim();
@@ -494,6 +500,7 @@ export default function QuotesPage({ clients: clientsProp }) {
       if(!match) return false;
     }
     if(filterStatus!=="all" && q.status!==filterStatus) return false;
+    if(filterClient!=="all" && (q.cliName||"").trim() !== filterClient) return false;
     if(filterDiv!=="all" && q.divId!==filterDiv) return false;
     if(filterFrom && q.date < filterFrom) return false;
     if(filterTo && q.date > filterTo) return false;
@@ -521,6 +528,14 @@ export default function QuotesPage({ clients: clientsProp }) {
               <span style={{position:"absolute",left:8,top:"50%",transform:"translateY(-50%)",color:T.muted,fontSize:13}}>🔍</span>
               <input style={{...sIn,paddingLeft:28}} value={search} onChange={e=>setSearch(e.target.value)} placeholder="Quote #, client, project, description..."/>
             </div>
+          </div>
+          {/* Client filter */}
+          <div style={{flex:"0 0 190px"}}>
+            <label style={sLbl}>Client</label>
+            <select style={sIn} value={filterClient} onChange={e=>setFilterClient(e.target.value)}>
+              <option value="all">All Clients</option>
+              {quoteClients.map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
           </div>
           {/* Status filter */}
           <div style={{flex:"0 0 130px"}}>
@@ -556,9 +571,18 @@ export default function QuotesPage({ clients: clientsProp }) {
               style={{...sBtn,alignSelf:"flex-end",padding:"7px 12px",fontSize:11}}>✕ Clear</button>
           }
         </div>
-        <div style={{fontSize:10,color:T.dim,marginTop:8}}>
-          {filteredQuotes.length} of {quotes.length} quote{quotes.length!==1?"s":""}
-          {filteredQuotes.length>0 && ` · Total: $${filteredQuotes.reduce((a,q)=>a+calcTotal(q),0).toFixed(2)}`}
+        <div style={{fontSize:10,color:T.dim,marginTop:8,display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+          <span>
+            {filteredQuotes.length} of {quotes.length} quote{quotes.length!==1?"s":""}
+            {filteredQuotes.length>0 && ` · Total: $${filteredQuotes.reduce((a,q)=>a+calcTotal(q),0).toFixed(2)}`}
+          </span>
+          {(search || filterClient!=="all" || filterStatus!=="all" || filterDiv!=="all" || filterFrom || filterTo) && (
+            <button
+              onClick={()=>{setSearch("");setFilterClient("all");setFilterStatus("all");setFilterDiv("all");setFilterFrom("");setFilterTo("");}}
+              style={{background:"none",border:"none",color:T.blue,fontSize:10,cursor:"pointer",fontFamily:"inherit",padding:0,textDecoration:"underline"}}>
+              Clear filters
+            </button>
+          )}
         </div>
       </div>
 

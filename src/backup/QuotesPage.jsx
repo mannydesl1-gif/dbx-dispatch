@@ -29,6 +29,7 @@ const fd = d => d ? new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"s
 const uid = () => Math.random().toString(36).slice(2,8).toUpperCase();
 
 const emptyLine = () => ({ id:uid(), qty:"1", desc:"", unitPrice:"", equipment:"", currency:"" });
+const emptyFreight = () => ({ id:uid(), pieces:"", desc:"", weight:"", weightUnit:"kg", length:"", width:"", height:"", dimUnit:"cm", commodity:"", unNumber:"", hazClass:"" });
 
 export default function QuotesPage({ clients: clientsProp }) {
   const [quotes, setQuotes] = useState([]);
@@ -147,12 +148,14 @@ export default function QuotesPage({ clients: clientsProp }) {
     consigneeName: "", consigneeStreet: "", consigneeCity: "", consigneeProvState: "", consigneePostalZip: "", consigneeCountry: "",
     date: today(),
     dueDate: "",
+    clientRef: "",
     project: "",
     attention: "",
     salesperson: "Manuel Deslauriers",
     paymentTerms: "Net 30",
     equipment: [],
     lines: [emptyLine(), emptyLine(), emptyLine()],
+    freight: [],
     taxRate: "",
     other: "",
     otherLabel: "Other",
@@ -178,6 +181,9 @@ export default function QuotesPage({ clients: clientsProp }) {
   const updateLine = (idx, k, v) => setForm(p=>{ const lines=[...p.lines]; lines[idx]={...lines[idx],[k]:v}; return {...p,lines}; });
   const addLine = () => setForm(p=>({...p, lines:[...p.lines, emptyLine()]}));
   const removeLine = (idx) => setForm(p=>({...p, lines:p.lines.filter((_,i)=>i!==idx)}));
+  const updateFreight = (idx, k, v) => setForm(p=>{ const freight=[...(p.freight||[])]; freight[idx]={...freight[idx],[k]:v}; return {...p,freight}; });
+  const addFreight = () => setForm(p=>({...p, freight:[...(p.freight||[]), emptyFreight()]}));
+  const removeFreight = (idx) => setForm(p=>({...p, freight:(p.freight||[]).filter((_,i)=>i!==idx)}));
 
   const subtotal = (lines, quoteCur) => {
     // For list view / single-currency display: sum all lines treating amounts as same currency
@@ -282,7 +288,12 @@ export default function QuotesPage({ clients: clientsProp }) {
     `).join("");
 
     const taxRow = taxRate>0 ? `<tr><td class="lbl">Tax (${taxRate}%)</td><td class="val">${sym}${((grandTotal||0)*(taxRate/100)).toFixed(2)}</td></tr>` : `<tr><td class="lbl">Tax</td><td class="val">${sym}0.00</td></tr>`;
-    const otherRow = otherAmt>0 ? `<tr><td class="lbl">${f.otherLabel||"Other"}</td><td class="val">${sym}${otherAmt.toFixed(2)}</td></tr>` : "";
+    const hasOtherLabel = (f.otherLabel||"").trim() && (f.otherLabel||"").trim().toLowerCase() !== "other";
+    const otherRow = otherAmt>0
+      ? `<tr><td class="lbl">${f.otherLabel||"Other"}</td><td class="val">${sym}${otherAmt.toFixed(2)}</td></tr>`
+      : (hasOtherLabel
+          ? `<tr><td class="lbl">${f.otherLabel}</td><td class="val" style="color:#c2410c;font-style:italic">TBD</td></tr>`
+          : "");
 
     const convNote = multiCur && rateDate ? `
       <div style="font-size:9px;color:#888;margin-bottom:4px;font-style:italic">
@@ -345,6 +356,7 @@ export default function QuotesPage({ clients: clientsProp }) {
         <div class="quote-title">QUOTE</div>
         <div style="font-size:11px;color:#555">
           <strong>${f.quoteNum}</strong><br>
+          ${f.clientRef?`Your Ref: ${f.clientRef}<br>`:""}
           Date: ${fd(f.date)}<br>
           ${f.dueDate?`Valid Until: ${fd(f.dueDate)}<br>`:""}
           ${f.paymentTerms?`Payment: ${f.paymentTerms}`:""}
@@ -407,6 +419,36 @@ export default function QuotesPage({ clients: clientsProp }) {
         <tr class="total-row"><td class="lbl">TOTAL (${cur})</td><td class="val">${sym}${grandTotal!==null?grandTotal.toFixed(2):"—"}</td></tr>
       </tbody></table>
     </div>
+
+    ${(f.freight||[]).filter(fr=>fr.desc||fr.pieces||fr.weight||fr.length||fr.commodity).length ? `
+    <div style="margin-bottom:20px">
+      <div style="font-size:9px;font-weight:700;color:#0ea5e9;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Freight Details</div>
+      <table style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="border-bottom:1px solid #e2e8f0">
+            <th style="text-align:left;padding:4px 8px;font-size:9px;color:#64748b;text-transform:uppercase">Pcs</th>
+            <th style="text-align:left;padding:4px 8px;font-size:9px;color:#64748b;text-transform:uppercase">Description</th>
+            <th style="text-align:left;padding:4px 8px;font-size:9px;color:#64748b;text-transform:uppercase">Dimensions</th>
+            <th style="text-align:left;padding:4px 8px;font-size:9px;color:#64748b;text-transform:uppercase">Weight</th>
+            <th style="text-align:left;padding:4px 8px;font-size:9px;color:#64748b;text-transform:uppercase">Commodity</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${(f.freight||[]).filter(fr=>fr.desc||fr.pieces||fr.weight||fr.length||fr.commodity).map(fr=>{
+            const dims = (fr.length||fr.width||fr.height) ? `${fr.length||"?"}×${fr.width||"?"}×${fr.height||"?"} ${fr.dimUnit||"cm"}` : "";
+            const wt = fr.weight ? `${fr.weight} ${fr.weightUnit||"kg"}` : "";
+            const dg = fr.unNumber || fr.hazClass ? `<br><span style="font-size:9px;color:#dc2626;font-weight:600">${[fr.unNumber,fr.hazClass].filter(Boolean).join(" · ")}</span>` : "";
+            return `<tr>
+              <td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:10px">${fr.pieces||""}</td>
+              <td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:10px">${fr.desc||""}</td>
+              <td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:10px">${dims}</td>
+              <td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:10px">${wt}</td>
+              <td style="padding:4px 8px;border-bottom:1px solid #eee;font-size:10px">${fr.commodity||""}${dg}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+      </table>
+    </div>`:""}
 
     ${f.scopeOfWork?`
     <div style="margin-bottom:20px;padding:14px 16px;background:#fff7ed;border-left:4px solid #f97316;border-radius:0 4px 4px 0">
@@ -655,6 +697,7 @@ export default function QuotesPage({ clients: clientsProp }) {
         <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:8,padding:14}}>
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
             <div><label style={sLbl}>Quote #</label><input style={sIn} value={form.quoteNum} onChange={e=>setF("quoteNum",e.target.value)}/></div>
+            <div><label style={sLbl}>Client Reference # <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>(optional)</span></label><input style={sIn} value={form.clientRef} onChange={e=>setF("clientRef",e.target.value)} placeholder="Their internal ref #"/></div>
             <div><label style={sLbl}>Date</label><input type="date" style={sIn} value={form.date} onChange={e=>setF("date",e.target.value)}/></div>
             <div><label style={sLbl}>Valid Until</label><input type="date" style={sIn} value={form.dueDate} onChange={e=>setF("dueDate",e.target.value)}/></div>
             <div><label style={sLbl}>Payment Terms</label>
@@ -823,6 +866,52 @@ export default function QuotesPage({ clients: clientsProp }) {
             </span>
           </div>
         </div>
+      </div>
+
+      {/* Freight Details — optional structured shipment specs, shown on client PDF */}
+      <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:8,padding:14,marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,flexWrap:"wrap"}}>
+          <span style={{fontSize:11,fontWeight:700,color:"#0ea5e9",textTransform:"uppercase",letterSpacing:"0.05em"}}>📦 Freight Details</span>
+          <span style={{fontSize:10,color:T.dim,fontStyle:"italic"}}>optional — pieces, dimensions, weight, commodity</span>
+          <span style={{fontSize:10,color:"#0ea5e9",background:"rgba(14,165,233,0.12)",padding:"2px 8px",borderRadius:10,fontWeight:600}}>Visible on client PDF</span>
+        </div>
+        {(form.freight||[]).length===0 && (
+          <div style={{fontSize:12,color:T.dim,marginBottom:10}}>No freight details added. Use this when quoting general freight and you have the piece count, dimensions, weight, or commodity.</div>
+        )}
+        {(form.freight||[]).map((fr,idx)=>(
+          <div key={fr.id} style={{border:`1px solid ${T.border}`,borderRadius:6,padding:10,marginBottom:8,background:T.bg}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+              <span style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase"}}>Item {idx+1}</span>
+              <button onClick={()=>removeFreight(idx)} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:13,fontWeight:700}}>✕</button>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"70px 1fr",gap:8,marginBottom:8}}>
+              <div><label style={sLbl}>Pieces</label><input style={sIn} value={fr.pieces} onChange={e=>updateFreight(idx,"pieces",e.target.value)} placeholder="1"/></div>
+              <div><label style={sLbl}>Description</label><input style={sIn} value={fr.desc} onChange={e=>updateFreight(idx,"desc",e.target.value)} placeholder="e.g. crate, pallet, aircraft engine"/></div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 90px 1fr 90px",gap:8,marginBottom:8}}>
+              <div><label style={sLbl}>Length</label><input style={sIn} value={fr.length} onChange={e=>updateFreight(idx,"length",e.target.value)} placeholder="L"/></div>
+              <div><label style={sLbl}>Width</label><input style={sIn} value={fr.width} onChange={e=>updateFreight(idx,"width",e.target.value)} placeholder="W"/></div>
+              <div><label style={sLbl}>Height</label><input style={sIn} value={fr.height} onChange={e=>updateFreight(idx,"height",e.target.value)} placeholder="H"/></div>
+              <div><label style={sLbl}>Unit</label>
+                <select style={sIn} value={fr.dimUnit} onChange={e=>updateFreight(idx,"dimUnit",e.target.value)}>
+                  <option value="cm">cm</option><option value="in">in</option>
+                </select>
+              </div>
+              <div><label style={sLbl}>Weight</label><input style={sIn} value={fr.weight} onChange={e=>updateFreight(idx,"weight",e.target.value)} placeholder="0"/></div>
+              <div><label style={sLbl}>Unit</label>
+                <select style={sIn} value={fr.weightUnit} onChange={e=>updateFreight(idx,"weightUnit",e.target.value)}>
+                  <option value="kg">kg</option><option value="lb">lb</option>
+                </select>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 120px 1fr",gap:8}}>
+              <div><label style={sLbl}>Commodity <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>(optional)</span></label><input style={sIn} value={fr.commodity} onChange={e=>updateFreight(idx,"commodity",e.target.value)} placeholder="e.g. Airline engine — DANGEROUS GOODS"/></div>
+              <div><label style={sLbl}>UN # <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>(DG)</span></label><input style={sIn} value={fr.unNumber} onChange={e=>updateFreight(idx,"unNumber",e.target.value)} placeholder="UN3528"/></div>
+              <div><label style={sLbl}>Class <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>(DG)</span></label><input style={sIn} value={fr.hazClass} onChange={e=>updateFreight(idx,"hazClass",e.target.value)} placeholder="Class 3 Flammable"/></div>
+            </div>
+          </div>
+        ))}
+        <button onClick={addFreight} style={{padding:"8px 14px",borderRadius:6,border:`1px dashed ${T.border}`,background:"transparent",color:T.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit"}}>+ Add Freight Item</button>
       </div>
 
       {/* Scope of Work — shown on client PDF */}
