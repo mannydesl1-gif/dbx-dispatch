@@ -1285,6 +1285,200 @@ exports.dailyPickupReminder = onSchedule({
 });
 // Thu May  7 10:51:56 PM UTC 2026
 
+// ═══ DAILY CERTIFICATION & EQUIPMENT EXPIRY DIGEST ═══════════════════════════
+// Runs every morning; emails anything expired or expiring within 30 days.
+const CERT_ALERT_RECIPIENTS = [
+  "manny@diamondbackexpress.com",
+  "nichole@diamondbackexpress.com",
+  "chris@diamondbackexpress.com",
+];
+
+const DIGEST_CERTS = [
+  { k: "acrDate", l: "ACR Training", months: 12 },
+  { k: "hazmatDate", l: "HazMat Training", months: 36 },
+  { k: "crimDate", l: "Criminal Record Check", months: 60 },
+  { k: "licenseExpiry", l: "Driver's Licence", direct: true },
+];
+
+// Effective expiry (YYYY-MM-DD) for a cert, or null when it never expires.
+function digestExpiry(dateStr, months, direct) {
+  if (!dateStr) return null;
+  if (direct) return dateStr;
+  if (!months) return null;
+  const d = new Date(dateStr + "T12:00:00");
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+function digestDaysLeft(expStr) {
+  if (!expStr) return null;
+  const ms = new Date(expStr + "T12:00:00") - new Date();
+  return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+// ─── ALERT CADENCE ───────────────────────────────────────────────────────────
+// First notice at 30 days out, then every 5 days: 30, 25, 20, 15, 10, 5, and 0
+// (expiration day itself). Purely a function of days-remaining, so nothing is
+// stored per record — updating an expiry date pushes days back above 30 and the
+// item simply stops matching. No flags to reset.
+const ALERT_DAYS = [30, 25, 20, 15, 10, 5, 0];
+
+// Should this record be included in today's email?
+function digestDue(days) {
+  if (days === null) return false;
+  if (days < 0) return true;            // already expired — keep nagging daily
+  return ALERT_DAYS.includes(days);
+}
+
+function digestRow(name, role, kind, expStr, days) {
+  const color = days <= 0 ? "#dc2626" : days <= 10 ? "#ca8a04" : "#ea580c";
+  const state = days < 0 ? `EXPIRED ${Math.abs(days)}d ago`
+    : days === 0 ? "EXPIRES TODAY"
+    : `${days}d left`;
+  return `<tr><td><b>${name}</b></td><td>${role}</td><td>${kind}</td><td>${fd(expStr)}</td>` +
+         `<td style="color:${color};font-weight:700">${state}</td></tr>`;
+}
+
+// ─── PER-PERSON ALERT MUTE ───────────────────────────────────────────────────
+// Set alertsMuted:true on a driver/employee doc to pause their expiry emails
+// (sick leave, LOA, seasonal layoff). Optional alertsMutedUntil (YYYY-MM-DD)
+// auto-resumes the day AFTER that date, so a pause can't be forgotten.
+// alertsMutedReason is free text shown in the digest footer.
+function digestMuted(p, todayStr) {
+  if (!p.alertsMuted) return false;
+  if (p.alertsMutedUntil && p.alertsMutedUntil < todayStr) return false; // expired pause
+  return true;
+}
+
+// Driver / Employee / both — mirrors the role badges in the app.
+function digestRole(p) {
+  if (p.isSupplier) return "Supplier";
+  const r = [];
+  if (p.isDriver !== false) r.push("Driver");
+  if (p.isEmployee) r.push("Employee");
+  return r.join(" / ") || "Staff";
+}
+
+exports.dailyExpiryDigest = onSchedule({
+  schedule: "0 7 * * *",
+  timeZone: "America/Toronto",
+  secrets: ["GMAIL_APP_PASSWORD"],
+}, async () => {
+  try {
+    const db = admin.firestore();
+
+    const [drvSnap, trkSnap, trlSnap] = await Promise.all([
+      db.collection("drivers").get(),
+      db.collection("trucks").get(),
+      db.collection("trailers").get(),
+    ]);
+
+    const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Toronto" });
+
+    const people = [];
+    const muted = [];
+    drvSnap.docs.forEach(d => {
+      const p = d.data();
+      if (p.isSupplier) return; // suppliers carry no certifications
+      if (digestMuted(p, todayStr)) {
+        // Record the pause so it stays visible, but raise no alerts.
+        const anyDue = DIGEST_CERTS.some(c => {
+          const e = digestExpiry(p[c.k], c.months, c.direct);
+          return e && digestDaysLeft(e) <= 30;
+        });
+        if (anyDue) muted.push({
+          name: p.name || "(unnamed)",
+          role: digestRole(p),
+          until: p.alertsMutedUntil || "",
+          reason: p.alertsMutedReason || "",
+        });
+        return;
+      }
+      DIGEST_CERTS.forEach(c => {
+        const exp = digestExpiry(p[c.k], c.months, c.direct);
+        if (!exp) return;
+        const days = digestDaysLeft(exp);
+        if (!digestDue(days)) return;
+        people.push({ name: p.name || "(unnamed)", role: digestRole(p), kind: c.l, exp, days });
+      });
+    });
+
+    const units = [];
+    const collectUnit = (snap, kindLabel) => snap.docs.forEach(d => {
+      const u = d.data();
+      if (!u.safetyExp) return;
+      const days = digestDaysLeft(u.safetyExp);
+      if (!digestDue(days)) return;
+      const desc = [u.year, u.make, u.model].filter(Boolean).join(" ");
+      units.push({
+        name: `${kindLabel} ${u.unit || "(no unit #)"}${desc ? ` — ${desc}` : ""}`,
+        unitKind: kindLabel, kind: "Safety Inspection", exp: u.safetyExp, days,
+      });
+    });
+    collectUnit(trkSnap, "Truck");
+    collectUnit(trlSnap, "Trailer");
+
+    if (people.length === 0 && units.length === 0) {
+      console.log(`Expiry digest: nothing due today (${muted.length} muted person(s) skipped)`);
+      return;
+    }
+
+    people.sort((a, b) => a.days - b.days);
+    units.sort((a, b) => a.days - b.days);
+
+    const tableOpen = (col2) => `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px">` +
+      `<tr style="background:#f1f5f9"><th>Name</th><th>${col2}</th><th>Item</th><th>Expires</th><th>Status</th></tr>`;
+
+    let html = `<h2>⚠️ DBX — Certification &amp; Safety Expiry Digest</h2>` +
+      `<p style="font-size:13px;color:#475569">Notices go out 30 days before expiry, then every 5 days ` +
+      `(30, 25, 20, 15, 10, 5) and on the expiration day. Expired items are reported daily until renewed. ` +
+      `Updating the expiration date stops the reminders automatically.</p>`;
+
+    if (people.length) {
+      html += `<h3 style="color:#dc2626">Personnel Certifications (${people.length})</h3>${tableOpen("Role")}`;
+      people.forEach(r => { html += digestRow(r.name, r.role, r.kind, r.exp, r.days); });
+      html += `</table>`;
+    }
+    if (units.length) {
+      html += `<h3 style="color:#ea580c">Equipment Safety (${units.length})</h3>${tableOpen("Type")}`;
+      units.forEach(r => { html += digestRow(r.name, r.kind === "Safety Inspection" ? r.unitKind : "", r.kind, r.exp, r.days); });
+      html += `</table>`;
+    }
+
+    if (muted.length) {
+      html += `<h3 style="color:#64748b">Paused — no alerts sent (${muted.length})</h3>` +
+        `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:12px;color:#64748b">` +
+        `<tr style="background:#f8fafc"><th>Name</th><th>Role</th><th>Paused until</th><th>Reason</th></tr>`;
+      muted.forEach(m => {
+        html += `<tr><td><b>${m.name}</b></td><td>${m.role}</td>` +
+          `<td>${m.until ? fd(m.until) : "Indefinite"}</td><td>${m.reason || "—"}</td></tr>`;
+      });
+      html += `</table><p style="font-size:11px;color:#94a3b8">` +
+        `These people have items expiring but alerts are paused. Clear the pause in the app to resume.</p>`;
+    }
+
+    html += `<br><p style="font-size:11px;color:#888">Automated daily digest from DBX Dispatch.<br>` +
+      `Manage records at <a href="https://dbx.cargodx.ca">dbx.cargodx.ca</a></p>`;
+
+    const all = [...people, ...units];
+    const expiredCount = all.filter(r => r.days < 0).length;
+    const todayCount = all.filter(r => r.days === 0).length;
+    const soonCount = all.length - expiredCount - todayCount;
+    const subjBits = [];
+    if (expiredCount) subjBits.push(`${expiredCount} expired`);
+    if (todayCount) subjBits.push(`${todayCount} expiring today`);
+    if (soonCount) subjBits.push(`${soonCount} upcoming`);
+    await getTransporter().sendMail({
+      from: '"DBX Dispatch" <manny@diamondbackexpress.com>',
+      to: CERT_ALERT_RECIPIENTS.join(", "),
+      subject: `DBX Expiry Alert — ${subjBits.join(", ")}`,
+      html,
+    });
+
+    console.log(`Expiry digest sent: ${people.length} cert(s), ${units.length} unit(s)`);
+  } catch (error) {
+    console.error("Expiry digest error:", error);
+  }
+});
+
 // ─── TIMESHEET RECAP EMAIL WITH PDF ATTACHMENT ───────────────────────────────
 async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, cfg, event, message) {
   const pdfDoc = await PDFDocument.create();

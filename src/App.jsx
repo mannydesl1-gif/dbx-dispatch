@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect, lazy, Suspense } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, lazy, Suspense } from "react";
 import { db, storage, auth } from "./firebase.js";
 import { collection, doc, getDocs, addDoc, updateDoc, deleteDoc, getDoc, setDoc, increment, onSnapshot, where, query } from "firebase/firestore";
 import { ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
@@ -3818,19 +3818,20 @@ function DriversPage({items, save, col}) {
   const { confirm: cfm, modal: cfmModal } = useConfirm();
   const formRef = useRef(null);
   // Refs keyed by docKey for reliable matching
-  const fileRefs = { acrDocs: useRef(), hazmatDocs: useRef(), crimDocs: useRef(), bgDocs: useRef(), docs: useRef() };
+  const fileRefs = { acrDocs: useRef(), hazmatDocs: useRef(), crimDocs: useRef(), bgDocs: useRef(), licenseDocs: useRef(), docs: useRef() };
 
   const CERTS = [
     { k: "acrDate", l: "ACR Training", months: 12, docKey: "acrDocs" },
     { k: "hazmatDate", l: "HazMat Training", months: 36, docKey: "hazmatDocs" },
     { k: "crimDate", l: "Criminal Record Check", months: 60, docKey: "crimDocs" },
     { k: "bgDate", l: "Background Verification", months: 0, docKey: "bgDocs" },
+    { k: "licenseExpiry", l: "Driver's Licence", direct: true, docKey: "licenseDocs" },
   ];
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
-    setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], docs:item.docs||[] });
+    setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
     setEd(item.id);
     setTimeout(() => { const el = formRef.current; if(el) { el.scrollIntoView({ behavior:"smooth", block:"start" }); const main = el.closest("main"); if(main) main.scrollTop = 0; } }, 100);
   };
@@ -3997,9 +3998,16 @@ function DriversPage({items, save, col}) {
     d.setMonth(d.getMonth() + months);
     return d;
   };
-  const expColor = (dateStr, months) => {
-    if (months === 0) return dateStr ? "#22c55e" : null;
-    const exp = calcExpiry(dateStr, months);
+  // `direct` certs (e.g. driver's licence) store the expiry date itself rather
+  // than a start date + renewal interval.
+  const resolveExp = (dateStr, months, direct) => {
+    if (!dateStr) return null;
+    if (direct) return new Date(dateStr + "T12:00:00");
+    return calcExpiry(dateStr, months);
+  };
+  const expColor = (dateStr, months, direct) => {
+    if (!direct && months === 0) return dateStr ? "#22c55e" : null;
+    const exp = resolveExp(dateStr, months, direct);
     if (!exp) return null;
     const diff = Math.floor((exp - new Date()) / (1000 * 60 * 60 * 24));
     if (diff < 0) return "#ef4444";
@@ -4007,16 +4015,17 @@ function DriversPage({items, save, col}) {
     if (diff <= 90) return "#f97316";
     return "#22c55e";
   };
-  const expLabel = (dateStr, months) => {
-    if (months === 0) return dateStr ? "Done" : "";
-    const exp = calcExpiry(dateStr, months);
+  const expLabel = (dateStr, months, direct) => {
+    if (!direct && months === 0) return dateStr ? "Done" : "";
+    const exp = resolveExp(dateStr, months, direct);
     if (!exp) return "";
     const diff = Math.floor((exp - new Date()) / (1000 * 60 * 60 * 24));
     if (diff < 0) return "EXPIRED";
     if (diff <= 90) return `${diff}d left`;
     return "Valid";
   };
-  const expDate = (dateStr, months) => {
+  const expDate = (dateStr, months, direct) => {
+    if (direct) return dateStr || "";
     if (months === 0) return dateStr || "";
     const exp = calcExpiry(dateStr, months);
     return exp ? exp.toISOString().slice(0, 10) : "";
@@ -4036,12 +4045,16 @@ function DriversPage({items, save, col}) {
 
   // Collect all upcoming expirations for alert banner
   const alerts = [];
+  const todayIso = new Date().toLocaleDateString("en-CA");
+  const isMuted = p => p.alertsMuted === true && !(p.alertsMutedUntil && p.alertsMutedUntil < todayIso);
   items.forEach(drv => {
+    if (isMuted(drv)) return; // alerts paused for this person
     CERTS.forEach(c => {
-      if (!drv[c.k] || c.months === 0) return;
-      const ec = expColor(drv[c.k], c.months);
+      if (!drv[c.k]) return;
+      if (!c.direct && c.months === 0) return;
+      const ec = expColor(drv[c.k], c.months, c.direct);
       if (ec === "#ef4444" || ec === "#eab308" || ec === "#f97316") {
-        alerts.push({ name: drv.name, cert: c.l, color: ec, label: expLabel(drv[c.k], c.months), due: expDate(drv[c.k], c.months) });
+        alerts.push({ name: drv.name, cert: c.l, color: ec, label: expLabel(drv[c.k], c.months, c.direct), due: expDate(drv[c.k], c.months, c.direct) });
       }
     });
   });
@@ -4173,15 +4186,53 @@ function DriversPage({items, save, col}) {
 
       <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Certifications & Checks</div>
+
+        {/* Pause expiry alert emails for this person (sick leave, LOA, etc.) */}
+        <div style={{ marginBottom: 10, padding: 12, background: T["bg"], borderRadius: 8,
+          border: `1px solid ${fm.alertsMuted ? "#f59e0b" : T.border}` }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, cursor: "pointer" }}>
+            <input type="checkbox" checked={fm.alertsMuted === true} style={{ accentColor: "#f59e0b" }}
+              onChange={e => setFm(p => ({ ...p, alertsMuted: e.target.checked,
+                ...(e.target.checked ? {} : { alertsMutedUntil: "", alertsMutedReason: "" }) }))} />
+            <span style={{ fontWeight: 600 }}>Pause expiry alert emails</span>
+          </label>
+          <div style={{ fontSize: 10, color: T.dim, marginTop: 4, marginLeft: 24 }}>
+            Stops this person's certification reminders to the team. Their dates keep tracking normally
+            and still appear on reports — only the emails pause.
+          </div>
+          {fm.alertsMuted && <div style={{ marginTop: 10, marginLeft: 24 }}>
+            <Field l="Resume alerts on (optional)">
+              <DatePicker value={fm.alertsMutedUntil || ""} onChange={v => setFm(p => ({ ...p, alertsMutedUntil: v }))} placeholder="Leave blank to pause indefinitely..." />
+              <div style={{ fontSize: 10, color: T.dim, marginTop: 3 }}>
+                {fm.alertsMutedUntil
+                  ? `Alerts resume automatically on ${fd(fm.alertsMutedUntil)}.`
+                  : "No end date — alerts stay paused until you uncheck this box."}
+              </div>
+            </Field>
+            <Field l="Reason (optional)">
+              <input style={sIn} value={fm.alertsMutedReason || ""} placeholder="e.g. Sick leave, LOA, seasonal layoff"
+                onChange={e => setFm(p => ({ ...p, alertsMutedReason: e.target.value }))} />
+            </Field>
+          </div>}
+          <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>
+            {saving ? "Saving..." : "Save Alert Settings"}
+          </button>
+        </div>
         {CERTS.map(c => (
           <div key={c.k} style={{ marginBottom: 6, padding: 12, background: T["bg"], borderRadius: 8, border: `1px solid ${T.border}` }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: "#3b82f6", marginBottom: 6 }}>{c.l}</div>
-            <Field l="Date Completed">
+            {c.direct && <Field l="Licence Class">
+              <input style={sIn} value={fm.license || ""} onChange={e => setFm(p => ({ ...p, license: e.target.value }))} placeholder="e.g. AZ, DZ, G" />
+            </Field>}
+            <Field l={c.direct ? "Expiration Date" : "Date Completed"}>
               <DatePicker value={fm[c.k] || ""} onChange={v => setFm(p => ({ ...p, [c.k]: v }))} placeholder="Select date..." />
-              {fm[c.k] && c.months > 0 && <div style={{ fontSize: 10, marginTop: 3, color: expColor(fm[c.k], c.months) || T.muted }}>
+              {fm[c.k] && c.direct && <div style={{ fontSize: 10, marginTop: 3, color: expColor(fm[c.k], 0, true) || T.muted }}>
+                Expires: {fd(fm[c.k])} — {expLabel(fm[c.k], 0, true)}
+              </div>}
+              {fm[c.k] && !c.direct && c.months > 0 && <div style={{ fontSize: 10, marginTop: 3, color: expColor(fm[c.k], c.months) || T.muted }}>
                 Expires: {fd(expDate(fm[c.k], c.months))} — Renewal every {c.months} months — {expLabel(fm[c.k], c.months)}
               </div>}
-              {fm[c.k] && c.months === 0 && <div style={{ fontSize: 10, marginTop: 3, color: "#22c55e" }}>
+              {fm[c.k] && !c.direct && c.months === 0 && <div style={{ fontSize: 10, marginTop: 3, color: "#22c55e" }}>
                 Completed on {fd(fm[c.k])} — No renewal required
               </div>}
             </Field>
@@ -4215,6 +4266,7 @@ function DriversPage({items, save, col}) {
               {item.isSupplier && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#f9731618",color:"#f97316",border:"1px solid #f97316",marginRight:3,fontWeight:600}}>Supplier</span>}
               {!item.isSupplier && item.isDriver!==false && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#3b82f618",color:"#3b82f6",border:"1px solid #3b82f6",marginRight:3,fontWeight:600}}>Driver</span>}
               {!item.isSupplier && item.isEmployee && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#8b5cf618",color:"#8b5cf6",border:"1px solid #8b5cf6",fontWeight:600,marginRight:3}}>Employee</span>}
+              {isMuted(item) && <span title={[item.alertsMutedReason, item.alertsMutedUntil ? `until ${fd(item.alertsMutedUntil)}` : "indefinite"].filter(Boolean).join(" — ")} style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(245,158,11,0.12)",color:"#f59e0b",border:"1px solid #f59e0b",marginRight:3,fontWeight:600}}>🔕 Alerts paused</span>}
               {!item.isSupplier && item.employeeId && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(14,165,233,0.1)",color:"#0ea5e9",border:"1px solid #0ea5e9",marginRight:3,fontWeight:600}}>ID: {item.employeeId}</span>}
               {!item.isSupplier && item.pin && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(34,197,94,0.1)",color:"#22c55e",border:"1px solid #22c55e",fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>PIN: {item.pin}</span>}
             </span>
@@ -4248,12 +4300,12 @@ function DriversPage({items, save, col}) {
           {/* Cert badges */}
           {!item.isSupplier && <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8 }}>
             {CERTS.map(c => {
-              const ec = expColor(item[c.k], c.months);
-              const el = expLabel(item[c.k], c.months);
+              const ec = expColor(item[c.k], c.months, c.direct);
+              const el = expLabel(item[c.k], c.months, c.direct);
               const shortLabel = c.l.replace(" Training", "").replace(" Check", "").replace(" Verification", "");
               return <div key={c.k} style={{ fontSize: 10, padding: "3px 8px", borderRadius: 6, background: ec ? ec + "18" : Tbg, color: ec || T.dim, border: `1px solid ${ec || T.border}` }}>
-                {shortLabel}: {item[c.k] ? (c.months > 0
-                  ? <><span style={{ fontWeight: 700 }}>{el}</span> <span style={{ color: T.muted }}>({fd(expDate(item[c.k], c.months))})</span></>
+                {shortLabel}: {item[c.k] ? ((c.direct || c.months > 0)
+                  ? <><span style={{ fontWeight: 700 }}>{el}</span> <span style={{ color: T.muted }}>({fd(expDate(item[c.k], c.months, c.direct))})</span></>
                   : <><span style={{ fontWeight: 700 }}>Done</span> <span style={{ color: T.muted }}>({fd(item[c.k])})</span></>
                 ) : <span style={{ color: T.dim }}>Not set</span>}
               </div>;
@@ -4456,8 +4508,8 @@ function EquipPage({db, saveColl}) {
   return <div style={{padding:20}}>
     <h1 style={{fontSize:18,fontWeight:700,margin:0,marginBottom:12}}>Equipment</h1>
     <div style={{display:"flex",gap:6,marginBottom:12}}>{["trucks","trailers","history"].map(t=><button key={t} onClick={()=>setTab(t)} style={{padding:"6px 12px",borderRadius:6,background:tab===t?T.border:"transparent",border:`1px solid ${tab===t?"#334155":T.border}`,color:tab===t?T.text:T.muted,fontSize:12,cursor:"pointer",textTransform:"capitalize",fontFamily:"inherit"}}>{t==="history"?"Vehicle History":t}</button>)}</div>
-    {tab==="trucks" && <EquipList title="Trucks" items={db.trucks} col="trucks" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
-    {tab==="trailers" && <EquipList title="Trailers" items={db.trailers} col="trailers" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
+    {tab==="trucks" && <EquipList title="Trucks" items={db.trucks} col="trucks" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"year",l:"Year",tp:"number"},{k:"make",l:"Make"},{k:"model",l:"Model"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
+    {tab==="trailers" && <EquipList title="Trailers" items={db.trailers} col="trailers" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"year",l:"Year",tp:"number"},{k:"make",l:"Make"},{k:"model",l:"Model"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
     {tab==="history" && <VehicleHistory/>}
   </div>;
 }
@@ -4559,7 +4611,7 @@ function EquipList({title, items, col, fields, saveColl}) {
       {items.filter(item => {
         if (!srch) return true;
         const s = srch.toLowerCase();
-        return fields.some(f => (item[f.k]||"").toLowerCase().includes(s));
+        return fields.some(f => String(item[f.k]??"").toLowerCase().includes(s));
       }).sort((a,b) => (a.unit||"").toLowerCase().localeCompare((b.unit||"").toLowerCase())).map(item => {
         const ec = expColor(item.safetyExp);
         return <div key={item.id} style={sCrd}>
@@ -4747,7 +4799,366 @@ function CrewPage({fireDb}) {
 }
 
 // ═══ REPORTS PAGE ═══
+// ═══════════════════════════════════════════════════════════════════════════
+// ROSTER & EQUIPMENT REPORTS
+// PDF via print-window (same approach as BOL), Excel via SheetJS (xlsx).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const RPT_CERTS = [
+  { k: "acrDate", l: "ACR Training", months: 12 },
+  { k: "hazmatDate", l: "HazMat Training", months: 36 },
+  { k: "crimDate", l: "Criminal Record Check", months: 60 },
+  { k: "bgDate", l: "Background Verification", months: 0 },
+  { k: "licenseExpiry", l: "Driver's Licence", direct: true },
+];
+
+// Resolve a cert's effective expiry date (YYYY-MM-DD) or "" when N/A.
+function rptExpDate(dateStr, months, direct) {
+  if (!dateStr) return "";
+  if (direct) return dateStr;
+  if (!months) return dateStr;
+  const d = new Date(dateStr + "T12:00:00");
+  d.setMonth(d.getMonth() + months);
+  return d.toISOString().slice(0, 10);
+}
+function rptDaysLeft(expStr) {
+  if (!expStr) return null;
+  return Math.floor((new Date(expStr + "T12:00:00") - new Date()) / (1000 * 60 * 60 * 24));
+}
+function rptStatus(dateStr, months, direct) {
+  if (!dateStr) return { txt: "Not set", color: "#94a3b8" };
+  if (!direct && months === 0) return { txt: "Done", color: "#16a34a" };
+  const exp = rptExpDate(dateStr, months, direct);
+  const dl = rptDaysLeft(exp);
+  if (dl === null) return { txt: "Not set", color: "#94a3b8" };
+  if (dl < 0) return { txt: `EXPIRED ${Math.abs(dl)}d ago`, color: "#dc2626" };
+  if (dl <= 30) return { txt: `${dl}d left`, color: "#ca8a04" };
+  if (dl <= 90) return { txt: `${dl}d left`, color: "#ea580c" };
+  return { txt: "Valid", color: "#16a34a" };
+}
+
+const rptFmtPay = (cfg) => {
+  if (!cfg) return "";
+  const parts = [];
+  if (cfg.hourly) parts.push(`Hourly: $${cfg.hourly}/hr`);
+  if (cfg.workDay) parts.push(`Work Day: $${cfg.workDay}`);
+  if (cfg.nonWorkDay) parts.push(`Non-Work Day: $${cfg.nonWorkDay}`);
+  if (cfg.perDiem) parts.push(`Per Diem: $${cfg.perDiem}`);
+  if (cfg.tripRate) parts.push(`Trip Rate: $${cfg.tripRate}`);
+  return parts.join(" | ");
+};
+
+const rptRole = (p) => {
+  if (p.isSupplier) return "Supplier";
+  const r = [];
+  if (p.isDriver !== false) r.push("Driver");
+  if (p.isEmployee) r.push("Employee");
+  return r.join(" / ") || "—";
+};
+
+const rptAddr = (p) => [p.street, p.city, p.provState, p.postalZip, p.country].filter(Boolean).join(", ");
+
+// ─── Field maps: every stored field, in report order ───
+function rptPersonRows(p) {
+  const rows = [
+    ["Name", p.name || ""],
+    ["Role", rptRole(p)],
+    ["Phone", p.phone || ""],
+    ["Email", p.email || ""],
+  ];
+  if (p.isSupplier) {
+    rows.push(["Contact Person", p.contactPerson || ""]);
+    rows.push(["Service Type", p.serviceType || ""]);
+  } else {
+    rows.push(["Licence Class", p.license || ""]);
+    rows.push(["Employee ID", p.employeeId || ""]);
+    rows.push(["PIN", p.pin || ""]);
+  }
+  rows.push(["Address", rptAddr(p)]);
+  if (!p.isSupplier) {
+    rows.push(["Pay Configuration", rptFmtPay(p.payCfg)]);
+    RPT_CERTS.forEach(c => {
+      const exp = rptExpDate(p[c.k], c.months, c.direct);
+      const st = rptStatus(p[c.k], c.months, c.direct);
+      const base = c.direct ? "" : (p[c.k] ? `Completed ${fd(p[c.k])}` : "");
+      const expTxt = exp ? `Expires ${fd(exp)}` : "";
+      rows.push([c.l, [base, expTxt, st.txt].filter(Boolean).join(" — ")]);
+    });
+  }
+  const docCount = ["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"]
+    .reduce((s,k) => s + (p[k]||[]).length, 0);
+  if (!p.isSupplier && p.alertsMuted) {
+    const until = p.alertsMutedUntil ? `until ${fd(p.alertsMutedUntil)}` : "indefinite";
+    rows.push(["Expiry Alerts", `PAUSED (${until})${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`]);
+  }
+  rows.push(["Documents on File", String(docCount)]);
+  return rows;
+}
+
+function rptUnitRows(u) {
+  const st = u.safetyExp ? rptStatus(u.safetyExp, 0, true) : null;
+  return [
+    ["Unit #", u.unit || ""],
+    ["Plate #", u.plate || ""],
+    ["Year", u.year != null ? String(u.year) : ""],
+    ["Make", u.make || ""],
+    ["Model", u.model || ""],
+    ["Type", u.type || ""],
+    ["VIN", u.vin || ""],
+    ["Safety Expiration", u.safetyExp ? `${fd(u.safetyExp)} — ${st.txt}` : ""],
+    ["Internal Notes", u.notes || ""],
+    ["Documents on File", String((u.docs || []).length)],
+  ];
+}
+
+// ─── Flat columns for multi-record (summary) reports ───
+const RPT_UNIT_COLS = [
+  ["Unit #", u => u.unit || ""],
+  ["Plate #", u => u.plate || ""],
+  ["Year", u => u.year != null ? String(u.year) : ""],
+  ["Make", u => u.make || ""],
+  ["Model", u => u.model || ""],
+  ["Type", u => u.type || ""],
+  ["VIN", u => u.vin || ""],
+  ["Safety Exp", u => u.safetyExp ? fd(u.safetyExp) : ""],
+  ["Safety Status", u => u.safetyExp ? rptStatus(u.safetyExp, 0, true).txt : "Not set"],
+  ["Notes", u => u.notes || ""],
+  ["Docs", u => String((u.docs || []).length)],
+];
+
+const RPT_PERSON_COLS = [
+  ["Name", p => p.name || ""],
+  ["Role", p => rptRole(p)],
+  ["Phone", p => p.phone || ""],
+  ["Email", p => p.email || ""],
+  ["Licence Class", p => p.license || ""],
+  ["Employee ID", p => p.employeeId || ""],
+  ["PIN", p => p.pin || ""],
+  ["Contact Person", p => p.contactPerson || ""],
+  ["Service Type", p => p.serviceType || ""],
+  ["Address", p => rptAddr(p)],
+  ["Pay Configuration", p => rptFmtPay(p.payCfg)],
+  ...RPT_CERTS.map(c => [c.l, p => {
+    const exp = rptExpDate(p[c.k], c.months, c.direct);
+    const st = rptStatus(p[c.k], c.months, c.direct);
+    return exp ? `${fd(exp)} (${st.txt})` : st.txt;
+  }]),
+  ["Expiry Alerts", p => p.alertsMuted
+    ? `PAUSED${p.alertsMutedUntil ? ` until ${fd(p.alertsMutedUntil)}` : ""}${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`
+    : "Active"],
+  ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
+];
+
+// ─── PDF (print window) ───
+const rptEsc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+function rptOpenPdf(title, bodyHtml) {
+  const w = window.open("", "_blank");
+  if (!w) { alert("Please allow popups to view the PDF."); return; }
+  w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${rptEsc(title)}</title>
+  <style>
+    @page { size: landscape; margin: 12mm; }
+    @media print { body { margin:0 } .no-print { display:none !important } .rec { page-break-inside: avoid } }
+    body { font-family:'Helvetica Neue',Arial,sans-serif; margin:0; padding:24px; background:#fff; color:#0f172a }
+    .hd { display:flex; align-items:center; gap:16px; border-bottom:3px solid #dc2626; padding-bottom:12px; margin-bottom:18px }
+    .hd img { height:54px }
+    .hd h1 { margin:0; font-size:20px; font-weight:700 }
+    .hd .meta { margin-left:auto; text-align:right; font-size:11px; color:#64748b }
+    table { border-collapse:collapse; width:100%; font-size:10px; margin-bottom:18px }
+    th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:left; vertical-align:top }
+    th { background:#f1f5f9; font-weight:700; font-size:9px; text-transform:uppercase; letter-spacing:.4px }
+    tr:nth-child(even) td { background:#f8fafc }
+    .rec { margin-bottom:22px }
+    .rec h2 { font-size:14px; margin:0 0 8px; padding-bottom:5px; border-bottom:2px solid #e2e8f0 }
+    .kv { width:100%; font-size:11px }
+    .kv td:first-child { width:210px; font-weight:600; background:#f8fafc; color:#475569 }
+    .ft { margin-top:20px; font-size:9px; color:#94a3b8; border-top:1px solid #e2e8f0; padding-top:8px }
+  </style></head><body>
+    <div class="hd">
+      <img src="${LOGO}" alt="DBX"/>
+      <h1>${rptEsc(title)}</h1>
+      <div class="meta">Diamond Back Express Inc.<br/>Generated ${new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"})}</div>
+    </div>
+    ${bodyHtml}
+    <div class="ft">Confidential — internal use only. Diamond Back Express Inc. / CargoDX.</div>
+    <div class="no-print" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:999">
+      <button onclick="window.print()" style="padding:12px 28px;background:#dc2626;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:15px;font-weight:700;box-shadow:0 4px 12px rgba(220,38,38,.4)">🖨 Print / Save as PDF</button>
+    </div>
+  </body></html>`);
+  w.document.close();
+}
+
+function rptTableHtml(cols, rows) {
+  const head = `<tr>${cols.map(c => `<th>${rptEsc(c[0])}</th>`).join("")}</tr>`;
+  const body = rows.map(r => `<tr>${cols.map(c => `<td>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("");
+  return `<table>${head}${body}</table>`;
+}
+
+function rptDetailHtml(records, titleFn, rowsFn) {
+  return records.map(r => `<div class="rec"><h2>${rptEsc(titleFn(r))}</h2><table class="kv">${
+    rowsFn(r).map(([k,v]) => `<tr><td>${rptEsc(k)}</td><td>${rptEsc(v)}</td></tr>`).join("")
+  }</table></div>`).join("");
+}
+
+// ─── Excel (SheetJS, lazy-loaded) ───
+async function rptExcel(filename, sheets) {
+  const XLSX = await import("xlsx");
+  const wb = XLSX.utils.book_new();
+  sheets.forEach(({ name, aoa }) => {
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    const widths = (aoa[0] || []).map((_, i) =>
+      ({ wch: Math.min(46, Math.max(12, ...aoa.map(r => String(r[i] ?? "").length + 2))) }));
+    ws["!cols"] = widths;
+    XLSX.utils.book_append_sheet(wb, ws, name.slice(0, 31));
+  });
+  XLSX.writeFile(wb, filename);
+}
+
+const rptAoaFlat = (cols, rows) => [cols.map(c => c[0]), ...rows.map(r => cols.map(c => c[1](r)))];
+const rptAoaDetail = (records, titleFn, rowsFn) => {
+  const out = [];
+  records.forEach((r, i) => {
+    if (i) out.push([]);
+    out.push([titleFn(r)]);
+    rowsFn(r).forEach(([k, v]) => out.push([k, v]));
+  });
+  return out;
+};
+
+function RosterEquipReports({ db }) {
+  const [scope, setScope] = useState("equipment"); // equipment | people
+  const [cat, setCat] = useState("trucks");        // trucks|trailers|all  /  drivers|employees|suppliers|all
+  const [mode, setMode] = useState("all");         // all | selected
+  const [sel, setSel] = useState([]);
+  const [detail, setDetail] = useState(true);
+  const [busy, setBusy] = useState(false);
+
+  const trucks = (db.trucks || []).map(t => ({ ...t, _kind: "Truck" }));
+  const trailers = (db.trailers || []).map(t => ({ ...t, _kind: "Trailer" }));
+  const people = db.drivers || [];
+
+  const pool = useMemo(() => {
+    if (scope === "equipment") {
+      const arr = cat === "trucks" ? trucks : cat === "trailers" ? trailers : [...trucks, ...trailers];
+      return [...arr].sort((a, b) => String(a.unit || "").localeCompare(String(b.unit || ""), undefined, { numeric: true }));
+    }
+    const arr = people.filter(p => {
+      if (cat === "drivers") return p.isDriver !== false && !p.isSupplier;
+      if (cat === "employees") return p.isEmployee === true && !p.isSupplier;
+      if (cat === "suppliers") return p.isSupplier === true;
+      return true;
+    });
+    return [...arr].sort((a, b) => (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
+  }, [scope, cat, db.trucks, db.trailers, db.drivers]);
+
+  useEffect(() => { setSel([]); }, [scope, cat]);
+
+  const chosen = mode === "all" ? pool : pool.filter(x => sel.includes(x.id));
+  const isEquip = scope === "equipment";
+  const label = x => isEquip ? `${x._kind || "Unit"} ${x.unit || "(no unit #)"}` : (x.name || "(unnamed)");
+  const catLabel = { trucks:"Trucks", trailers:"Trailers", all: isEquip ? "All Units" : "All People",
+                     drivers:"Drivers", employees:"Employees", suppliers:"Suppliers" }[cat] || "";
+  const title = `${isEquip ? "Equipment" : "Roster"} Report — ${catLabel}${mode === "selected" ? ` (${chosen.length} selected)` : ""}`;
+  const cols = isEquip ? RPT_UNIT_COLS : RPT_PERSON_COLS;
+  const rowsFn = isEquip ? rptUnitRows : rptPersonRows;
+  const stamp = new Date().toISOString().slice(0, 10);
+
+  const doPdf = () => {
+    if (!chosen.length) return alert("Nothing selected.");
+    rptOpenPdf(title, detail
+      ? rptDetailHtml(chosen, label, rowsFn)
+      : rptTableHtml(cols, chosen));
+  };
+  const doExcel = async () => {
+    if (!chosen.length) return alert("Nothing selected.");
+    setBusy(true);
+    try {
+      const aoa = detail ? rptAoaDetail(chosen, label, rowsFn) : rptAoaFlat(cols, chosen);
+      await rptExcel(`${isEquip ? "equipment" : "roster"}-${cat}-${stamp}.xlsx`,
+        [{ name: catLabel || "Report", aoa }]);
+    } catch (e) { console.error(e); alert("Excel export failed. Is the 'xlsx' package installed?"); }
+    setBusy(false);
+  };
+  // Single-record shortcut
+  const onePdf = (x) => rptOpenPdf(`${label(x)} — Detail`, rptDetailHtml([x], label, rowsFn));
+  const oneExcel = async (x) => {
+    setBusy(true);
+    try { await rptExcel(`${(isEquip ? (x.unit||"unit") : (x.name||"record")).replace(/[^\w\-]+/g,"_")}-${stamp}.xlsx`,
+      [{ name: "Detail", aoa: rptAoaDetail([x], label, rowsFn) }]); }
+    catch (e) { console.error(e); alert("Excel export failed. Is the 'xlsx' package installed?"); }
+    setBusy(false);
+  };
+
+  const tabBtn = (active, onClick, children) => (
+    <button onClick={onClick} style={{ padding:"6px 14px", borderRadius:6, background: active ? T.border : "transparent",
+      border:`1px solid ${active ? "#334155" : T.border}`, color: active ? T.text : T.muted, fontSize:12,
+      cursor:"pointer", fontFamily:"inherit", fontWeight: active ? 600 : 400 }}>{children}</button>
+  );
+
+  return <div>
+    <div style={{ ...sCrd }}>
+      <div style={{ fontSize:11, fontWeight:700, color:T.muted, textTransform:"uppercase", marginBottom:8 }}>Report Type</div>
+      <div style={{ display:"flex", gap:6, marginBottom:12, flexWrap:"wrap" }}>
+        {tabBtn(scope==="equipment", ()=>{setScope("equipment");setCat("trucks");}, "Equipment")}
+        {tabBtn(scope==="people", ()=>{setScope("people");setCat("drivers");}, "Drivers / Employees / Suppliers")}
+      </div>
+
+      <div style={{ fontSize:11, fontWeight:700, color:T.muted, textTransform:"uppercase", marginBottom:8 }}>Category</div>
+      <div style={{ display:"flex", gap:6, marginBottom:12, flexWrap:"wrap" }}>
+        {(isEquip ? [["trucks","Trucks"],["trailers","Trailers"],["all","All Units"]]
+                  : [["drivers","Drivers"],["employees","Employees"],["suppliers","Suppliers"],["all","All"]])
+          .map(([k,l]) => <span key={k}>{tabBtn(cat===k, ()=>setCat(k), l)}</span>)}
+      </div>
+
+      <div style={{ fontSize:11, fontWeight:700, color:T.muted, textTransform:"uppercase", marginBottom:8 }}>Scope</div>
+      <div style={{ display:"flex", gap:6, marginBottom:12, flexWrap:"wrap" }}>
+        {tabBtn(mode==="all", ()=>setMode("all"), `All in category (${pool.length})`)}
+        {tabBtn(mode==="selected", ()=>setMode("selected"), `Choose specific (${sel.length})`)}
+      </div>
+
+      <label style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:T.text, marginBottom:12, cursor:"pointer" }}>
+        <input type="checkbox" checked={detail} onChange={e=>setDetail(e.target.checked)} style={{ accentColor:T.red }}/>
+        Full detail (every field per record). Uncheck for a compact one-row-per-record table.
+      </label>
+
+      {mode==="selected" && <div style={{ maxHeight:280, overflowY:"auto", border:`1px solid ${T.border}`, borderRadius:8, padding:8, marginBottom:12 }}>
+        <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+          <button style={{...bS, padding:"4px 10px", fontSize:11}} onClick={()=>setSel(pool.map(x=>x.id))}>Select all</button>
+          <button style={{...bS, padding:"4px 10px", fontSize:11}} onClick={()=>setSel([])}>Clear</button>
+        </div>
+        {pool.length === 0 && <div style={{ fontSize:12, color:T.dim, padding:6 }}>Nothing in this category.</div>}
+        {pool.map(x => <label key={x.id} style={{ display:"flex", alignItems:"center", gap:8, padding:"4px 6px", fontSize:12, color:T.text, cursor:"pointer" }}>
+          <input type="checkbox" checked={sel.includes(x.id)} style={{ accentColor:T.red }}
+            onChange={e => setSel(p => e.target.checked ? [...p, x.id] : p.filter(i => i !== x.id))}/>
+          {label(x)}
+        </label>)}
+      </div>}
+
+      <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+        <button style={bP} disabled={busy} onClick={doPdf}><Ic n="file" s={14}/> Generate PDF ({chosen.length})</button>
+        <button style={{...bS}} disabled={busy} onClick={doExcel}>{busy ? "Working..." : `Generate Excel (${chosen.length})`}</button>
+      </div>
+    </div>
+
+    <div style={sCrd}>
+      <div style={{ fontSize:11, fontWeight:700, color:T.muted, textTransform:"uppercase", marginBottom:8 }}>
+        Per-record reports ({pool.length})
+      </div>
+      {pool.length === 0 && <div style={{ fontSize:12, color:T.dim }}>Nothing in this category.</div>}
+      <div style={{ display:"grid", gap:6 }}>
+        {pool.map(x => <div key={x.id} style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 10px",
+          background:T["bg"], border:`1px solid ${T.border}`, borderRadius:6 }}>
+          <div style={{ fontSize:12, fontWeight:600, flex:1 }}>{label(x)}</div>
+          <button style={{...bS, padding:"4px 10px", fontSize:11}} onClick={()=>onePdf(x)}>PDF</button>
+          <button style={{...bS, padding:"4px 10px", fontSize:11}} disabled={busy} onClick={()=>oneExcel(x)}>Excel</button>
+        </div>)}
+      </div>
+    </div>
+  </div>;
+}
+
 function ReportsPage({db, go}) {
+  const [rptView, setRptView] = useState("orders"); // orders | roster
   const [period, setPeriod] = useState("month"); // day, week, month, year, custom, all
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -4968,10 +5379,22 @@ ${pricedOrders.length>0?`<h3 style="margin-top:20px;font-size:13px">Order Detail
 
   return <div style={{ padding: 20 }}>
     <PageHdr title="Reports">
-      <button style={bP} onClick={()=>downloadReport("csv")}><Ic n="dl" s={14}/> CSV</button>
-      <button style={{...bP,background:"#7c3aed"}} onClick={()=>downloadReport("pdf")}><Ic n="pdf" s={14}/> PDF</button>
-
+      {rptView==="orders" && <>
+        <button style={bP} onClick={()=>downloadReport("csv")}><Ic n="dl" s={14}/> CSV</button>
+        <button style={{...bP,background:"#7c3aed"}} onClick={()=>downloadReport("pdf")}><Ic n="pdf" s={14}/> PDF</button>
+      </>}
     </PageHdr>
+
+    <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
+      {[["orders","Orders & Revenue"],["roster","Equipment & Roster"]].map(([k,l])=>
+        <button key={k} onClick={()=>setRptView(k)} style={{padding:"6px 14px",borderRadius:6,
+          background:rptView===k?T.border:"transparent",border:`1px solid ${rptView===k?"#334155":T.border}`,
+          color:rptView===k?T.text:T.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",
+          fontWeight:rptView===k?600:400}}>{l}</button>)}
+    </div>
+
+    {rptView==="roster" && <RosterEquipReports db={db}/>}
+    {rptView==="orders" && <>
 
     {/* Filters row 1 — Period */}
     <div style={filterBox}>
@@ -5091,6 +5514,7 @@ ${pricedOrders.length>0?`<h3 style="margin-top:20px;font-size:13px">Order Detail
         </table>
       </div>}
     </div>}
+    </>}
   </div>;
 }
 

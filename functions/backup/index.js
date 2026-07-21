@@ -176,13 +176,11 @@ async function drawTopHeader(pdfDoc, page, order, client, fonts, opts = {}) {
     y -= 20;
   }
 
-  // ── Event/Project badge + name ──
+  // ── Event/Project label + name ──
   if (order.orderType === "event") {
     const projLabel = "PROJECT";
-    const projW = helveticaBold.widthOfTextAtSize(projLabel, 8);
-    page.drawRectangle({ x: M, y: y - 11, width: projW + 12, height: 14, color: rgb(0.55, 0.36, 0.96) });
-    page.drawText(projLabel, { x: M + 6, y: y - 8, size: 8, font: helveticaBold, color: rgb(1,1,1) });
-    y -= 18;
+    page.drawText(projLabel, { x: M, y: y - 8, size: 8, font: helveticaBold, color: gray });
+    y -= 24;
   }
 
   // ── Location for event orders (if chosen) ──
