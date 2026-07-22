@@ -3829,7 +3829,7 @@ function DriversPage({items, save, col}) {
   ];
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
     setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
     setEd(item.id);
@@ -4184,6 +4184,25 @@ function DriversPage({items, save, col}) {
         <button style={{...bP,padding:"5px 14px",fontSize:10,marginTop:4}} disabled={saving} onClick={doSaveStay}>{saving?"Saving...":"Save Pay Config"}</button>
       </div>
 
+      {!fm.isSupplier && <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Portal Access</div>
+        <div style={{ marginBottom: 10, padding: 12, background: T["bg"], borderRadius: 8,
+          border: `1px solid ${fm.logRestricted ? "#dc2626" : T.border}` }}>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, cursor: "pointer" }}>
+            <input type="checkbox" checked={fm.logRestricted === true} style={{ accentColor: "#dc2626" }}
+              onChange={e => setFm(p => ({ ...p, logRestricted: e.target.checked }))} />
+            <span style={{ fontWeight: 600 }}>Restrict Daily Log tab</span>
+          </label>
+          <div style={{ fontSize: 10, color: T.dim, marginTop: 4, marginLeft: 24 }}>
+            Hides the daily hours/log workflow in this person's employee portal. They keep access to
+            Orders, Equipment, and Documents. Takes effect next time they open the app.
+          </div>
+          <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>
+            {saving ? "Saving..." : "Save Portal Access"}
+          </button>
+        </div>
+      </div>}
+
       <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Certifications & Checks</div>
 
@@ -4267,6 +4286,7 @@ function DriversPage({items, save, col}) {
               {!item.isSupplier && item.isDriver!==false && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#3b82f618",color:"#3b82f6",border:"1px solid #3b82f6",marginRight:3,fontWeight:600}}>Driver</span>}
               {!item.isSupplier && item.isEmployee && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#8b5cf618",color:"#8b5cf6",border:"1px solid #8b5cf6",fontWeight:600,marginRight:3}}>Employee</span>}
               {isMuted(item) && <span title={[item.alertsMutedReason, item.alertsMutedUntil ? `until ${fd(item.alertsMutedUntil)}` : "indefinite"].filter(Boolean).join(" — ")} style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(245,158,11,0.12)",color:"#f59e0b",border:"1px solid #f59e0b",marginRight:3,fontWeight:600}}>🔕 Alerts paused</span>}
+              {!item.isSupplier && item.logRestricted && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(220,38,38,0.1)",color:"#dc2626",border:"1px solid #dc2626",marginRight:3,fontWeight:600}}>🔒 Log restricted</span>}
               {!item.isSupplier && item.employeeId && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(14,165,233,0.1)",color:"#0ea5e9",border:"1px solid #0ea5e9",marginRight:3,fontWeight:600}}>ID: {item.employeeId}</span>}
               {!item.isSupplier && item.pin && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(34,197,94,0.1)",color:"#22c55e",border:"1px solid #22c55e",fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>PIN: {item.pin}</span>}
             </span>
@@ -4891,6 +4911,7 @@ function rptPersonRows(p) {
     const until = p.alertsMutedUntil ? `until ${fd(p.alertsMutedUntil)}` : "indefinite";
     rows.push(["Expiry Alerts", `PAUSED (${until})${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`]);
   }
+  if (!p.isSupplier) rows.push(["Portal Daily Log", p.logRestricted ? "RESTRICTED" : "Allowed"]);
   rows.push(["Documents on File", String(docCount)]);
   return rows;
 }
@@ -4946,6 +4967,7 @@ const RPT_PERSON_COLS = [
   ["Expiry Alerts", p => p.alertsMuted
     ? `PAUSED${p.alertsMutedUntil ? ` until ${fd(p.alertsMutedUntil)}` : ""}${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`
     : "Active"],
+  ["Portal Daily Log", p => p.logRestricted ? "Restricted" : "Allowed"],
   ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
 ];
 
