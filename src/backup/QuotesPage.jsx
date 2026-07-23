@@ -340,8 +340,6 @@ export default function QuotesPage({ clients: clientsProp }) {
       .notes-section{margin-bottom:10px;padding:8px 12px;background:#f8fafc;border-left:4px solid #dc2626;border-radius:0 4px 4px 0}
       .notes-section .notes-label{font-size:8px;font-weight:700;color:#dc2626;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
       .notes-section .notes-text{font-size:10px;color:#333;line-height:1.4;white-space:pre-wrap}
-      .signature{display:flex;gap:30px;margin-top:12px}
-      .sig-box{flex:1;border-top:1px solid #333;padding-top:4px;font-size:9px;color:#555}
       .equipment-badges{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:3px}
       .eq-badge{background:#1e293b;color:#fff;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600}
       @media print{
@@ -364,7 +362,15 @@ export default function QuotesPage({ clients: clientsProp }) {
         /* Repeat line-item column headers if the table spans pages. */
         thead{display:table-header-group}
         tbody tr{page-break-inside:avoid}
-        .notes-section,.signature,.totals{page-break-inside:avoid}
+        .notes-section,.totals{page-break-inside:avoid}
+        /* tfoot left as a normal row group so it does NOT repeat per page. */
+        .page-wrap tfoot{display:table-row-group}
+        /* NOTE: position:fixed was tried here and is WRONG — a fixed element
+           repeats on every printed page, so "Prepared by" appeared on page 1
+           overlapping the scope text as well as on the last page. Left in
+           normal flow inside <tfoot>, it renders exactly once, after all
+           content, at the end of the final page. */
+        .prepared-by{margin-top:18px;padding-top:8px;border-top:1px solid #e2e8f0}
         /* The scope block is long and MUST be allowed to split across pages,
            otherwise it would be pushed whole onto page 2 leaving page 1 short. */
         .scope-block{page-break-inside:auto}
@@ -372,9 +378,12 @@ export default function QuotesPage({ clients: clientsProp }) {
       /* Invisible wrapper table used only to get a repeating page header. */
       .page-wrap{width:100%;border-collapse:collapse;border:none}
       .page-wrap > thead > tr > th.page-head,
-      .page-wrap > tbody > tr > td.page-body{
+      .page-wrap > tbody > tr > td.page-body,
+      .page-wrap > tfoot > tr > td.page-foot{
         border:none;padding:0;margin:0;background:transparent;text-align:left;
         font-weight:normal;vertical-align:top}
+      .prepared-by{font-size:11px;color:#555;padding-top:10px}
+      .page-wrap > tfoot > tr > td.page-foot{vertical-align:bottom}
       /* Top padding on the repeating header cell — page 1 gets its gap from the
          body padding, but continuation pages start flush at the paper edge
          without this. */
@@ -494,17 +503,22 @@ export default function QuotesPage({ clients: clientsProp }) {
       <div style="font-size:12px;color:#1e293b;line-height:1.7;white-space:pre-wrap">${f.scopeOfWork}</div>
     </div>`:""}
 
-    ${f.notes?`<div class="notes-section"><div class="notes-label">Notes &amp; Details</div><div class="notes-text">${f.notes}</div></div>`:""}
+    ${(() => {
+      // "Subject to availability" is a standing term — appended to the notes on
+      // every quote, and shown even when there are no other notes.
+      const STANDING = "Subject to availability";
+      const body = [f.notes, STANDING].filter(Boolean).join("\n");
+      return `<div class="notes-section"><div class="notes-label">Notes &amp; Details</div><div class="notes-text">${body}</div></div>`;
+    })()}
 
-    <div class="signature">
-      <div class="sig-box">Authorized Rep &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</div>
-      <div class="sig-box">Date</div>
+
     </div>
-    ${f.salesperson?`<div style="margin-top:16px;font-size:11px;color:#555">Prepared by: <strong>${f.salesperson}</strong></div>`:""}
 
-    </div>
-
-    </td></tr></tbody></table>
+    </td></tr></tbody>
+    <tfoot><tr><td class="page-foot">
+      ${f.salesperson?`<div class="prepared-by">Prepared by: <strong>${f.salesperson}</strong></div>`:""}
+    </td></tr></tfoot>
+    </table>
 
     <div class="no-print" style="margin-top:24px;text-align:center">
       <button onclick="window.print()" style="padding:12px 28px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700">Print / Save as PDF</button>
