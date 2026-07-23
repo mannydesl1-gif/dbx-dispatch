@@ -3829,7 +3829,7 @@ function DriversPage({items, save, col}) {
   ];
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, driverLog:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
     setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
     setEd(item.id);
@@ -4197,6 +4197,15 @@ function DriversPage({items, save, col}) {
             Hides the daily hours/log workflow in this person's employee portal. They keep access to
             Orders, Equipment, and Documents. Takes effect next time they open the app.
           </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, cursor: "pointer", marginTop: 12 }}>
+            <input type="checkbox" checked={fm.driverLog === true} style={{ accentColor: "#3b82f6" }}
+              onChange={e => setFm(p => ({ ...p, driverLog: e.target.checked }))} />
+            <span style={{ fontWeight: 600 }}>Driver log (hide Expenses &amp; Summary)</span>
+          </label>
+          <div style={{ fontSize: 10, color: T.dim, marginTop: 4, marginLeft: 24 }}>
+            In the daily log, hides the Expenses and Summary steps so this person only sees Registration
+            and the clock in/out. Everything else in their portal stays the same.
+          </div>
           <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>
             {saving ? "Saving..." : "Save Portal Access"}
           </button>
@@ -4287,6 +4296,7 @@ function DriversPage({items, save, col}) {
               {!item.isSupplier && item.isEmployee && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#8b5cf618",color:"#8b5cf6",border:"1px solid #8b5cf6",fontWeight:600,marginRight:3}}>Employee</span>}
               {isMuted(item) && <span title={[item.alertsMutedReason, item.alertsMutedUntil ? `until ${fd(item.alertsMutedUntil)}` : "indefinite"].filter(Boolean).join(" — ")} style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(245,158,11,0.12)",color:"#f59e0b",border:"1px solid #f59e0b",marginRight:3,fontWeight:600}}>🔕 Alerts paused</span>}
               {!item.isSupplier && item.logRestricted && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(220,38,38,0.1)",color:"#dc2626",border:"1px solid #dc2626",marginRight:3,fontWeight:600}}>🔒 Log restricted</span>}
+              {!item.isSupplier && item.driverLog && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(59,130,246,0.1)",color:"#3b82f6",border:"1px solid #3b82f6",marginRight:3,fontWeight:600}}>🚚 Driver log</span>}
               {!item.isSupplier && item.employeeId && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(14,165,233,0.1)",color:"#0ea5e9",border:"1px solid #0ea5e9",marginRight:3,fontWeight:600}}>ID: {item.employeeId}</span>}
               {!item.isSupplier && item.pin && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(34,197,94,0.1)",color:"#22c55e",border:"1px solid #22c55e",fontWeight:600,fontFamily:"'IBM Plex Mono',monospace"}}>PIN: {item.pin}</span>}
             </span>
@@ -4911,7 +4921,7 @@ function rptPersonRows(p) {
     const until = p.alertsMutedUntil ? `until ${fd(p.alertsMutedUntil)}` : "indefinite";
     rows.push(["Expiry Alerts", `PAUSED (${until})${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`]);
   }
-  if (!p.isSupplier) rows.push(["Portal Daily Log", p.logRestricted ? "RESTRICTED" : "Allowed"]);
+  if (!p.isSupplier) rows.push(["Portal Daily Log", p.logRestricted ? "RESTRICTED" : (p.driverLog ? "Driver log (no Expenses/Summary)" : "Full")]);
   rows.push(["Documents on File", String(docCount)]);
   return rows;
 }
@@ -4967,7 +4977,7 @@ const RPT_PERSON_COLS = [
   ["Expiry Alerts", p => p.alertsMuted
     ? `PAUSED${p.alertsMutedUntil ? ` until ${fd(p.alertsMutedUntil)}` : ""}${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`
     : "Active"],
-  ["Portal Daily Log", p => p.logRestricted ? "Restricted" : "Allowed"],
+  ["Portal Daily Log", p => p.logRestricted ? "Restricted" : (p.driverLog ? "Driver log" : "Full")],
   ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
 ];
 
