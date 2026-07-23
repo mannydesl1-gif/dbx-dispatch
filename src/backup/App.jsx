@@ -3815,23 +3815,26 @@ function DriversPage({items, save, col}) {
   const [uploading, setUploading] = useState(false);
   const [srch, setSrch] = useState("");
   const [roleFilter, setRoleFilter] = useState("all");
+  const [certsOpen, setCertsOpen] = useState(false); // Certifications & Checks section collapsed by default
   const { confirm: cfm, modal: cfmModal } = useConfirm();
   const formRef = useRef(null);
   // Refs keyed by docKey for reliable matching
-  const fileRefs = { acrDocs: useRef(), hazmatDocs: useRef(), crimDocs: useRef(), bgDocs: useRef(), licenseDocs: useRef(), docs: useRef() };
+  const fileRefs = { acrDocs: useRef(), hazmatDocs: useRef(), crimDocs: useRef(), bgDocs: useRef(), conductDocs: useRef(), licenseDocs: useRef(), docs: useRef() };
 
   const CERTS = [
     { k: "acrDate", l: "ACR Training", months: 12, docKey: "acrDocs" },
     { k: "hazmatDate", l: "HazMat Training", months: 36, docKey: "hazmatDocs" },
     { k: "crimDate", l: "Criminal Record Check", months: 60, docKey: "crimDocs" },
     { k: "bgDate", l: "Background Verification", months: 0, docKey: "bgDocs" },
+    { k: "conductDate", l: "Code of Conduct", months: 0, docKey: "conductDocs" },
     { k: "licenseExpiry", l: "Driver's Licence", direct: true, docKey: "licenseDocs" },
   ];
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, driverLog:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", conductDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, driverLog:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], conductDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
-    setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
+    setCertsOpen(false);
+    setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], conductDocs:item.conductDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
     setEd(item.id);
     setTimeout(() => { const el = formRef.current; if(el) { el.scrollIntoView({ behavior:"smooth", block:"start" }); const main = el.closest("main"); if(main) main.scrollTop = 0; } }, 100);
   };
@@ -4213,8 +4216,35 @@ function DriversPage({items, save, col}) {
       </div>}
 
       <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Certifications & Checks</div>
+        {/* Collapsible header — shows an at-a-glance summary while closed */}
+        {(() => {
+          const set = CERTS.filter(c => fm[c.k]).length;
+          const worst = CERTS.reduce((acc, c) => {
+            if (!fm[c.k]) return acc;
+            if (!c.direct && c.months === 0) return acc; // never expires
+            const col = expColor(fm[c.k], c.months, c.direct);
+            if (col === "#ef4444") return "expired";
+            if (col === "#eab308" && acc !== "expired") return "soon";
+            return acc;
+          }, null);
+          const sumColor = worst === "expired" ? "#ef4444" : worst === "soon" ? "#eab308" : T.dim;
+          const sumText = worst === "expired" ? "· needs attention"
+            : worst === "soon" ? "· expiring soon" : "";
+          return <div onClick={() => setCertsOpen(o => !o)} style={{ display: "flex", alignItems: "center",
+            gap: 8, cursor: "pointer", userSelect: "none", marginBottom: certsOpen ? 8 : 0,
+            padding: "6px 8px", borderRadius: 6, background: certsOpen ? "transparent" : T["bg"],
+            border: `1px solid ${certsOpen ? "transparent" : T.border}` }}>
+            <span style={{ fontSize: 11, color: T.muted, transform: certsOpen ? "rotate(90deg)" : "none",
+              transition: "transform .15s", display: "inline-block" }}>▶</span>
+            <span style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase" }}>Certifications & Checks</span>
+            <span style={{ fontSize: 10, color: sumColor, marginLeft: "auto", fontWeight: 600 }}>
+              {set} of {CERTS.length} on file {sumText}
+              {fm.alertsMuted ? " · alerts paused" : ""}
+            </span>
+          </div>;
+        })()}
 
+        {certsOpen && <>
         {/* Pause expiry alert emails for this person (sick leave, LOA, etc.) */}
         <div style={{ marginBottom: 10, padding: 12, background: T["bg"], borderRadius: 8,
           border: `1px solid ${fm.alertsMuted ? "#f59e0b" : T.border}` }}>
@@ -4269,6 +4299,7 @@ function DriversPage({items, save, col}) {
             <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : `Save ${c.l}`}</button>
           </div>
         ))}
+        </>}
       </div>
       </>}
 
@@ -4839,6 +4870,7 @@ const RPT_CERTS = [
   { k: "hazmatDate", l: "HazMat Training", months: 36 },
   { k: "crimDate", l: "Criminal Record Check", months: 60 },
   { k: "bgDate", l: "Background Verification", months: 0 },
+  { k: "conductDate", l: "Code of Conduct", months: 0 },
   { k: "licenseExpiry", l: "Driver's Licence", direct: true },
 ];
 
@@ -4915,7 +4947,7 @@ function rptPersonRows(p) {
       rows.push([c.l, [base, expTxt, st.txt].filter(Boolean).join(" — ")]);
     });
   }
-  const docCount = ["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"]
+  const docCount = ["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"]
     .reduce((s,k) => s + (p[k]||[]).length, 0);
   if (!p.isSupplier && p.alertsMuted) {
     const until = p.alertsMutedUntil ? `until ${fd(p.alertsMutedUntil)}` : "indefinite";
@@ -4978,7 +5010,7 @@ const RPT_PERSON_COLS = [
     ? `PAUSED${p.alertsMutedUntil ? ` until ${fd(p.alertsMutedUntil)}` : ""}${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`
     : "Active"],
   ["Portal Daily Log", p => p.logRestricted ? "Restricted" : (p.driverLog ? "Driver log" : "Full")],
-  ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
+  ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
 ];
 
 // ─── PDF (print window) ───
