@@ -4989,28 +4989,67 @@ const RPT_UNIT_COLS = [
   ["Docs", u => String((u.docs || []).length)],
 ];
 
-const RPT_PERSON_COLS = [
-  ["Name", p => p.name || ""],
-  ["Role", p => rptRole(p)],
-  ["Phone", p => p.phone || ""],
-  ["Email", p => p.email || ""],
+// Column pieces, assembled per category by rptPersonCols() below.
+const RPT_COL_NAME    = ["Name", p => p.name || ""];
+const RPT_COL_ROLE    = ["Role", p => rptRole(p)];
+const RPT_COL_PHONE   = ["Phone", p => p.phone || ""];
+const RPT_COL_EMAIL   = ["Email", p => p.email || ""];
+const RPT_COL_ADDRESS = ["Address", p => rptAddr(p)];
+const RPT_COL_DOCS    = ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))];
+
+// Supplier-only fields
+const RPT_SUPPLIER_COLS = [
+  ["Contact Person", p => p.contactPerson || ""],
+  ["Service Type", p => p.serviceType || ""],
+];
+
+// Driver/employee-only fields
+const RPT_STAFF_COLS = [
   ["Licence Class", p => p.license || ""],
   ["Employee ID", p => p.employeeId || ""],
   ["PIN", p => p.pin || ""],
-  ["Contact Person", p => p.contactPerson || ""],
-  ["Service Type", p => p.serviceType || ""],
-  ["Address", p => rptAddr(p)],
   ["Pay Configuration", p => rptFmtPay(p.payCfg)],
-  ...RPT_CERTS.map(c => [c.l, p => {
-    const exp = rptExpDate(p[c.k], c.months, c.direct);
-    const st = rptStatus(p[c.k], c.months, c.direct);
-    return exp ? `${fd(exp)} (${st.txt})` : st.txt;
-  }]),
+];
+
+const RPT_CERT_COLS = RPT_CERTS.map(c => [c.l, p => {
+  const exp = rptExpDate(p[c.k], c.months, c.direct);
+  const st = rptStatus(p[c.k], c.months, c.direct);
+  return exp ? `${fd(exp)} (${st.txt})` : st.txt;
+}]);
+
+// Portal/alert status — shown only in the per-record detail layout, not in the
+// wide table reports (dropped there to keep the printed table within the page).
+const RPT_PORTAL_COLS = [
   ["Expiry Alerts", p => p.alertsMuted
     ? `PAUSED${p.alertsMutedUntil ? ` until ${fd(p.alertsMutedUntil)}` : ""}${p.alertsMutedReason ? ` — ${p.alertsMutedReason}` : ""}`
     : "Active"],
   ["Portal Daily Log", p => p.logRestricted ? "Restricted" : (p.driverLog ? "Driver log" : "Full")],
-  ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))],
+];
+
+// Build the column set for a category. Suppliers have no certifications, PIN,
+// licence or pay config; drivers/employees have no contact person or service
+// type. Dropping the inapplicable ones keeps the table narrow enough to fit
+// the printed page — 21 fixed columns overflow landscape Letter regardless of
+// margin, which is what was cutting off the last column.
+function rptPersonCols(cat, records) {
+  if (cat === "suppliers") {
+    return [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
+            ...RPT_SUPPLIER_COLS, RPT_COL_ADDRESS];
+  }
+  const cols = [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
+                ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
+  // "All" mixes suppliers in, so re-add their fields only when some are present.
+  if (cat === "all" && (records || []).some(p => p.isSupplier)) {
+    cols.splice(4, 0, ...RPT_SUPPLIER_COLS);
+  }
+  return cols;
+}
+
+// Kept for the per-record detail layout, which lists every field vertically.
+const RPT_PERSON_COLS = [
+  RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
+  ...RPT_STAFF_COLS, ...RPT_SUPPLIER_COLS, RPT_COL_ADDRESS,
+  ...RPT_CERT_COLS, ...RPT_PORTAL_COLS, RPT_COL_DOCS,
 ];
 
 // ─── PDF (print window) ───
@@ -5025,7 +5064,7 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
   const stamp = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
   w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${rptEsc(title)}</title>
   <style>
-    @page { size: landscape; margin: 12mm; }
+    @page { size: landscape; margin: 10mm 14mm; }
     @media print {
       body { margin:0; padding:0 }
       .no-print { display:none !important }
@@ -5049,7 +5088,16 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
     th.hdcell { border:none !important; padding:0 0 10px !important; background:#fff !important;
                 color:#0f172a !important; text-align:left !important; }
     th.hdcell .hd { margin-bottom:0 }
-    table { border-collapse:collapse; width:100%; font-size:10px; margin-bottom:18px }
+    /* table-layout:fixed keeps the table inside the printable width, but with
+       equal column widths phone numbers and emails wrap badly. Explicit widths
+       (below, via colgroup) give each column space proportional to its content. */
+    table { border-collapse:collapse; width:100%; font-size:10px; margin-bottom:18px;
+            table-layout:fixed }
+    /* break-word only, never mid-word: avoids "a@balochi@hotmail.com" splitting
+       into three lines. Long unbroken strings shrink instead. */
+    td, th { word-wrap:break-word; overflow-wrap:break-word; hyphens:none }
+    td { font-size:9px; line-height:1.3 }
+    th { font-size:8px; line-height:1.25 }
     /* Centered by default; .txt columns (names, emails, addresses) stay left
        so long values remain readable. */
     th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:center; vertical-align:middle }
@@ -5082,6 +5130,21 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
   w.document.close();
 }
 
+// Relative column widths (arbitrary units, normalised to 100% at render time).
+// Sized to actual content: emails and addresses need room, Role/PIN do not.
+// Without these, table-layout:fixed gives every column equal width and phone
+// numbers and emails wrap onto 2-3 lines.
+const RPT_COL_WIDTH = {
+  "Name": 13, "Role": 6, "Phone": 9, "Email": 17,
+  "Licence Class": 6, "Employee ID": 7, "PIN": 5,
+  "Pay Configuration": 11, "Address": 12,
+  "Contact Person": 11, "Service Type": 11,
+  "ACR Training": 8, "HazMat Training": 8, "Criminal Record Check": 8,
+  "Background Verification": 8, "Code of Conduct": 8, "Driver's Licence": 8,
+  "Expiry Alerts": 8, "Portal Daily Log": 7, "Docs": 4,
+};
+const rptColWidth = label => RPT_COL_WIDTH[label] || 8;
+
 // Columns holding long free text stay left-aligned; everything else centers.
 const RPT_TXT_COLS = new Set(["Address", "Client", "Contact Person", "Email", "Expiry Alerts", "Make", "Model", "Name", "Notes", "Pay Configuration", "Ref", "Service Type"]);
 
@@ -5103,9 +5166,13 @@ function rptTableHtml(cols, rows, headerBandHtml) {
     ? `<tr><th class="hdcell" colspan="${cols.length}">${headerBandHtml}</th></tr>`
     : "";
   const isTxt = label => RPT_TXT_COLS.has(label);
+  // Normalise the relative widths to percentages so the row always totals 100%.
+  const wTotal = cols.reduce((s, c) => s + rptColWidth(c[0]), 0);
+  const group = `<colgroup>${cols.map(c =>
+    `<col style="width:${(rptColWidth(c[0]) / wTotal * 100).toFixed(2)}%"/>`).join("")}</colgroup>`;
   const head = `<thead>${band}<tr>${cols.map(c => `<th${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[0])}</th>`).join("")}</tr></thead>`;
   const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
-  return `<table>${head}${body}</table>`;
+  return `<table>${group}${head}${body}</table>`;
 }
 
 function rptDetailHtml(records, titleFn, rowsFn) {
@@ -5173,7 +5240,8 @@ function RosterEquipReports({ db }) {
   const catLabel = { trucks:"Trucks", trailers:"Trailers", all: isEquip ? "All Units" : "All People",
                      drivers:"Drivers", employees:"Employees", suppliers:"Suppliers" }[cat] || "";
   const title = `${isEquip ? "Equipment" : "Roster"} Report — ${catLabel}${mode === "selected" ? ` (${chosen.length} selected)` : ""}`;
-  const cols = isEquip ? RPT_UNIT_COLS : RPT_PERSON_COLS;
+  // Columns adapt to the category so inapplicable fields are dropped.
+  const cols = isEquip ? RPT_UNIT_COLS : rptPersonCols(cat, chosen);
   const rowsFn = isEquip ? rptUnitRows : rptPersonRows;
   const stamp = new Date().toISOString().slice(0, 10);
 
@@ -5458,7 +5526,9 @@ function ReportsPage({db, go}) {
     const tableRows = rows.map(r =>
       `<tr><td class="txt">${r.label}</td><td>${r.count}</td><td class="num">${csym(r.cur)}${nf(r.total)}</td><td class="muted">${r.cur}</td></tr>`
     ).join("");
-    const detailRows = pricedOrders.sort((a,b)=>b.reqDate>a.reqDate?1:-1).map(o => {
+    const detailRows = [...pricedOrders].sort((a,b)=>
+      String(a.bol||"").localeCompare(String(b.bol||""), undefined, { numeric: true })
+    ).map(o => {
       const t = calcTotal(o); const cur = (o.price?.cur)||"CAD";
       return `<tr><td style="font-weight:700">${o.bol}</td><td>${fd(o.reqDate)}</td><td class="txt">${o.cliName||"—"}</td><td class="txt">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td class="num">${csym(cur)}${nf(t)}</td><td class="muted">${cur}</td></tr>`;
     }).join("");
@@ -5671,7 +5741,9 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
             <th style={{padding:"6px 8px"}}>Reference</th><th style={{padding:"6px 8px"}}>Status</th>
             <th style={{padding:"6px 8px",textAlign:"right"}}>Total</th><th style={{padding:"6px 8px"}}>Cur</th>
           </tr></thead>
-          <tbody>{pricedOrders.sort((a,b)=>b.reqDate>a.reqDate?1:-1).map(o=>{
+          <tbody>{[...pricedOrders].sort((a,b)=>
+            String(a.bol||"").localeCompare(String(b.bol||""), undefined, { numeric: true })
+          ).map(o=>{
             const t=calcTotal(o); const cur=(o.price?.cur)||"CAD";
             return <tr key={o.id} style={{borderTop:`1px solid ${T.border}`,cursor:"pointer"}} onClick={()=>go("od",o)}>
               <td style={{padding:"5px 8px",fontWeight:600}}>{o.bol}</td>
