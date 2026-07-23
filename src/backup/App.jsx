@@ -5016,21 +5016,43 @@ const RPT_PERSON_COLS = [
 // ─── PDF (print window) ───
 const rptEsc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 
-function rptOpenPdf(title, bodyHtml) {
+// standaloneHeader=true renders the DBX band once at the top of the document
+// (used by the per-record detail layout). For table reports it is false and the
+// band is embedded in <thead> instead, so it repeats on every page.
+function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
   const w = window.open("", "_blank");
   if (!w) { alert("Please allow popups to view the PDF."); return; }
+  const stamp = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
   w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${rptEsc(title)}</title>
   <style>
     @page { size: landscape; margin: 12mm; }
-    @media print { body { margin:0 } .no-print { display:none !important } .rec { page-break-inside: avoid } }
+    @media print {
+      body { margin:0; padding:0 }
+      .no-print { display:none !important }
+      .rec { page-break-inside: avoid }
+      /* The DBX band and the column headers both live inside <thead>, so the
+         browser repeats them on every page AND reserves their height on every
+         page. A fixed-position header can't do the latter — padding only
+         applies once, which left continuation pages clipped. */
+      thead { display: table-header-group; }
+      tbody tr { page-break-inside: avoid; }
+      /* Standalone header only shows for the detail (per-record) layout,
+         which has no repeating table. */
+      .hd-standalone { page-break-after: avoid; }
+    }
     body { font-family:'Helvetica Neue',Arial,sans-serif; margin:0; padding:24px; background:#fff; color:#0f172a }
     .hd { display:flex; align-items:center; gap:16px; border-bottom:3px solid #dc2626; padding-bottom:12px; margin-bottom:18px }
     .hd img { height:54px }
     .hd h1 { margin:0; font-size:20px; font-weight:700 }
     .hd .meta { margin-left:auto; text-align:right; font-size:11px; color:#64748b }
+    /* Header band rendered inside <thead> so it repeats per page. */
+    th.hdcell { border:none !important; padding:0 0 10px !important; background:#fff !important; }
+    th.hdcell .hd { margin-bottom:0 }
     table { border-collapse:collapse; width:100%; font-size:10px; margin-bottom:18px }
     th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:left; vertical-align:top }
     th { background:#f1f5f9; font-weight:700; font-size:9px; text-transform:uppercase; letter-spacing:.4px }
+    /* -webkit-print-color-adjust keeps header shading from being dropped by the printer. */
+    th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
     tr:nth-child(even) td { background:#f8fafc }
     .rec { margin-bottom:22px }
     .rec h2 { font-size:14px; margin:0 0 8px; padding-bottom:5px; border-bottom:2px solid #e2e8f0 }
@@ -5038,11 +5060,11 @@ function rptOpenPdf(title, bodyHtml) {
     .kv td:first-child { width:210px; font-weight:600; background:#f8fafc; color:#475569 }
     .ft { margin-top:20px; font-size:9px; color:#94a3b8; border-top:1px solid #e2e8f0; padding-top:8px }
   </style></head><body>
-    <div class="hd">
+    ${standaloneHeader ? `<div class="hd hd-standalone">
       <img src="${LOGO}" alt="DBX"/>
       <h1>${rptEsc(title)}</h1>
-      <div class="meta">Diamond Back Express Inc.<br/>Generated ${new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"})}</div>
-    </div>
+      <div class="meta">Diamond Back Express Inc.<br/>Generated ${stamp}</div>
+    </div>` : ""}
     ${bodyHtml}
     <div class="ft">Confidential — internal use only. Diamond Back Express Inc. / CargoDX.</div>
     <div class="no-print" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:999">
@@ -5052,9 +5074,25 @@ function rptOpenPdf(title, bodyHtml) {
   w.document.close();
 }
 
-function rptTableHtml(cols, rows) {
-  const head = `<tr>${cols.map(c => `<th>${rptEsc(c[0])}</th>`).join("")}</tr>`;
-  const body = rows.map(r => `<tr>${cols.map(c => `<td>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("");
+// The DBX band markup, for embedding inside <thead> so it repeats per page.
+function rptHeaderBand(title) {
+  return `<div class="hd">
+      <img src="${LOGO}" alt="DBX"/>
+      <h1>${rptEsc(title)}</h1>
+      <div class="meta">Diamond Back Express Inc.<br/>Generated ${new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"})}</div>
+    </div>`;
+}
+
+function rptTableHtml(cols, rows, headerBandHtml) {
+  // Everything inside <thead> is repeated by the browser at the top of EVERY
+  // printed page, and its height is reserved on every page. Putting the DBX
+  // band here (rather than fixed-positioning it) is what stops continuation
+  // pages from being clipped.
+  const band = headerBandHtml
+    ? `<tr><th class="hdcell" colspan="${cols.length}">${headerBandHtml}</th></tr>`
+    : "";
+  const head = `<thead>${band}<tr>${cols.map(c => `<th>${rptEsc(c[0])}</th>`).join("")}</tr></thead>`;
+  const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
   return `<table>${head}${body}</table>`;
 }
 
@@ -5129,9 +5167,13 @@ function RosterEquipReports({ db }) {
 
   const doPdf = () => {
     if (!chosen.length) return alert("Nothing selected.");
-    rptOpenPdf(title, detail
-      ? rptDetailHtml(chosen, label, rowsFn)
-      : rptTableHtml(cols, chosen));
+    if (detail) {
+      // Per-record layout: single header at the top of the document.
+      rptOpenPdf(title, rptDetailHtml(chosen, label, rowsFn), true);
+    } else {
+      // Table layout: header band goes inside <thead> so it repeats per page.
+      rptOpenPdf(title, rptTableHtml(cols, chosen, rptHeaderBand(title)), false);
+    }
   };
   const doExcel = async () => {
     if (!chosen.length) return alert("Nothing selected.");
