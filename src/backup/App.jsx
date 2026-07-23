@@ -5046,18 +5046,26 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
     .hd h1 { margin:0; font-size:20px; font-weight:700 }
     .hd .meta { margin-left:auto; text-align:right; font-size:11px; color:#64748b }
     /* Header band rendered inside <thead> so it repeats per page. */
-    th.hdcell { border:none !important; padding:0 0 10px !important; background:#fff !important; }
+    th.hdcell { border:none !important; padding:0 0 10px !important; background:#fff !important;
+                color:#0f172a !important; text-align:left !important; }
     th.hdcell .hd { margin-bottom:0 }
     table { border-collapse:collapse; width:100%; font-size:10px; margin-bottom:18px }
-    th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:left; vertical-align:top }
-    th { background:#f1f5f9; font-weight:700; font-size:9px; text-transform:uppercase; letter-spacing:.4px }
+    /* Centered by default; .txt columns (names, emails, addresses) stay left
+       so long values remain readable. */
+    th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:center; vertical-align:middle }
+    td.txt, th.txt { text-align:left }
+    th { background:#1e293b; color:#fff; font-weight:700; font-size:9px; text-transform:uppercase;
+         letter-spacing:.4px; -webkit-print-color-adjust:exact; print-color-adjust:exact }
     /* -webkit-print-color-adjust keeps header shading from being dropped by the printer. */
     th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-    tr:nth-child(even) td { background:#f8fafc }
+    tbody tr:nth-child(even) td { background:#f8fafc;
+         -webkit-print-color-adjust:exact; print-color-adjust:exact }
     .rec { margin-bottom:22px }
     .rec h2 { font-size:14px; margin:0 0 8px; padding-bottom:5px; border-bottom:2px solid #e2e8f0 }
     .kv { width:100%; font-size:11px }
-    .kv td:first-child { width:210px; font-weight:600; background:#f8fafc; color:#475569 }
+    .kv td { text-align:left }
+    .kv td:first-child { width:210px; font-weight:600; background:#f8fafc; color:#475569;
+         -webkit-print-color-adjust:exact; print-color-adjust:exact }
     .ft { margin-top:20px; font-size:9px; color:#94a3b8; border-top:1px solid #e2e8f0; padding-top:8px }
   </style></head><body>
     ${standaloneHeader ? `<div class="hd hd-standalone">
@@ -5073,6 +5081,9 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
   </body></html>`);
   w.document.close();
 }
+
+// Columns holding long free text stay left-aligned; everything else centers.
+const RPT_TXT_COLS = new Set(["Address", "Client", "Contact Person", "Email", "Expiry Alerts", "Make", "Model", "Name", "Notes", "Pay Configuration", "Ref", "Service Type"]);
 
 // The DBX band markup, for embedding inside <thead> so it repeats per page.
 function rptHeaderBand(title) {
@@ -5091,8 +5102,9 @@ function rptTableHtml(cols, rows, headerBandHtml) {
   const band = headerBandHtml
     ? `<tr><th class="hdcell" colspan="${cols.length}">${headerBandHtml}</th></tr>`
     : "";
-  const head = `<thead>${band}<tr>${cols.map(c => `<th>${rptEsc(c[0])}</th>`).join("")}</tr></thead>`;
-  const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  const isTxt = label => RPT_TXT_COLS.has(label);
+  const head = `<thead>${band}<tr>${cols.map(c => `<th${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[0])}</th>`).join("")}</tr></thead>`;
+  const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
   return `<table>${head}${body}</table>`;
 }
 
@@ -5439,25 +5451,79 @@ function ReportsPage({db, go}) {
   // PDF HTML builder
   const buildReportHTML = () => {
     const periodLabel = `${fd(rangeFrom)} — ${fd(rangeTo)}`;
+    const nf = n => n.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
     const totalsHTML = Object.entries(grandTotals).map(([c, d]) =>
-      `<div style="display:inline-block;border:2px solid #0ea5e9;border-radius:8px;padding:12px 20px;margin:0 10px 10px 0"><div style="font-size:10px;font-weight:700;color:#0ea5e9;text-transform:uppercase;margin-bottom:4px">Total Revenue (${c})</div><div style="font-size:22px;font-weight:700">${csym(c)}${d.total.toFixed(2)}</div><div style="font-size:11px;color:#666;margin-top:2px">${d.count} order${d.count!==1?"s":""}</div></div>`
+      `<div class="kpi"><div class="lbl">Total Revenue (${c})</div><div class="val">${csym(c)}${nf(d.total)}</div><div class="sub">${d.count} order${d.count!==1?"s":""}</div></div>`
     ).join("");
     const tableRows = rows.map(r =>
-      `<tr><td style="padding:6px 10px;border-bottom:1px solid #ddd">${r.label}</td><td style="padding:6px 10px;border-bottom:1px solid #ddd;text-align:right">${r.count}</td><td style="padding:6px 10px;border-bottom:1px solid #ddd;text-align:right;font-weight:700">${csym(r.cur)}${r.total.toFixed(2)}</td><td style="padding:6px 10px;border-bottom:1px solid #ddd;text-align:right;color:#888">${r.cur}</td></tr>`
+      `<tr><td class="txt">${r.label}</td><td>${r.count}</td><td class="num">${csym(r.cur)}${nf(r.total)}</td><td class="muted">${r.cur}</td></tr>`
     ).join("");
     const detailRows = pricedOrders.sort((a,b)=>b.reqDate>a.reqDate?1:-1).map(o => {
       const t = calcTotal(o); const cur = (o.price?.cur)||"CAD";
-      return `<tr><td style="padding:4px 8px;border-bottom:1px solid #eee;font-weight:600">${o.bol}</td><td style="padding:4px 8px;border-bottom:1px solid #eee">${fd(o.reqDate)}</td><td style="padding:4px 8px;border-bottom:1px solid #eee">${o.cliName||"—"}</td><td style="padding:4px 8px;border-bottom:1px solid #eee">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td style="padding:4px 8px;border-bottom:1px solid #eee;text-align:right;font-weight:600">${csym(cur)}${t.toFixed(2)}</td><td style="padding:4px 8px;border-bottom:1px solid #eee;color:#888">${cur}</td></tr>`;
+      return `<tr><td style="font-weight:700">${o.bol}</td><td>${fd(o.reqDate)}</td><td class="txt">${o.cliName||"—"}</td><td class="txt">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td class="num">${csym(cur)}${nf(t)}</td><td class="muted">${cur}</td></tr>`;
     }).join("");
 
     const evtLabel = evtFilter !== "ALL" ? (db.events||[]).find(e=>e.id===evtFilter)?.name || "" : "";
-    return `<html><head><title>${APP_NAME} Report</title><style>body{font-family:Arial,sans-serif;margin:30px;color:#111}table{width:100%;border-collapse:collapse;font-size:12px}th{background:#f1f5f9;text-align:left;padding:8px 10px;font-weight:700}@media print{body{margin:15px}}</style></head><body>
-<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px"><img src="${LOGO}" style="height:40px;border-radius:4px"/><div><div style="font-weight:800;font-size:16px">${APP_NAME} — REPORT</div><div style="font-size:11px;color:#666">${COMPANY_NAME}</div></div></div>
-<hr style="border:none;border-top:3px solid #dc2626;margin:10px 0 16px"/>
-<div style="font-size:12px;color:#555;margin-bottom:4px"><b>Period:</b> ${periodLabel} &nbsp;&nbsp; <b>Group by:</b> ${groupBy} &nbsp;&nbsp; <b>Orders:</b> ${pricedOrders.length}${evtLabel?` &nbsp;&nbsp; <b>Event:</b> ${evtLabel}`:""}</div>
-<div style="margin:14px 0">${totalsHTML}</div>
-${rows.length>0?`<table><thead><tr><th>Breakdown</th><th style="text-align:right">Orders</th><th style="text-align:right">Total</th><th style="text-align:right">Currency</th></tr></thead><tbody>${tableRows}</tbody></table>`:""}
-${pricedOrders.length>0?`<h3 style="margin-top:20px;font-size:13px">Order Details</h3><table><thead><tr><th>BOL</th><th>Date</th><th>Client</th><th>Ref</th><th style="text-align:right">Total</th><th>Cur</th></tr></thead><tbody>${detailRows}</tbody></table>`:""}
+    const genStamp = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
+    return `<html><head><title>${APP_NAME} Report</title><style>
+  /* Left/right margin 0 so the browser can't inject its own date/URL header
+     and footer. 30mm top reserves the running-header strip on EVERY page. */
+  @page{size:letter;margin:30mm 0 16mm}
+  body{font-family:'Helvetica Neue',Arial,sans-serif;margin:0;padding:0 14mm;color:#0f172a;font-size:12px}
+
+  /* Running header: repeats on every printed page, drawn into the @page strip. */
+  .rhead{display:flex;align-items:center;gap:12px;padding:10mm 14mm 8px;
+         border-bottom:3px solid #dc2626;background:#fff;margin-bottom:14px}
+  .rhead img{height:40px;border-radius:4px}
+  .rhead .t1{font-weight:800;font-size:16px;letter-spacing:-.2px}
+  .rhead .t2{font-size:11px;color:#64748b}
+  .rhead .meta{margin-left:auto;text-align:right;font-size:10px;color:#94a3b8;line-height:1.5}
+
+  .subhead{font-size:11px;color:#475569;margin-bottom:14px;padding-bottom:10px;
+           border-bottom:1px solid #e2e8f0}
+  .subhead b{color:#0f172a}
+
+  /* KPI cards */
+  .kpis{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+  .kpi{flex:1;min-width:150px;border:1px solid #e2e8f0;border-top:3px solid #0ea5e9;
+       border-radius:6px;padding:12px 16px;background:#f8fafc}
+  .kpi .lbl{font-size:9px;font-weight:700;color:#0ea5e9;text-transform:uppercase;
+            letter-spacing:.6px;margin-bottom:5px}
+  .kpi .val{font-size:21px;font-weight:800;letter-spacing:-.5px;color:#0f172a}
+  .kpi .sub{font-size:10px;color:#94a3b8;margin-top:3px}
+
+  h3{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:#475569;
+     margin:22px 0 8px;padding-bottom:5px;border-bottom:2px solid #e2e8f0}
+
+  table{width:100%;border-collapse:collapse;font-size:11px}
+  thead{display:table-header-group}
+  th{background:#1e293b;color:#fff;text-align:center;padding:7px 8px;font-weight:700;
+     font-size:9px;text-transform:uppercase;letter-spacing:.5px;
+     -webkit-print-color-adjust:exact;print-color-adjust:exact}
+  td{padding:6px 8px;border-bottom:1px solid #e2e8f0;text-align:center;vertical-align:middle}
+  /* Zebra striping for easier row tracking across wide tables. */
+  tbody tr:nth-child(even){background:#f8fafc;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  tbody tr{page-break-inside:avoid}
+  /* Money right-aligned so decimals line up; long text left-aligned to read. */
+  .num{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+  .txt{text-align:left}
+  .muted{color:#94a3b8;font-size:10px}
+  .totrow td{border-top:2px solid #1e293b;font-weight:800;background:#f1f5f9;
+             -webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .ft{margin-top:18px;padding-top:8px;border-top:1px solid #e2e8f0;
+      font-size:9px;color:#94a3b8}
+  @media print{.no-print{display:none!important}}
+</style></head><body>
+<div class="rhead">
+  <img src="${LOGO}"/>
+  <div><div class="t1">${APP_NAME} — REPORT</div><div class="t2">${COMPANY_NAME}</div></div>
+  <div class="meta">Generated ${genStamp}<br/>${periodLabel}</div>
+</div>
+<div class="subhead"><b>Period:</b> ${periodLabel} &nbsp;&nbsp;·&nbsp;&nbsp; <b>Group by:</b> ${groupBy} &nbsp;&nbsp;·&nbsp;&nbsp; <b>Orders:</b> ${pricedOrders.length}${evtLabel?` &nbsp;&nbsp;·&nbsp;&nbsp; <b>Event:</b> ${evtLabel}`:""}</div>
+<div class="kpis">${totalsHTML}</div>
+${rows.length>0?`<h3>Revenue Breakdown</h3><table><thead><tr><th class="txt">Breakdown</th><th>Orders</th><th>Total</th><th>Currency</th></tr></thead><tbody>${tableRows}</tbody></table>`:""}
+${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th>Date</th><th class="txt">Client</th><th class="txt">Ref</th><th>Total</th><th>Cur</th></tr></thead><tbody>${detailRows}</tbody></table>`:""}
+<div class="ft">Confidential — internal use only. ${COMPANY_NAME}</div>
 </body></html>`;
   };
 
