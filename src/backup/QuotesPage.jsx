@@ -346,7 +346,8 @@ export default function QuotesPage({ clients: clientsProp }) {
         /* Zero side margins so the browser has no room to inject its own
            date / blob: URL header and footer. Real margins are on the body. */
         @page{size:letter;margin:0}
-        body{padding:0 14mm 12mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        body{padding:0 14mm 12mm;box-sizing:border-box;
+             -webkit-print-color-adjust:exact;print-color-adjust:exact}
         .no-print{display:none}
         /* REPEATING HEADER — the whole quote is wrapped in .page-wrap, whose
            <thead> holds the DBX band. Browsers repeat a thead on every printed
@@ -367,9 +368,31 @@ export default function QuotesPage({ clients: clientsProp }) {
         .page-wrap tfoot{display:table-row-group}
         /* NOTE: position:fixed was tried here and is WRONG — a fixed element
            repeats on every printed page, so "Prepared by" appeared on page 1
-           overlapping the scope text as well as on the last page. Left in
-           normal flow inside <tfoot>, it renders exactly once, after all
-           content, at the end of the final page. */
+           overlapping the scope text as well as on the last page.
+           Instead the body cell is given a min-height just under one page, so
+           on a short quote the content block is stretched and the tfoot is
+           pushed down to the bottom of the sheet. On a long quote the content
+           already exceeds this, so the footer simply follows the last content
+           on the final page. */
+        /* Push "Prepared by" to the bottom of the sheet WITHOUT ever adding
+           height that could force an extra page.
+
+           min-height is the wrong tool: it adds height unconditionally, so a
+           quote with more line items gets pushed onto page 2 even though the
+           content itself fits. Instead the body cell is stretched to the full
+           height of the table row (height:100% on a table cell resolves against
+           the page box) and the inner content flexes. When content is short the
+           spacer absorbs the slack and the footer drops to the bottom; when
+           content is tall the spacer collapses to zero and adds nothing, so
+           pagination is driven purely by the real content. */
+        /* NO height:100% on the wrapper. Constraining the table to one page
+           makes the tfoot draw at a stale position once content overflows, so
+           on page 2 "Prepared by" printed ON TOP of the notes block.
+           The table is left to flow naturally, which keeps pagination correct
+           and the footer strictly after the last content. */
+        .page-wrap > tbody > tr > td.page-body{vertical-align:top}
+        .page-body > .content{display:block}
+        .flex-spacer{display:none}
         .prepared-by{margin-top:18px;padding-top:8px;border-top:1px solid #e2e8f0}
         /* The scope block is long and MUST be allowed to split across pages,
            otherwise it would be pushed whole onto page 2 leaving page 1 short. */
@@ -512,6 +535,7 @@ export default function QuotesPage({ clients: clientsProp }) {
     })()}
 
 
+    <div class="flex-spacer"></div>
     </div>
 
     </td></tr></tbody>
