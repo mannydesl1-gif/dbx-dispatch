@@ -344,7 +344,30 @@ export default function QuotesPage({ clients: clientsProp }) {
       .sig-box{flex:1;border-top:1px solid #333;padding-top:4px;font-size:9px;color:#555}
       .equipment-badges{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:3px}
       .eq-badge{background:#1e293b;color:#fff;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600}
-      @media print{body{padding:12px 18px}.no-print{display:none}}
+      @media print{
+        /* Left/right page margin is 0 so the browser has no room to inject its
+           own date / blob: URL header and footer. The 46mm top margin reserves
+           the running-header strip on EVERY page; 16mm bottom is the footer gap. */
+        @page{size:letter;margin:46mm 0 16mm}
+        /* Side margins live on the body. */
+        body{padding:0 16mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        .no-print{display:none}
+        /* Repeat the DBX logo + QUOTE meta band at the top of every page.
+           Its own top/side padding provides the page's top margin. */
+        .header{position:fixed;top:0;left:0;right:0;background:#fff;margin:0;
+                padding:12mm 16mm 10px;box-sizing:border-box;z-index:10}
+        /* No padding needed: @page margin-top above reserves the strip on every
+           page. (padding-top reserves space only ONCE, which is why the first
+           attempt clipped continuation pages.) */
+        .content{padding-top:0}
+        /* Repeat line-item column headers if the table spans pages. */
+        thead{display:table-header-group}
+        tbody tr{page-break-inside:avoid}
+        .notes-section,.signature,.totals{page-break-inside:avoid}
+        /* The scope block is long and MUST be allowed to split across pages,
+           otherwise it would be pushed whole onto page 2 leaving page 1 short. */
+        .scope-block{page-break-inside:auto}
+      }
     </style></head><body>
 
     <div class="header">
@@ -364,6 +387,7 @@ export default function QuotesPage({ clients: clientsProp }) {
       </div>
     </div>
 
+    <div class="content">
     <div class="meta-row">
       <div class="prepared-for">
         <h3>Prepared For</h3>
@@ -451,7 +475,7 @@ export default function QuotesPage({ clients: clientsProp }) {
     </div>`:""}
 
     ${f.scopeOfWork?`
-    <div style="margin-bottom:20px;padding:14px 16px;background:#fff7ed;border-left:4px solid #f97316;border-radius:0 4px 4px 0">
+    <div class="scope-block" style="margin-bottom:20px;padding:14px 16px;background:#fff7ed;border-left:4px solid #f97316;border-radius:0 4px 4px 0">
       <div style="font-size:9px;font-weight:700;color:#f97316;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px">Scope of Work / Quote Details</div>
       <div style="font-size:12px;color:#1e293b;line-height:1.7;white-space:pre-wrap">${f.scopeOfWork}</div>
     </div>`:""}
@@ -463,6 +487,8 @@ export default function QuotesPage({ clients: clientsProp }) {
       <div class="sig-box">Date</div>
     </div>
     ${f.salesperson?`<div style="margin-top:16px;font-size:11px;color:#555">Prepared by: <strong>${f.salesperson}</strong></div>`:""}
+
+    </div>
 
     <div class="no-print" style="margin-top:24px;text-align:center">
       <button onclick="window.print()" style="padding:12px 28px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700">Print / Save as PDF</button>
