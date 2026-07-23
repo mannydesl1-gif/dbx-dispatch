@@ -345,20 +345,21 @@ export default function QuotesPage({ clients: clientsProp }) {
       .equipment-badges{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:3px}
       .eq-badge{background:#1e293b;color:#fff;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600}
       @media print{
-        /* Left/right page margin is 0 so the browser has no room to inject its
-           own date / blob: URL header and footer. The 46mm top margin reserves
-           the running-header strip on EVERY page; 16mm bottom is the footer gap. */
-        @page{size:letter;margin:46mm 0 16mm}
-        /* Side margins live on the body. */
-        body{padding:0 16mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        /* Zero side margins so the browser has no room to inject its own
+           date / blob: URL header and footer. Real margins are on the body. */
+        @page{size:letter;margin:0}
+        body{padding:0 14mm 12mm;-webkit-print-color-adjust:exact;print-color-adjust:exact}
         .no-print{display:none}
-        /* Repeat the DBX logo + QUOTE meta band at the top of every page.
-           Its own top/side padding provides the page's top margin. */
-        .header{position:fixed;top:0;left:0;right:0;background:#fff;margin:0;
-                padding:12mm 16mm 10px;box-sizing:border-box;z-index:10}
-        /* No padding needed: @page margin-top above reserves the strip on every
-           page. (padding-top reserves space only ONCE, which is why the first
-           attempt clipped continuation pages.) */
+        /* REPEATING HEADER — the whole quote is wrapped in .page-wrap, whose
+           <thead> holds the DBX band. Browsers repeat a thead on every printed
+           page AND reserve its height there, so the header appears on page 2+
+           without ever overlapping content. (position:fixed cannot do the
+           second part: it sits at the page edge while content flows below the
+           margin, which is what hid PREPARED FOR and SHIPPER / CONSIGNEE.) */
+        .page-wrap thead{display:table-header-group}
+        .page-wrap tbody{display:table-row-group}
+        .header{position:static;margin:0;padding:0 0 8px;background:#fff}
+        .header img{max-height:52px}
         .content{padding-top:0}
         /* Repeat line-item column headers if the table spans pages. */
         thead{display:table-header-group}
@@ -368,8 +369,19 @@ export default function QuotesPage({ clients: clientsProp }) {
            otherwise it would be pushed whole onto page 2 leaving page 1 short. */
         .scope-block{page-break-inside:auto}
       }
+      /* Invisible wrapper table used only to get a repeating page header. */
+      .page-wrap{width:100%;border-collapse:collapse;border:none}
+      .page-wrap > thead > tr > th.page-head,
+      .page-wrap > tbody > tr > td.page-body{
+        border:none;padding:0;margin:0;background:transparent;text-align:left;
+        font-weight:normal;vertical-align:top}
+      /* Top padding on the repeating header cell — page 1 gets its gap from the
+         body padding, but continuation pages start flush at the paper edge
+         without this. */
+      @media print{ .page-wrap > thead > tr > th.page-head{ padding-top:10mm } }
     </style></head><body>
 
+    <table class="page-wrap"><thead><tr><th class="page-head">
     <div class="header">
       <div class="logo-section">
         <img src="https://firebasestorage.googleapis.com/v0/b/dbx-prod.firebasestorage.app/o/assets%2Fdbx%20logo.jpg?alt=media&token=d8372047-6d1d-470a-9f72-7352cfa4d410" style="height:44px;object-fit:contain"/>
@@ -386,6 +398,8 @@ export default function QuotesPage({ clients: clientsProp }) {
         </div>
       </div>
     </div>
+    </th></tr></thead>
+    <tbody><tr><td class="page-body">
 
     <div class="content">
     <div class="meta-row">
@@ -489,6 +503,8 @@ export default function QuotesPage({ clients: clientsProp }) {
     ${f.salesperson?`<div style="margin-top:16px;font-size:11px;color:#555">Prepared by: <strong>${f.salesperson}</strong></div>`:""}
 
     </div>
+
+    </td></tr></tbody></table>
 
     <div class="no-print" style="margin-top:24px;text-align:center">
       <button onclick="window.print()" style="padding:12px 28px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:700">Print / Save as PDF</button>
