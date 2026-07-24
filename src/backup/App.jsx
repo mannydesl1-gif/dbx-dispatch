@@ -5080,7 +5080,7 @@ const rptEsc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").r
 // standaloneHeader=true renders the DBX band once at the top of the document
 // (used by the per-record detail layout). For table reports it is false and the
 // band is embedded in <thead> instead, so it repeats on every page.
-function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
+function rptOpenPdf(title, bodyHtml, standaloneHeader = true, countLabel = "") {
   const w = window.open("", "_blank");
   if (!w) { alert("Please allow popups to view the PDF."); return; }
   const stamp = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
@@ -5099,21 +5099,30 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
          page. A fixed-position header can't do the latter — padding only
          applies once, which left continuation pages clipped. */
       thead { display: table-header-group; }
-      tbody tr { page-break-inside: avoid; }
+      /* break-inside is the modern property — page-break-inside alone is
+         ignored on table rows in current Chrome, which let the last row on a
+         page get sliced in half instead of moving whole to the next page. */
+      tbody tr { page-break-inside: avoid; break-inside: avoid; }
+      tbody td { page-break-inside: avoid; break-inside: avoid; }
       /* Standalone header only shows for the detail (per-record) layout,
          which has no repeating table. */
       .hd-standalone { page-break-after: avoid; }
     }
     body { font-family:'Helvetica Neue',Arial,sans-serif; margin:0; padding:24px; background:#fff; color:#0f172a }
     .hd { display:flex; align-items:center; gap:16px; border-bottom:3px solid #dc2626; padding-bottom:12px; margin-bottom:18px }
-    .hd img { height:44px; display:block; flex:0 0 auto; max-width:170px; object-fit:contain }
+    /* Size the logo by WIDTH with height auto — capping height and using
+       object-fit:contain inside a flex row squashed the wide DBX mark. */
+    .hd img { width:150px; height:auto; max-height:60px; display:block; flex:0 0 auto }
     .hd h1 { margin:0; font-size:20px; font-weight:700 }
+    .hd .count { background:#dc2626; color:#fff; font-size:13px; font-weight:800;
+                 padding:5px 14px; border-radius:14px; white-space:nowrap;
+                 -webkit-print-color-adjust:exact; print-color-adjust:exact }
     .hd .meta { margin-left:auto; text-align:right; font-size:11px; color:#64748b }
     /* Header band rendered inside <thead> so it repeats per page. */
     /* Top padding is what stops the logo being clipped at the top of every
        continuation page — the repeated thead row otherwise starts flush against
        the page edge. */
-    th.hdcell { border:none !important; padding:2mm 0 8px !important; background:#fff !important;
+    th.hdcell { border:none !important; padding:4mm 0 10px !important; background:#fff !important;
                 color:#0f172a !important; text-align:left !important; font-size:inherit !important;
                 vertical-align:middle !important; }
     th.hdcell .hd { margin-bottom:0 }
@@ -5155,6 +5164,7 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
     ${standaloneHeader ? `<div class="hd hd-standalone">
       <img src="${LOGO}" alt="DBX"/>
       <h1>${rptEsc(title)}</h1>
+      ${countLabel ? `<div class="count">${rptEsc(countLabel)}</div>` : ""}
       <div class="meta">Diamond Back Express Inc.<br/>Generated ${stamp}</div>
     </div>` : ""}
     ${bodyHtml}
@@ -5209,10 +5219,13 @@ const RPT_NOWRAP_COLS = new Set(["Phone", "Role", "PIN", "Licence Class",
 const RPT_TXT_COLS = new Set(["Address", "Client", "Contact Person", "Email", "Expiry Alerts", "Make", "Model", "Name", "Notes", "Pay Configuration", "Ref", "Service Type"]);
 
 // The DBX band markup, for embedding inside <thead> so it repeats per page.
-function rptHeaderBand(title) {
+// countLabel e.g. "46 Trailers" — shown as a pill beside the title so the total
+// is visible at the top of every page.
+function rptHeaderBand(title, countLabel) {
   return `<div class="hd">
       <img src="${LOGO}" alt="DBX"/>
       <h1>${rptEsc(title)}</h1>
+      ${countLabel ? `<div class="count">${rptEsc(countLabel)}</div>` : ""}
       <div class="meta">Diamond Back Express Inc.<br/>Generated ${new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"})}</div>
     </div>`;
 }
@@ -5311,21 +5324,33 @@ function RosterEquipReports({ db }) {
   const rowsFn = isEquip ? rptUnitRows : rptPersonRows;
   const stamp = new Date().toISOString().slice(0, 10);
 
+  // Total shown in the report header, e.g. "46 Trailers" / "31 Drivers".
+  const NOUN = {
+    trucks: ["Truck","Trucks"], trailers: ["Trailer","Trailers"],
+    drivers: ["Driver","Drivers"], employees: ["Employee","Employees"],
+    suppliers: ["Supplier","Suppliers"],
+    all: isEquip ? ["Unit","Units"] : ["Person","People"],
+  }[cat] || ["Record","Records"];
+  const countLabel = `${chosen.length} ${chosen.length === 1 ? NOUN[0] : NOUN[1]}`;
+
   const doPdf = () => {
     if (!chosen.length) return alert("Nothing selected.");
     if (detail) {
       // Per-record layout: single header at the top of the document.
-      rptOpenPdf(title, rptDetailHtml(chosen, label, rowsFn), true);
+      rptOpenPdf(title, rptDetailHtml(chosen, label, rowsFn), true, countLabel);
     } else {
       // Table layout: header band goes inside <thead> so it repeats per page.
-      rptOpenPdf(title, rptTableHtml(cols, chosen, rptHeaderBand(title)), false);
+      rptOpenPdf(title, rptTableHtml(cols, chosen, rptHeaderBand(title, countLabel)), false, countLabel);
     }
   };
   const doExcel = async () => {
     if (!chosen.length) return alert("Nothing selected.");
     setBusy(true);
     try {
-      const aoa = detail ? rptAoaDetail(chosen, label, rowsFn) : rptAoaFlat(cols, chosen);
+      // Prepend the title and total so the count is visible in Excel too.
+      const aoa = [[title], [countLabel], []].concat(
+        detail ? rptAoaDetail(chosen, label, rowsFn) : rptAoaFlat(cols, chosen)
+      );
       await rptExcel(`${isEquip ? "equipment" : "roster"}-${cat}-${stamp}.xlsx`,
         [{ name: catLabel || "Report", aoa }]);
     } catch (e) { console.error(e); alert("Excel export failed. Is the 'xlsx' package installed?"); }
