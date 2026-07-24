@@ -1291,6 +1291,7 @@ const CERT_ALERT_RECIPIENTS = [
   "manny@diamondbackexpress.com",
   "nichole@diamondbackexpress.com",
   "chris@diamondbackexpress.com",
+  "vathani143@yahoo.com",
 ];
 
 const DIGEST_CERTS = [

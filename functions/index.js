@@ -1287,12 +1287,30 @@ exports.dailyPickupReminder = onSchedule({
 
 // ═══ DAILY CERTIFICATION & EQUIPMENT EXPIRY DIGEST ═══════════════════════════
 // Runs every morning; emails anything expired or expiring within 30 days.
-const CERT_ALERT_RECIPIENTS = [
+// Fallback only — the live list is managed in the app and stored at
+// settings/alertRecipients. If that doc is missing or empty we fall back to
+// these so the digest can never silently email nobody.
+const CERT_ALERT_RECIPIENTS_FALLBACK = [
   "manny@diamondbackexpress.com",
   "nichole@diamondbackexpress.com",
   "chris@diamondbackexpress.com",
-  "vathani143@yahoo.com",
 ];
+
+// Read the editable recipient list from Firestore.
+async function getAlertRecipients(db) {
+  try {
+    const snap = await db.collection("settings").doc("alertRecipients").get();
+    const list = snap.exists ? (snap.data().emails || []) : [];
+    const clean = list
+      .map(e => String(e || "").trim())
+      .filter(e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
+    if (clean.length) return clean;
+    console.warn("alertRecipients empty or invalid — using fallback list");
+  } catch (e) {
+    console.error("Could not read alertRecipients, using fallback:", e);
+  }
+  return CERT_ALERT_RECIPIENTS_FALLBACK;
+}
 
 const DIGEST_CERTS = [
   { k: "acrDate", l: "ACR Training", months: 12 },
@@ -1508,7 +1526,7 @@ exports.dailyExpiryDigest = onSchedule({
     if (soonCount) subjBits.push(`${soonCount} upcoming`);
     await getTransporter().sendMail({
       from: '"DBX Dispatch" <manny@diamondbackexpress.com>',
-      to: CERT_ALERT_RECIPIENTS.join(", "),
+      to: (await getAlertRecipients(db)).join(", "),
       subject: `DBX Expiry Alert — ${subjBits.join(", ")}`,
       html,
     });

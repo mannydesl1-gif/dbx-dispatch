@@ -3640,7 +3640,13 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
           </Field>;
         }
         if(f.tp==="select") return <Field key={f.k} l={f.l}><select style={sIn} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}>{(f.opts||[]).map(o=><option key={o} value={o}>{o||"— None —"}</option>)}</select></Field>;
-        return <Field key={f.k} l={f.l}>{f.tp==="textarea" ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/> : <input style={sIn} type={f.tp||"text"} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>}</Field>;
+        return <Field key={f.k} l={f.l}>{
+          f.tp==="textarea"
+            ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
+            : f.tp==="date"
+              ? <DatePicker value={fmData[f.k]||""} onChange={v=>setFmData(p=>({...p,[f.k]:v}))} placeholder="Select date..."/>
+              : <input style={sIn} type={f.tp||"text"} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
+        }</Field>;
       })}
 
       {/* Pricing Schedule — clients only. Optional; if enabled, orders for this client auto-calc pricing (always overridable per order). */}
@@ -4660,7 +4666,13 @@ function EquipList({title, items, col, fields, saveColl}) {
       })}
     </div>}
     {ed && <div ref={formRef} style={sCrd}>
-      {fields.map(f=><Field key={f.k} l={f.l}>{f.tp==="textarea" ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/> : <input style={sIn} type={f.tp||"text"} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>}</Field>)}
+      {fields.map(f=><Field key={f.k} l={f.l}>{
+        f.tp==="textarea"
+          ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
+          : f.tp==="date"
+            ? <DatePicker value={fmData[f.k]||""} onChange={v=>setFmData(p=>({...p,[f.k]:v}))} placeholder="Select date..."/>
+            : <input style={sIn} type={f.tp||"text"} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
+      }</Field>)}
       <div style={{marginTop:8}}>
         <DropZone label="Documents" uploading={uploading} docKey="docs" fileRef={fileRef} onFiles={addFiles} />
         {(fmData.docs||[]).length>0 &&
