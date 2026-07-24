@@ -4986,7 +4986,6 @@ const RPT_UNIT_COLS = [
   ["Safety Exp", u => u.safetyExp ? fd(u.safetyExp) : ""],
   ["Safety Status", u => u.safetyExp ? rptStatus(u.safetyExp, 0, true).txt : "Not set"],
   ["Notes", u => u.notes || ""],
-  ["Docs", u => String((u.docs || []).length)],
 ];
 
 // Column pieces, assembled per category by rptPersonCols() below.
@@ -5004,10 +5003,10 @@ const RPT_SUPPLIER_COLS = [
 ];
 
 // Driver/employee-only fields
+// Employee ID and PIN deliberately excluded — Manuel looks those up in dispatch,
+// and they consumed width the phone/email columns needed.
 const RPT_STAFF_COLS = [
   ["Licence Class", p => p.license || ""],
-  ["Employee ID", p => p.employeeId || ""],
-  ["PIN", p => p.pin || ""],
   ["Pay Configuration", p => rptFmtPay(p.payCfg)],
 ];
 
@@ -5032,17 +5031,40 @@ const RPT_PORTAL_COLS = [
 // the printed page — 21 fixed columns overflow landscape Letter regardless of
 // margin, which is what was cutting off the last column.
 function rptPersonCols(cat, records) {
+  let cols;
+  // Role is omitted — the report title already says Drivers / Employees /
+  // Suppliers. It is kept for the "all" category, where the mix matters.
   if (cat === "suppliers") {
-    return [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
+    cols = [RPT_COL_NAME, RPT_COL_PHONE, RPT_COL_EMAIL,
             ...RPT_SUPPLIER_COLS, RPT_COL_ADDRESS];
+  } else if (cat === "all") {
+    cols = [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
+            ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
+    if ((records || []).some(p => p.isSupplier)) {
+      cols.splice(4, 0, ...RPT_SUPPLIER_COLS);
+    }
+  } else {
+    cols = [RPT_COL_NAME, RPT_COL_PHONE, RPT_COL_EMAIL,
+            ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
   }
-  const cols = [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
-                ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
-  // "All" mixes suppliers in, so re-add their fields only when some are present.
-  if (cat === "all" && (records || []).some(p => p.isSupplier)) {
-    cols.splice(4, 0, ...RPT_SUPPLIER_COLS);
-  }
-  return cols;
+  return rptDropEmptyCols(cols, records);
+}
+
+// Remove columns that are blank for every record in the report. Empty columns
+// still consume width under table-layout:fixed, which is what forced phone
+// numbers and emails to wrap. Name and Role are always kept.
+const RPT_ALWAYS_KEEP = new Set(["Name", "Role"]);
+function rptDropEmptyCols(cols, records) {
+  const list = records || [];
+  if (!list.length) return cols;
+  return cols.filter(c => {
+    if (RPT_ALWAYS_KEEP.has(c[0])) return true;
+    return list.some(r => {
+      const v = c[1](r);
+      // Cert columns render "Not set" when absent — treat that as empty too.
+      return v && String(v).trim() !== "" && String(v).trim() !== "Not set";
+    });
+  });
 }
 
 // Kept for the per-record detail layout, which lists every field vertically.
@@ -5064,7 +5086,10 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
   const stamp = new Date().toLocaleString("en-US",{dateStyle:"medium",timeStyle:"short"});
   w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>${rptEsc(title)}</title>
   <style>
-    @page { size: landscape; margin: 10mm 14mm; }
+    /* Generous top margin so the repeated header row (logo band + column
+       headers) always has room at the top of continuation pages — without it
+       the 54px logo is clipped by the page edge. */
+    @page { size: landscape; margin: 14mm 14mm 10mm; }
     @media print {
       body { margin:0; padding:0 }
       .no-print { display:none !important }
@@ -5081,12 +5106,16 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
     }
     body { font-family:'Helvetica Neue',Arial,sans-serif; margin:0; padding:24px; background:#fff; color:#0f172a }
     .hd { display:flex; align-items:center; gap:16px; border-bottom:3px solid #dc2626; padding-bottom:12px; margin-bottom:18px }
-    .hd img { height:54px }
+    .hd img { height:44px; display:block; flex:0 0 auto; max-width:170px; object-fit:contain }
     .hd h1 { margin:0; font-size:20px; font-weight:700 }
     .hd .meta { margin-left:auto; text-align:right; font-size:11px; color:#64748b }
     /* Header band rendered inside <thead> so it repeats per page. */
-    th.hdcell { border:none !important; padding:0 0 10px !important; background:#fff !important;
-                color:#0f172a !important; text-align:left !important; }
+    /* Top padding is what stops the logo being clipped at the top of every
+       continuation page — the repeated thead row otherwise starts flush against
+       the page edge. */
+    th.hdcell { border:none !important; padding:2mm 0 8px !important; background:#fff !important;
+                color:#0f172a !important; text-align:left !important; font-size:inherit !important;
+                vertical-align:middle !important; }
     th.hdcell .hd { margin-bottom:0 }
     /* table-layout:fixed keeps the table inside the printable width, but with
        equal column widths phone numbers and emails wrap badly. Explicit widths
@@ -5095,9 +5124,16 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
             table-layout:fixed }
     /* break-word only, never mid-word: avoids "a@balochi@hotmail.com" splitting
        into three lines. Long unbroken strings shrink instead. */
-    td, th { word-wrap:break-word; overflow-wrap:break-word; hyphens:none }
-    td { font-size:9px; line-height:1.3 }
-    th { font-size:8px; line-height:1.25 }
+    td { word-wrap:break-word; overflow-wrap:break-word; hyphens:none;
+         font-size:9px; line-height:1.3 }
+    /* Headers wrap only between words — overflow-wrap:normal stops "CRIMINAL"
+       being split as "CRIMINA / L". Slightly tighter tracking helps them fit. */
+    /* Header labels are the longest strings in the narrowest cells, so they get
+       a smaller size than the body text (9px) to fit on fewer lines. */
+    th { overflow-wrap:normal; word-break:normal; hyphens:none;
+         font-size:7px; line-height:1.2; letter-spacing:0 !important; padding:5px 3px }
+    /* Phone numbers should never break across lines. */
+    td.nowrap, th.nowrap { white-space:nowrap }
     /* Centered by default; .txt columns (names, emails, addresses) stay left
        so long values remain readable. */
     th,td { border:1px solid #cbd5e1; padding:5px 7px; text-align:center; vertical-align:middle }
@@ -5135,15 +5171,39 @@ function rptOpenPdf(title, bodyHtml, standaloneHeader = true) {
 // Without these, table-layout:fixed gives every column equal width and phone
 // numbers and emails wrap onto 2-3 lines.
 const RPT_COL_WIDTH = {
-  "Name": 13, "Role": 6, "Phone": 9, "Email": 17,
-  "Licence Class": 6, "Employee ID": 7, "PIN": 5,
-  "Pay Configuration": 11, "Address": 12,
-  "Contact Person": 11, "Service Type": 11,
-  "ACR Training": 8, "HazMat Training": 8, "Criminal Record Check": 8,
-  "Background Verification": 8, "Code of Conduct": 8, "Driver's Licence": 8,
-  "Expiry Alerts": 8, "Portal Daily Log": 7, "Docs": 4,
+  // Sized to actual content. Phone fits "555-555-5555" and no more; VIN needs
+  // room for a full 17-character number on one line.
+  "Name": 15, "Role": 6, "Phone": 8, "Email": 22,
+  "Licence Class": 4, "Employee ID": 8, "PIN": 5,
+  "Pay Configuration": 12, "Address": 14,
+  "Contact Person": 12, "Service Type": 12,
+  "ACR Training": 9, "HazMat Training": 9, "Criminal Record Check": 9,
+  "Background Verification": 9, "Code of Conduct": 9, "Driver's Licence": 9,
+  "Expiry Alerts": 9, "Portal Daily Log": 8, "Docs": 4,
+  // Equipment columns
+  "Unit #": 7, "Plate #": 7, "Year": 4, "Make": 9, "Model": 9, "Type": 7,
+  "VIN": 18, "Safety Exp": 8, "Safety Status": 8, "Notes": 16,
 };
 const rptColWidth = label => RPT_COL_WIDTH[label] || 8;
+
+// Shorter labels for the wide table layout — the full names ("Background
+// Verification", "Criminal Record Check") force very narrow columns.
+const RPT_SHORT_LABEL = {
+  "Criminal Record Check": "Criminal Check",
+  "Background Verification": "Background",
+  "Driver's Licence": "Licence Exp",
+  "Pay Configuration": "Pay Config",
+  "Licence Class": "Class",
+  "Employee ID": "Emp ID",
+  "ACR Training": "ACR",
+  "HazMat Training": "HazMat",
+  "Code of Conduct": "Conduct",
+};
+const rptShort = label => RPT_SHORT_LABEL[label] || label;
+
+// Phone must stay on one line.
+const RPT_NOWRAP_COLS = new Set(["Phone", "Role", "PIN", "Licence Class",
+  "Employee ID", "VIN", "Year", "Plate #", "Unit #", "Safety Exp"]);
 
 // Columns holding long free text stay left-aligned; everything else centers.
 const RPT_TXT_COLS = new Set(["Address", "Client", "Contact Person", "Email", "Expiry Alerts", "Make", "Model", "Name", "Notes", "Pay Configuration", "Ref", "Service Type"]);
@@ -5170,8 +5230,14 @@ function rptTableHtml(cols, rows, headerBandHtml) {
   const wTotal = cols.reduce((s, c) => s + rptColWidth(c[0]), 0);
   const group = `<colgroup>${cols.map(c =>
     `<col style="width:${(rptColWidth(c[0]) / wTotal * 100).toFixed(2)}%"/>`).join("")}</colgroup>`;
-  const head = `<thead>${band}<tr>${cols.map(c => `<th${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[0])}</th>`).join("")}</tr></thead>`;
-  const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td${isTxt(c[0])?' class="txt"':""}>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  const cls = label => {
+    const parts = [];
+    if (isTxt(label)) parts.push("txt");
+    if (RPT_NOWRAP_COLS.has(label)) parts.push("nowrap");
+    return parts.length ? ` class="${parts.join(" ")}"` : "";
+  };
+  const head = `<thead>${band}<tr>${cols.map(c => `<th${cls(c[0])}>${rptEsc(rptShort(c[0]))}</th>`).join("")}</tr></thead>`;
+  const body = `<tbody>${rows.map(r => `<tr>${cols.map(c => `<td${cls(c[0])}>${rptEsc(c[1](r))}</td>`).join("")}</tr>`).join("")}</tbody>`;
   return `<table>${group}${head}${body}</table>`;
 }
 
