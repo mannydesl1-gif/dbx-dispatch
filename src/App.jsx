@@ -196,6 +196,54 @@ function fxConvertToTargetM(byCur, targetCur, rates) {
   return total;
 }
 
+// Convert ONE amount from its native currency to the invoice/target currency using
+// the rates LOCKED on the order's fxSnapshot. Rates are USD-based (units of CUR per
+// 1 USD, USD:1). Returns { val, rate, ok }:
+//   ok=false  → no usable rate (caller shows native amount, flags "rate n/a")
+//   rate      → effective native→target multiplier actually applied
+// Legacy fallback: snapshots saved before rates were stored can still convert a
+// SINGLE-currency order using the implied rate convertedBase/nativeSum.
+function fxLineToTarget(amtNative, nativeCur, snap) {
+  const target = (snap && snap.target) || nativeCur;
+  if (!nativeCur || nativeCur === target) return { val: amtNative, rate: 1, ok: true };
+  const rates = snap && snap.rates;
+  if (rates) {
+    const rFrom = nativeCur === "USD" ? 1 : rates[nativeCur];
+    const rTo = target === "USD" ? 1 : rates[target];
+    if (rFrom && rTo) return { val: (amtNative / rFrom) * rTo, rate: rTo / rFrom, ok: true };
+  }
+  // Legacy single-currency implied rate.
+  if (snap && snap.byCur && Object.keys(snap.byCur).length === 1
+      && snap.convertedBase != null) {
+    const only = Object.keys(snap.byCur)[0];
+    const nativeSum = snap.byCur[only];
+    if (only === nativeCur && nativeSum) {
+      const implied = snap.convertedBase / nativeSum;
+      return { val: amtNative * implied, rate: implied, ok: true };
+    }
+  }
+  return { val: amtNative, rate: null, ok: false };
+}
+
+// Sum a set of native line totals after converting EACH to the target currency
+// and rounding to 2 decimals, so the displayed/exported subtotal always equals the
+// sum of the rounded line totals shown (Xero recomputes from lines, so they must
+// foot). lines: [{ltot, currency}]. Returns { target, rows:[{rounded, cur, ok...}],
+// sum } where sum is in the target currency.
+function fxConvertedLineSum(lines, snap) {
+  const target = (snap && snap.target) || null;
+  let sum = 0;
+  const rows = (lines || []).map(l => {
+    const cur = l.currency || (snap && snap.cur) || "CAD";
+    const r = fxLineToTarget(l.ltot, cur, snap || {});
+    const rounded = Math.round(r.val * 100) / 100;
+    sum += rounded;
+    return { conv: r.val, rounded, cur, ok: r.ok, rate: r.rate, native: l.ltot };
+  });
+  return { target, rows, sum: Math.round(sum * 100) / 100 };
+}
+
+
 function buildFxSnapshotFromOrder(order, rates, fxDate) {
   // Rebuild the fxSnapshot from an order's event lines using freshly-fetched
   // rates — mirrors the in-editor snapshot build so the invoice matches the BOL.
@@ -367,14 +415,22 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
           <th style="${thR}">Tax</th>
           <th style="${thR}">Amount</th>
         </tr></thead>
-        <tbody>${linesCalc.map(l=>{const lc=l.currency||p.cur||"CAD";const ls=fxSymPdf(lc);return `
+        <tbody>${linesCalc.map(l=>{const lc=l.currency||p.cur||"CAD";const ls=fxSymPdf(lc);
+          const snap2=p.fxSnapshot; const tgt=(snap2&&snap2.target)||lc; const showConv=lc!==tgt;
+          const conv=fxLineToTarget(l.ltot,lc,snap2||{}); const tsym=fxSymPdf(tgt);
+          const amtCell = showConv
+            ? (conv.ok
+                ? `${tsym}${(Math.round(conv.val*100)/100).toFixed(2)}<div style="font-size:9px;color:#999;font-weight:400">was ${ls}${l.ltot.toFixed(2)} ${lc}</div>`
+                : `${ls}${l.ltot.toFixed(2)} ${lc}<div style="font-size:9px;color:#b45309;font-weight:400">rate n/a</div>`)
+            : `${ls}${l.ltot.toFixed(2)}`;
+          return `
           <tr>
             <td style="${td}">${l.desc||"Charge"}</td>
             <td style="${tdR}">${l.qty}</td>
             <td style="${tdR}">${ls}${parseFloat(l.unitPrice).toFixed(2)}</td>
             <td style="${tdR};font-size:10px;color:#888">${lc}</td>
             <td style="${tdR};font-size:10px;color:#888">${l.lt.label||"—"}</td>
-            <td style="${tdR};font-weight:600">${ls}${l.ltot.toFixed(2)}</td>
+            <td style="${tdR};font-weight:600">${amtCell}</td>
           </tr>`;}).join("")}
         </tbody>
       </table>`;
@@ -384,17 +440,23 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
     const snap = p.fxSnapshot;
     if (snap && (snap.applies || snap.multi) && snap.grand != null) {
       const tSym = fxSymPdf2(snap.target);
+      const footed = fxConvertedLineSum(linesCalc, snap);
+      const anyMissing = footed.rows.some(r=>!r.ok);
+      const convSub = footed.sum;
+      const adjAmt = snap.adjVal ? (snap.adjMode==="pct" ? Math.round(convSub*(snap.adjVal/100)*100)/100 : (parseFloat(snap.adjVal)||0)) : 0;
+      const grand = Math.round((convSub + adjAmt)*100)/100;
       html += `<div style="margin-top:10px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
-        <div style="font-size:10px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">Subtotals by Currency</div>
+        <div style="font-size:10px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">Subtotals by Currency (as entered)</div>
         ${Object.entries(snap.byCur||{}).map(([c,a])=>`<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px"><span style="color:#555">${c}</span><span style="font-weight:600">${fxSymPdf2(c)}${a.toFixed(2)} ${c}</span></div>`).join("")}
         <div style="border-top:1px solid #e2e8f0;margin-top:8px;padding-top:8px">
-          ${snap.adjVal ? `<div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:2px"><span>Subtotal (${snap.target})</span><span>${tSym}${snap.convertedBase.toFixed(2)}</span></div>
-          <div style="display:flex;justify-content:space-between;font-size:12px;color:${snap.adjAmount<0?"#b45309":"#555"};margin-bottom:4px"><span>${snap.adjLabel} (${snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>${snap.adjAmount<0?"−":""}${tSym}${Math.abs(snap.adjAmount).toFixed(2)}</span></div>` : ""}
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:2px"><span>Subtotal (${snap.target})</span><span>${tSym}${convSub.toFixed(2)}</span></div>
+          ${snap.adjVal ? `<div style="display:flex;justify-content:space-between;font-size:12px;color:${adjAmt<0?"#b45309":"#555"};margin-bottom:4px"><span>${snap.adjLabel} (${snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>${adjAmt<0?"−":""}${tSym}${Math.abs(adjAmt).toFixed(2)}</span></div>` : ""}
           <div style="display:flex;justify-content:space-between;align-items:baseline">
             <span style="font-weight:700;font-size:13px;color:#dc2626;text-transform:uppercase">Grand Total ${snap.target}</span>
-            <span style="font-weight:800;font-size:16px;color:#dc2626">${tSym}${snap.grand.toFixed(2)} ${snap.target}</span>
+            <span style="font-weight:800;font-size:16px;color:#dc2626">${tSym}${grand.toFixed(2)} ${snap.target}</span>
           </div>
         </div>
+        ${anyMissing?`<div style="font-size:9px;color:#b45309;margin-top:6px">Some lines have no locked rate — re-save this order to lock exchange rates.</div>`:""}
         ${snap.fxDate?`<div style="font-size:9px;color:#999;margin-top:6px">Converted using exchange rates as of ${snap.fxDate} UTC.</div>`:""}
       </div>
       ${o.poNumber?`<div style="margin-top:8px;font-size:11px;color:#666">PO #: <strong>${o.poNumber}</strong></div>`:""}
@@ -1984,6 +2046,11 @@ function OrderEdit({data, db, savOrd, go}) {
       byCur, target: fxTarget, convertedBase, adjMode: fxAdjMode, adjVal: fxAdjVal,
       adjLabel: o.price?.adjLabel || "Adjustment", adjAmount: fxAdjAmount, grand: fxGrand,
       fxDate, multi: Object.keys(byCur).length > 1,
+      // Locked per-currency rates (USD-based: units of CUR per 1 USD, USD:1) so
+      // each LINE can be converted to the target at the SAME rate shown on the BOL,
+      // and stays fixed for this order regardless of later rate moves. Re-save an
+      // old order once to populate this.
+      rates: { ...fxRates, USD: 1 }, rateBase: "USD",
       // Snapshot "applies" (drives PDF/detail) whenever a real conversion or
       // adjustment happened: multiple currencies, an adjustment, or the target
       // currency differs from the lines' currency. Single-currency, no-fee,
@@ -2784,14 +2851,54 @@ function buildXeroCsvString(o, p) {
     return rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",")).join("\n");
   }
   if(p.useEventPricing || hasEvtLines) {
+    // Xero rejects mixed currencies on one invoice, so every row must be in the
+    // invoice (target) currency. Lines already IN the target keep qty × unit and
+    // their tax type (fully tax-correct). Lines in another currency are converted
+    // at the order's LOCKED snapshot rate to a single qty-1, tax-inclusive row in
+    // the target currency (TaxType NONE — the converted figure is final, Xero must
+    // not recompute tax on it). Foots exactly to the BOL/PDF.
+    const snap = p.fxSnapshot;
+    const target = (snap && snap.target) || cur;
     if(hasBase) {
       const base=parseFloat(p.base||0), fuelP=parseFloat(p.fuelPct||0), fuel=base*(fuelP/100);
-      rows.push(row(p.transDesc||"Transport Charge",1,base.toFixed(2),p.taxMode));
-      if(fuel>0) rows.push(row("Fuel Surcharge",1,fuel.toFixed(2),"NONE"));
+      // Transport is in the order's cur; convert if it differs from target.
+      const tconv = fxLineToTarget(base, cur, snap||{});
+      const fconv = fxLineToTarget(fuel, cur, snap||{});
+      if(cur===target){
+        rows.push(row(p.transDesc||"Transport Charge",1,base.toFixed(2),p.taxMode,target));
+        if(fuel>0) rows.push(row("Fuel Surcharge",1,fuel.toFixed(2),"NONE",target));
+      } else {
+        rows.push(row((p.transDesc||"Transport Charge")+` (${cur} ${base.toFixed(2)} @ ${snap&&snap.fxDate?snap.fxDate:"rate"})`,1,(Math.round(tconv.val*100)/100).toFixed(2),"NONE",target));
+        if(fuel>0) rows.push(row(`Fuel Surcharge (${cur} ${fuel.toFixed(2)})`,1,(Math.round(fconv.val*100)/100).toFixed(2),"NONE",target));
+      }
     }
     (p.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).forEach(l=>{
-      rows.push(row(l.desc,parseFloat(l.qty)||1,(parseFloat(l.unitPrice)||0).toFixed(2),l.taxMode||"NONE",l.currency||cur));
+      const lc = l.currency||cur;
+      if(lc===target){
+        // Same currency as invoice — keep native qty × unit and tax type.
+        rows.push(row(l.desc,parseFloat(l.qty)||1,(parseFloat(l.unitPrice)||0).toFixed(2),l.taxMode||"NONE",target));
+      } else {
+        // Different currency — convert the tax-inclusive line total to one qty-1 row.
+        const ltp = l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+        const lb = (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+        const ltot = lb + lb*(ltp/100);
+        const conv = fxLineToTarget(ltot, lc, snap||{});
+        const val = conv.ok ? (Math.round(conv.val*100)/100) : ltot;
+        const note = ` (${lc} ${ltot.toFixed(2)}${l.qty&&parseFloat(l.qty)!==1?` = ${l.qty}×${(parseFloat(l.unitPrice)||0).toFixed(2)}`:""}${conv.ok?` @ ${snap&&snap.fxDate?snap.fxDate:"locked rate"}`:" — RATE N/A"})`;
+        rows.push(row(l.desc+note,1,val.toFixed(2),"NONE",target));
+      }
     });
+    // Admin fee / adjustment as its own row so the CSV total matches the BOL.
+    if(snap && snap.adjVal){
+      const footed = fxConvertedLineSum(
+        (p.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).map(l=>{
+          const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+          const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+          return {ltot:lb+lb*(ltp/100), currency:l.currency||cur};
+        }), snap);
+      const adjAmt = snap.adjMode==="pct" ? Math.round(footed.sum*(snap.adjVal/100)*100)/100 : (parseFloat(snap.adjVal)||0);
+      if(adjAmt) rows.push(row(`${snap.adjLabel||"Adjustment"}${snap.adjMode==="pct"?` (${snap.adjVal}%)`:""}`,1,adjAmt.toFixed(2),"NONE",target));
+    }
   } else {
     const routeDesc = [o.pickCo?`from ${o.pickCo}`:"",o.pickCity||"",o.delCo?`to ${o.delCo}`:"",o.delCity||""].filter(Boolean).join(" ");
     const mainDesc = o.notes||routeDesc||`Freight Services - BOL ${o.bol}`;
@@ -3345,6 +3452,7 @@ function PricingEntry({o:io, db, savOrd, go}) {
             byCur, target, convertedBase, adjMode, adjVal,
             adjLabel: p.adjLabel||"Adjustment", adjAmount, grand,
             fxDate, multi: evtCurrenciesUsed().length>1,
+            rates: { ...fxRates, USD: 1 }, rateBase: "USD",
             applies: (Object.keys(byCur).length > 1) || (adjVal !== 0)
               || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== target),
           };
@@ -4108,14 +4216,24 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
                 <th style={{textAlign:"right",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 0"}}>Total</th>
               </tr></thead>
               <tbody>
-                {linesCalc.map((l,i)=>{const lc=l.currency||p.cur||"CAD";const ls=csym(lc);return <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
+                {linesCalc.map((l,i)=>{const lc=l.currency||p.cur||"CAD";const ls=csym(lc);
+                  const snap=p.fxSnapshot; const tgt=(snap&&snap.target)||lc;
+                  const conv=fxLineToTarget(l.ltot,lc,snap||{}); const tsym=csym(tgt);
+                  const showConv=lc!==tgt;
+                  return <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
                   <td style={{padding:"4px 8px 4px 0",fontSize:11}}>
                     {l.desc}{l.ltax>0&&<span style={{fontSize:9,color:T.muted,marginLeft:4}}>({l.ltaxLabel})</span>}
                   </td>
                   <td style={{textAlign:"right",padding:"4px",fontSize:11,color:T.muted}}>{l.qty}</td>
                   <td style={{textAlign:"right",padding:"4px",fontSize:11,color:T.muted}}>{ls}{parseFloat(l.unitPrice).toFixed(2)}</td>
                   <td style={{textAlign:"right",padding:"4px",fontSize:10,color:T.muted}}>{lc}</td>
-                  <td style={{textAlign:"right",padding:"4px 0",fontWeight:600,fontSize:11,color:"#22c55e"}}>{ls}{l.ltot.toFixed(2)}</td>
+                  <td style={{textAlign:"right",padding:"4px 0",fontWeight:600,fontSize:11,color:"#22c55e"}}>
+                    {showConv
+                      ? (conv.ok
+                          ? <>{tsym}{conv.val.toFixed(2)}<div style={{fontSize:9,color:T.muted,fontWeight:400}}>was {ls}{l.ltot.toFixed(2)} {lc}</div></>
+                          : <>{ls}{l.ltot.toFixed(2)} {lc}<div style={{fontSize:9,color:"#f59e0b",fontWeight:400}}>rate n/a — re-save order</div></>)
+                      : <>{ls}{l.ltot.toFixed(2)}</>}
+                  </td>
                 </tr>;})}
               </tbody>
             </table>
@@ -4125,18 +4243,26 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
             const snap = p.fxSnapshot;
             if (snap && (snap.applies || snap.multi) && snap.grand!=null) {
               const tsym = csym(snap.target);
+              // Foot the subtotal to the SUM of the rounded converted line totals
+              // shown above, so lines add up exactly (Xero recomputes from lines).
+              const footed = fxConvertedLineSum(linesCalc, snap);
+              const anyMissing = footed.rows.some(r=>!r.ok);
+              // Converted subtotal = rounded line sum (+ transport already in target).
+              const convSub = footed.sum;
+              const adjAmt = snap.adjVal ? (snap.adjMode==="pct" ? Math.round(convSub*(snap.adjVal/100)*100)/100 : (parseFloat(snap.adjVal)||0)) : 0;
+              const grand = Math.round((convSub + adjAmt)*100)/100;
               return <div style={{marginTop:8,borderTop:`1px solid ${T.border}`,paddingTop:6}}>
-                <div style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.3px",marginBottom:4}}>Subtotals by currency</div>
+                <div style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.3px",marginBottom:4}}>Subtotals by currency (as entered)</div>
                 {Object.entries(snap.byCur||{}).map(([c,a])=>(
                   <div key={c} style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.muted,marginBottom:2}}>
                     <span>{c}</span><span>{csym(c)}{a.toFixed(2)} {c}</span>
                   </div>
                 ))}
-                {snap.adjVal ? <>
-                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.muted,marginTop:4}}><span>Subtotal ({snap.target})</span><span>{tsym}{snap.convertedBase.toFixed(2)}</span></div>
-                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:snap.adjAmount<0?"#f59e0b":T.muted}}><span>{snap.adjLabel} ({snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>{snap.adjAmount<0?"−":""}{tsym}{Math.abs(snap.adjAmount).toFixed(2)}</span></div>
-                </> : null}
-                <div style={{display:"flex",justifyContent:"space-between",fontWeight:700,fontSize:14,marginTop:4}}><span>Grand Total</span><span style={{color:"#0ea5e9"}}>{tsym}{snap.grand.toFixed(2)} {snap.target}</span></div>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.muted,marginTop:4}}><span>Subtotal ({snap.target})</span><span>{tsym}{convSub.toFixed(2)}</span></div>
+                {snap.adjVal ? <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:adjAmt<0?"#f59e0b":T.muted}}><span>{snap.adjLabel} ({snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>{adjAmt<0?"−":""}{tsym}{Math.abs(adjAmt).toFixed(2)}</span></div> : null}
+                <div style={{display:"flex",justifyContent:"space-between",fontWeight:700,fontSize:14,marginTop:4}}><span>Grand Total</span><span style={{color:"#0ea5e9"}}>{tsym}{grand.toFixed(2)} {snap.target}</span></div>
+                {anyMissing && <div style={{fontSize:10,color:"#f59e0b",marginTop:4}}>Some lines have no locked rate — re-save this order to lock exchange rates.</div>}
+                {snap.fxDate && <div style={{fontSize:9,color:T.dim,marginTop:4}}>Converted at rates as of {snap.fxDate} UTC.</div>}
               </div>;
             }
             return <div style={{fontWeight:700,marginTop:8,fontSize:14,borderTop:`1px solid ${T.border}`,paddingTop:6}}>
