@@ -1633,18 +1633,23 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     empEntries.forEach(e=>{ if(!e.startTime||!e.endTime||["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) return; const [sh,sm]=e.startTime.split(":").map(Number); const [eh,em]=e.endTime.split(":").map(Number); let m=(eh*60+em)-(sh*60+sm); if(m<=0) m+=24*60; const r=parseFloat(e.hourlyOverride)||(parseFloat(cfg?.hourly)||0); if(r>0) { const k=r.toFixed(2); if(!hoursByRate[k]) hoursByRate[k]=0; hoursByRate[k]+=m; } });
     Object.entries(hoursByRate).forEach(([rate,mins])=>rows.push(makeRow(emp.name,invNum,invDate,dueDate,"Hours worked",((mins/60).toFixed(2)),rate,acct,"Tax Exempt")));
     // Working days
-    // Working days — per entry, count numDays if present, ELSE the dayType flag (never both).
-    // A record carrying both numDays and dayType="working-day" is one day, not two (see line ~496).
-    const totalWorkDays = empEntries.reduce((a,e)=>{ const n=parseFloat(e.numDays)||0; return a+(n>0?n:(e.dayType==="working-day"?1:0)); },0);
+    // Working days — count both admin numDays and employee dayType="working-day" entries
+    const totalWorkDayAdmin = empEntries.reduce((a,e)=>a+(parseFloat(e.numDays)||0),0);
+    const totalWorkDayEmp = empEntries.filter(e=>e.dayType==="working-day").length;
+    const totalWorkDays = totalWorkDayAdmin + totalWorkDayEmp;
     if(totalWorkDays>0) { const rate=Math.max(...[...empEntries.map(e=>parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0)),parseFloat(cfg?.workDay)||0]); if(rate>0) rows.push(makeRow(emp.name,invNum,invDate,dueDate,"Working days",totalWorkDays.toFixed(1),rate.toFixed(2),acct,"Tax Exempt")); }
-    // Non-working days — count numNwDays if present, ELSE the dayType flag (never both).
-    const totalNwDays = empEntries.reduce((a,e)=>{ const n=parseFloat(e.numNwDays)||0; return a+(n>0?n:(e.dayType==="non-working"?1:0)); },0);
+    // Non-working days
+    const totalNwAdmin = empEntries.reduce((a,e)=>a+(parseFloat(e.numNwDays)||0),0);
+    const totalNwEmp = empEntries.filter(e=>e.dayType==="non-working").length;
+    const totalNwDays = totalNwAdmin+totalNwEmp;
     if(totalNwDays>0) { const rate=Math.max(...[...empEntries.map(e=>parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0)),parseFloat(cfg?.nonWorkDay)||0]); if(rate>0) rows.push(makeRow(emp.name,invNum,invDate,dueDate,"Non-working days",totalNwDays.toFixed(1),rate.toFixed(2),acct,"Tax Exempt")); }
     // Traveling days — same account as non-working; per-employee travelDay rate, falls back to nonWorkDay
-    const totalTravelDays = empEntries.reduce((a,e)=>{ const n=parseFloat(e.numTravelDays)||0; return a+(n>0?n:(e.dayType==="travel-day"?1:0)); },0);
+    const totalTravelAdmin = empEntries.reduce((a,e)=>a+(parseFloat(e.numTravelDays)||0),0);
+    const totalTravelEmp = empEntries.filter(e=>e.dayType==="travel-day").length;
+    const totalTravelDays = totalTravelAdmin+totalTravelEmp;
     if(totalTravelDays>0) { const rate=Math.max(...[...empEntries.map(e=>parseFloat(e.travelDayRateOverride)||(parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0)),parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0]); if(rate>0) rows.push(makeRow(emp.name,invNum,invDate,dueDate,"Traveling days",totalTravelDays.toFixed(1),rate.toFixed(2),acct,"Tax Exempt")); }
     // Per diem
-    const totalPD = empEntries.reduce((a,e)=>{ const n=parseFloat(e.numPerDiem)||0; return a+(n>0?n:(e.dayType==="per-diem"?1:0)); },0);
+    const totalPD = empEntries.reduce((a,e)=>a+(parseFloat(e.numPerDiem)||0)+(e.dayType==="per-diem"?1:0),0);
     if(totalPD>0) { const rate=Math.max(...[...empEntries.map(e=>parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0)),parseFloat(cfg?.perDiem)||0]); if(rate>0) rows.push(makeRow(emp.name,invNum,invDate,dueDate,"Per diem",totalPD.toFixed(1),rate.toFixed(2),acctPerDiem,"Tax Exempt")); }
     // Trips
     const totalTrips = empEntries.reduce((a,e)=>a+(parseFloat(e.numTrips)||0),0);

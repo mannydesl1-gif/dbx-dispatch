@@ -1475,6 +1475,23 @@ exports.dailyPickupReminder = onSchedule({
 // Thu May  7 10:51:56 PM UTC 2026
 
 // ─── TIMESHEET RECAP EMAIL WITH PDF ATTACHMENT ───────────────────────────────
+// Within a single date, order entries: hours, then working/non-working/traveling
+// day, then per diem, then trips, then misc, then expense. Only existing rows show.
+function recapEntryRank(e){
+  const has=(n)=>(parseFloat(e[n])||0)>0;
+  const hasHours=!!(e.startTime&&e.endTime)&&!["non-working","travel-day","per-diem","working-day"].includes(e.dayType);
+  if(hasHours) return 0;
+  if(e.dayType==="working-day"||has("numDays")) return 1;
+  if(e.dayType==="non-working"||has("numNwDays")) return 2;
+  if(e.dayType==="travel-day"||has("numTravelDays")) return 3;
+  if(e.dayType==="per-diem"||has("numPerDiem")) return 4;
+  if(has("numTrips")) return 5;
+  if(has("miscAmt")) return 6;
+  if(has("expenseAmt")) return 7;
+  return 8;
+}
+const recapByDateThenType=(a,b)=>(a.date||"").localeCompare(b.date||"")||(recapEntryRank(a)-recapEntryRank(b));
+
 async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, cfg, event, message) {
   const pdfDoc = await PDFDocument.create();
   const fonts = {
@@ -1572,6 +1589,8 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
     if (pd > 0) { lines.push(`Per diem`);}
     const tr = parseFloat(e.numTrips)||0;
     if (tr > 0) { lines.push(`${tr} trip${tr>1?"s":""}`);}
+    const misc = parseFloat(e.miscAmt)||0;
+    if (misc > 0) { lines.push(`${(e.miscDesc||"Misc")}: CAD ${misc.toFixed(2)}`);}
     if ((parseFloat(e.expenseAmt)||0)>0 && e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; const _ec=e.expenseCurrency||"CAD"; const _cad=_ec==="USD"&&typeof e.expenseAmtCad==="number"?` -> CAD ${e.expenseAmtCad.toFixed(2)}`:""; lines.push(`Expense: ${e.expenseDesc} ${_ec} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}${_cad}${taxLbl}`); }
     if (e.notes) lines.push(e.notes.substring(0,40));
     return lines.length ? lines : ["—"];
@@ -1585,6 +1604,7 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
     amt += ((parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0)) * (parseFloat(e.travelDayRateOverride)||parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0);
     amt += ((parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0)) * (parseFloat(e.perDiemRateOverride)||parseFloat(cfg?.perDiem)||0);
     amt += (parseFloat(e.numTrips)||0) * (parseFloat(e.tripRateOverride)||parseFloat(cfg?.tripRate)||0);
+    amt += parseFloat(e.miscAmt)||0;
     const m2 = calcMins(e.startTime, e.endTime);
     if (m2 > 0 && !["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) amt += (m2/60)*(parseFloat(e.hourlyOverride)||parseFloat(cfg?.hourly)||0);
     const expRaw = parseFloat(e.expenseAmt)||0;
@@ -1611,7 +1631,7 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
   };
   drawTableHeader();
 
-  const sorted = [...(entries||[])].sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+  const sorted = [...(entries||[])].sort(recapByDateThenType);
   let totalMins = 0, rowIdx = 0;
   for (const e of sorted) {
     const details = getEntryDetails(e);
@@ -1719,6 +1739,11 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
     const amt=trips*parseFloat(rate); addRow(`${trips} trip${trips>1?"s":""} x $${rate}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
   });
 
+  // Miscellaneous — group by name, one line each
+  const miscByName = {};
+  sorted.forEach(e => { const m=parseFloat(e.miscAmt)||0; if(m>0){ const t=(e.miscDesc||"Miscellaneous"); miscByName[t]=(miscByName[t]||0)+m; } });
+  Object.entries(miscByName).forEach(([name,amt]) => { addRow(name, `CAD ${amt.toFixed(2)}`); grandTotal+=amt; });
+
   // Inline expenses from entries — list each once, and record amount+date keys
   // so a matching approved submitted expense (the same physical expense) isn't
   // counted twice.
@@ -1764,7 +1789,7 @@ exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"]
     const fmtDate = (d) => new Date(d+"T12:00:00").toLocaleDateString("en-CA",{weekday:"short",month:"short",day:"numeric",year:"numeric"});
     const calcMins = (s,e) => { if(!s||!e) return 0; const [sh,sm]=s.split(":").map(Number); const [eh,em]=e.split(":").map(Number); let m=(eh*60+em)-(sh*60+sm); if(m<=0) m+=24*60; return m; };
     const fmtH = (m) => { const h=Math.floor(m/60),mn=m%60; return `${h}h${mn>0?` ${mn}m`:""}`; };
-    const sorted = [...(entries||[])].sort((a,b)=>(a.date||"").localeCompare(b.date||""));
+    const sorted = [...(entries||[])].sort(recapByDateThenType);
     const totalMins = sorted.reduce((a,e)=>a+calcMins(e.startTime,e.endTime),0);
     const esc = (s) => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
     const msgHtml = (message||"").trim() ? `<div style="margin:16px 0;padding:14px 16px;background:#fff8f0;border-left:4px solid #b45309;border-radius:4px"><p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.05em">Message from Management</p><p style="margin:0;font-size:13px;color:#1a1a1a;white-space:pre-wrap">${esc(message)}</p></div>` : "";
@@ -1777,6 +1802,7 @@ exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"]
       const tv=(parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0); if(tv>0){ parts.push(`Traveling day`);}
       const pd=(parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0); if(pd>0){ parts.push(`Per diem`);}
       const tr=parseFloat(e.numTrips)||0; if(tr>0){ parts.push(`${tr} trip${tr>1?"s":""}`);}
+      const misc=parseFloat(e.miscAmt)||0; if(misc>0){ parts.push(`${esc(e.miscDesc||"Misc")}: CAD ${misc.toFixed(2)}`);}
       if((parseFloat(e.expenseAmt)||0)>0&&e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; const _ec=e.expenseCurrency||"CAD"; const _cad=_ec==="USD"&&typeof e.expenseAmtCad==="number"?` → CAD ${e.expenseAmtCad.toFixed(2)}`:""; parts.push(`Expense: ${esc(e.expenseDesc)} ${_ec} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}${_cad}${taxLbl}`); }
       if(e.notes) parts.push(`<em style="color:#888">${esc(e.notes)}</em>`);
       // Per-entry amount (CAD) shown beside the details for quick reference.
@@ -1787,6 +1813,7 @@ exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"]
       amt += ((parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0)) * (parseFloat(e.travelDayRateOverride)||parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0);
       amt += ((parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0)) * (parseFloat(e.perDiemRateOverride)||parseFloat(cfg?.perDiem)||0);
       amt += (parseFloat(e.numTrips)||0) * (parseFloat(e.tripRateOverride)||parseFloat(cfg?.tripRate)||0);
+      amt += parseFloat(e.miscAmt)||0;
       const m2=calcMins(e.startTime,e.endTime); if(m2>0&&!["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) amt += (m2/60)*(parseFloat(e.hourlyOverride)||parseFloat(cfg?.hourly)||0);
       const expRaw=parseFloat(e.expenseAmt)||0; if(expRaw>0) amt += (e.expenseCurrency||"CAD")==="USD"&&typeof e.expenseAmtCad==="number"?e.expenseAmtCad:expRaw;
       const amtCell = amt>0 ? `<td style="padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;text-align:right;font-weight:700;color:#16a34a;white-space:nowrap;vertical-align:top">CAD ${amt.toFixed(2)}</td>` : `<td style="padding:8px 10px;border-bottom:1px solid #eee"></td>`;
@@ -1812,6 +1839,9 @@ exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"]
     // Trips by rate
     const trByR={}; sorted.forEach(e=>{const t=parseFloat(e.numTrips)||0; if(t>0){const r=parseFloat(e.tripRateOverride)||(parseFloat(cfg?.tripRate)||0); if(r>0){const k=r.toFixed(2);trByR[k]=(trByR[k]||0)+t;}}});
     Object.entries(trByR).forEach(([rate,t])=>{const a=t*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${t} trip${t>1?"s":""} × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
+    // Misc by name
+    const miscByN={}; sorted.forEach(e=>{const m=parseFloat(e.miscAmt)||0; if(m>0){const t=e.miscDesc||"Miscellaneous"; miscByN[t]=(miscByN[t]||0)+m;}});
+    Object.entries(miscByN).forEach(([name,a])=>{ payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${esc(name)}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
     // Expenses live ON the entries (approving moves a submitted expense onto the
     // entry). Count only entry expenses; do NOT add the `expenses` submission
     // queue to the total (that was the double-count). Show the note.
