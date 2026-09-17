@@ -3887,9 +3887,9 @@ function DispatchNotesCard({o, savOrd}) {
     setVal(v => (v && v.trim() ? v.replace(/\s+$/,"")+"\n" : "") + `${d}: `);
   };
   return <div style={sCrd}>
-    <div style={{display:"flex",alignItems:"center",marginBottom:has||editing?6:0}}>
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:has||editing?6:0}}>
       <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase"}}>Dispatch Notes <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>· internal, not on PDF</span></div>
-      {!editing && <button onClick={startEdit} style={{marginLeft:"auto",fontSize:10,padding:"2px 10px",borderRadius:4,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,cursor:"pointer",fontFamily:"inherit"}}>{has?"Edit":"+ Add note"}</button>}
+      {!editing && <button onClick={startEdit} style={{fontSize:10,padding:"2px 10px",borderRadius:4,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,cursor:"pointer",fontFamily:"inherit"}}>{has?"Edit":"+ Add note"}</button>}
     </div>
     {!editing
       ? (has
