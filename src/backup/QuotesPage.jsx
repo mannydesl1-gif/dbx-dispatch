@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
-import { db } from "./firebase.js";
+import { useState, useEffect, useRef } from "react";
+import { db, storage } from "./firebase.js";
+import { ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, orderBy, query } from "firebase/firestore";
 
 // ── Theme (matches App.jsx dark theme) ──
@@ -22,7 +23,7 @@ const DIVISIONS = [
   { id:"us", name:"Diamond Back Express LLC", short:"DBX USA", addr:"Suite 400-K-175\n1110 Brickell Ave\nMiami, FL 33131\nUSA", phone:"" },
 ];
 
-const DISCLAIMER = "Please note that the fuel listed above will be charged based on actual fuel prices on date of completion. Prices reflect rental quotes (where applicable) at time of quote and may vary. Prices quoted on date given, subject to change - please allow for up to a 10% variance if applicable.";
+const DISCLAIMER = "Please note that the fuel listed above will be charged based on actual fuel prices on date of completion. Prices reflect rental quotes (where applicable) at time of quote and may vary. Prices quoted on date given, subject to change - please allow for up to a 10% variance if applicable.\n\nExclude: Demurrage, detention, custom inspection, excessive waiting time";
 
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const fd = d => d ? new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—";
@@ -31,12 +32,13 @@ const uid = () => Math.random().toString(36).slice(2,8).toUpperCase();
 const emptyLine = () => ({ id:uid(), qty:"1", desc:"", unitPrice:"", equipment:"", currency:"" });
 const emptyFreight = () => ({ id:uid(), pieces:"", desc:"", weight:"", weightUnit:"kg", length:"", width:"", height:"", dimUnit:"cm", commodity:"", unNumber:"", hazClass:"" });
 
-export default function QuotesPage({ clients: clientsProp }) {
+export default function QuotesPage({ clients: clientsProp, onConvertToOrder }) {
   const [quotes, setQuotes] = useState([]);
   const [clients, setClients] = useState(clientsProp||[]);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("list"); // "list" | "form" | "preview"
   const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [convertModal, setConvertModal] = useState(null); // quote being converted (order-type chooser)
   const toggleGroup = (s) => setCollapsedGroups(p=>({...p,[s]:!p[s]}));
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState(null);
@@ -159,16 +161,19 @@ export default function QuotesPage({ clients: clientsProp }) {
     taxRate: "",
     other: "",
     otherLabel: "Other",
-    notes: DISCLAIMER,
+    notes: "",
+    terms: DISCLAIMER,
     scopeOfWork: "",
     internalNotes: "",
+    attachments: [],
     status: "draft",
     createdAt: new Date().toISOString(),
   });
 
   const startNew = () => { setForm(newForm()); setEditId(null); setView("form"); };
 
-  const startEdit = (q) => { setForm({...q, lines: q.lines||[emptyLine()]}); setEditId(q.id); setView("form"); };
+  // attachments defaults to [] so quotes saved before this field existed still work
+  const startEdit = (q) => { setForm({...q, lines: q.lines||[emptyLine()], attachments: q.attachments||[]}); setEditId(q.id); setView("form"); };
 
   const setF = (k, v) => setForm(p => ({...p, [k]:v}));
 
@@ -205,6 +210,69 @@ export default function QuotesPage({ clients: clientsProp }) {
     const quoteCur = f.currency||(f.divId==="us"?"USD":"CAD");
     const curs = new Set((f.lines||[]).filter(l=>l.desc||l.unitPrice).map(l=>l.currency||quoteCur));
     return curs.size > 1;
+  };
+
+  // ─── Quote attachments (internal only — never appear on the client PDF) ───
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+
+  const humanSize = b => b < 1024 ? `${b} B`
+    : b < 1048576 ? `${(b/1024).toFixed(0)} KB`
+    : `${(b/1048576).toFixed(1)} MB`;
+
+  // Icon by extension — .eml/.msg can't preview in-browser, so flag them clearly.
+  const fileIcon = name => {
+    const e = (name.split(".").pop() || "").toLowerCase();
+    if (["eml","msg"].includes(e)) return "email";
+    if (e === "pdf") return "pdf";
+    if (["png","jpg","jpeg","gif","webp","heic"].includes(e)) return "image";
+    if (["doc","docx"].includes(e)) return "word";
+    if (["xls","xlsx","csv"].includes(e)) return "excel";
+    return "file";
+  };
+  const ICON_CHAR = { email:"\u2709", pdf:"\u{1F4C4}", image:"\u{1F5BC}", word:"\u{1F4DD}", excel:"\u{1F4CA}", file:"\u{1F4CE}" };
+
+  const addAttachments = async (files) => {
+    const list = Array.from(files || []);
+    if (!list.length) return;
+    const MAX = 25 * 1024 * 1024; // 25 MB per file
+    const tooBig = list.filter(f => f.size > MAX);
+    if (tooBig.length) {
+      alert(`These files exceed the 25 MB limit:\n${tooBig.map(f=>f.name).join("\n")}`);
+    }
+    const ok = list.filter(f => f.size <= MAX);
+    if (!ok.length) return;
+    setUploading(true);
+    try {
+      const uploaded = [];
+      for (const file of ok) {
+        // Quote-scoped folder so files stay grouped per quote.
+        const folder = `quotes/${editId || form.quoteNum || "unsaved"}`;
+        const path = `${folder}/${Date.now()}_${file.name}`;
+        const sRef = storageRef(storage, path);
+        await uploadBytes(sRef, file);
+        const url = await getDownloadURL(sRef);
+        uploaded.push({
+          name: file.name, type: file.type || "", size: file.size,
+          url, path, uploadedAt: new Date().toISOString(),
+        });
+      }
+      setF("attachments", [...(form.attachments || []), ...uploaded]);
+    } catch (e) {
+      console.error(e);
+      alert("Upload failed. Check your connection and try again.");
+    }
+    setUploading(false);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const removeAttachment = async (idx) => {
+    const f = (form.attachments || [])[idx];
+    if (!f) return;
+    if (!window.confirm(`Remove "${f.name}" from this quote?`)) return;
+    // Delete from Storage too, so removed files don't linger and bill.
+    try { await deleteObject(storageRef(storage, f.path)); } catch (e) { console.error(e); }
+    setF("attachments", (form.attachments || []).filter((_, i) => i !== idx));
   };
 
   const save = async (status) => {
@@ -340,6 +408,9 @@ export default function QuotesPage({ clients: clientsProp }) {
       .notes-section{margin-bottom:10px;padding:8px 12px;background:#f8fafc;border-left:4px solid #dc2626;border-radius:0 4px 4px 0}
       .notes-section .notes-label{font-size:8px;font-weight:700;color:#dc2626;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
       .notes-section .notes-text{font-size:10px;color:#333;line-height:1.4;white-space:pre-wrap}
+      .terms-section{margin-top:auto;padding-top:8px;border-top:1px solid #e2e8f0}
+      .terms-section .terms-label{font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px}
+      .terms-section .terms-text{font-size:7.5px;color:#94a3b8;line-height:1.35;white-space:pre-wrap}
       .equipment-badges{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:3px}
       .eq-badge{background:#1e293b;color:#fff;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600}
       @media print{
@@ -363,7 +434,7 @@ export default function QuotesPage({ clients: clientsProp }) {
         /* Repeat line-item column headers if the table spans pages. */
         thead{display:table-header-group}
         tbody tr{page-break-inside:avoid}
-        .notes-section,.totals{page-break-inside:avoid}
+        .notes-section,.totals,.terms-section{page-break-inside:avoid}
         /* tfoot left as a normal row group so it does NOT repeat per page. */
         .page-wrap tfoot{display:table-row-group}
         /* NOTE: position:fixed was tried here and is WRONG — a fixed element
@@ -536,6 +607,8 @@ export default function QuotesPage({ clients: clientsProp }) {
 
 
     <div class="flex-spacer"></div>
+
+    ${(()=>{const t=f.terms!==undefined?f.terms:DISCLAIMER;return t&&t.trim()?`<div class="terms-section"><div class="terms-label">Terms &amp; Conditions</div><div class="terms-text">${t.replace(/</g,"&lt;")}</div></div>`:"";})()}
     </div>
 
     </td></tr></tbody>
@@ -706,6 +779,10 @@ export default function QuotesPage({ clients: clientsProp }) {
                         <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:2}}>
                           <span style={{fontSize:13,fontWeight:700,color:T.text}}>{q.quoteNum}</span>
                           {q.divId&&<span style={{fontSize:10,color:T.muted,background:T.hover,padding:"1px 6px",borderRadius:4}}>{DIVISIONS.find(d=>d.id===q.divId)?.short}</span>}
+                          {(q.attachments||[]).length>0&&
+                            <span title={`${q.attachments.length} attachment${q.attachments.length!==1?"s":""}`}
+                              style={{fontSize:10,color:"#2563eb",background:"rgba(37,99,235,0.1)",border:"1px solid #2563eb",
+                                      padding:"1px 6px",borderRadius:4,fontWeight:600}}>&#128206; {q.attachments.length}</span>}
                         </div>
                         <div style={{fontSize:12,fontWeight:600,color:T.text}}>{q.cliName||"—"}</div>
                         <div style={{fontSize:11,color:T.muted,marginTop:1}}>
@@ -723,6 +800,9 @@ export default function QuotesPage({ clients: clientsProp }) {
                           <option value="declined">Declined</option>
                         </select>
                         <button onClick={()=>startEdit(q)} style={{...sBtn,fontSize:10,padding:"4px 10px"}}>Edit</button>
+                        {q.status==="accepted" && onConvertToOrder && (
+                          <button onClick={()=>setConvertModal(q)} style={{...sBtn,fontSize:10,padding:"4px 10px",background:"rgba(34,197,94,0.12)",color:"#16a34a",border:"1px solid #16a34a",fontWeight:700}}>→ Order</button>
+                        )}
                         <button onClick={()=>generatePDF(q)} style={{...sBtn,fontSize:10,padding:"4px 10px",background:"rgba(220,38,38,0.1)",color:T.red,border:`1px solid ${T.red}`}}>PDF</button>
                         <button onClick={()=>deleteQuote(q.id)} style={{...sBtn,fontSize:10,padding:"4px 8px",color:"#ef4444",border:"1px solid #ef4444"}}>✕</button>
                       </div>
@@ -732,6 +812,29 @@ export default function QuotesPage({ clients: clientsProp }) {
               </div>
             );
           })}
+        </div>
+      )}
+      {convertModal && (
+        <div onClick={()=>setConvertModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:T.card||T.surface||"#0f172a",border:`1px solid ${T.border}`,borderRadius:14,padding:24,maxWidth:440,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+            <div style={{fontSize:16,fontWeight:700,color:T.text||"#f1f5f9",marginBottom:6}}>Convert Quote {convertModal.quoteNum}</div>
+            <div style={{fontSize:13,color:T.muted,marginBottom:20}}>What type of order should this become? The quote's pricing carries into whichever you choose.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>{const q=convertModal;setConvertModal(null);onConvertToOrder(q,"event");}}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"14px 16px",borderRadius:10,border:`1.5px solid ${T.border}`,background:"rgba(14,165,233,0.08)",cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+                <span style={{fontSize:22}}>📋</span>
+                <div><div style={{fontSize:14,fontWeight:700,color:T.text||"#f1f5f9"}}>Project / Event Order</div>
+                <div style={{fontSize:11,color:T.muted}}>Line-item pricing — each quote line stays its own priced line</div></div>
+              </button>
+              <button onClick={()=>{const q=convertModal;setConvertModal(null);onConvertToOrder(q,"transport");}}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"14px 16px",borderRadius:10,border:`1.5px solid ${T.border}`,background:"rgba(34,197,94,0.08)",cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+                <span style={{fontSize:22}}>🚚</span>
+                <div><div style={{fontSize:14,fontWeight:700,color:T.text||"#f1f5f9"}}>Transport Order</div>
+                <div style={{fontSize:11,color:T.muted}}>Pickup / delivery — quote lines become accessorial charges</div></div>
+              </button>
+            </div>
+            <button onClick={()=>setConvertModal(null)} style={{marginTop:16,width:"100%",padding:"9px",borderRadius:8,border:`1px solid ${T.border}`,background:"none",color:T.muted,fontFamily:"inherit",fontSize:13,cursor:"pointer"}}>Cancel</button>
+          </div>
         </div>
       )}
     </div>
@@ -930,8 +1033,10 @@ export default function QuotesPage({ clients: clientsProp }) {
       <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:16,marginBottom:16}}>
         {/* Notes */}
         <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:8,padding:14}}>
-          <label style={sLbl}>Notes / Disclaimer</label>
-          <textarea style={{...sIn,minHeight:100,resize:"vertical"}} value={form.notes} onChange={e=>setF("notes",e.target.value)}/>
+          <label style={sLbl}>Notes <span style={{fontWeight:400,color:T.muted,fontSize:10}}>(your notes for this quote)</span></label>
+          <textarea style={{...sIn,minHeight:100,resize:"vertical"}} value={form.notes} onChange={e=>setF("notes",e.target.value)} placeholder="Notes specific to this quote..."/>
+          <label style={{...sLbl,marginTop:12}}>Terms &amp; Conditions <span style={{fontWeight:400,color:T.muted,fontSize:10}}>(shown at bottom of PDF)</span></label>
+          <textarea style={{...sIn,minHeight:90,resize:"vertical",fontSize:11}} value={form.terms||""} onChange={e=>setF("terms",e.target.value)} placeholder="Standard terms & conditions..."/>
         </div>
 
         {/* Summary */}
@@ -1044,6 +1149,60 @@ export default function QuotesPage({ clients: clientsProp }) {
           value={form.internalNotes||""}
           onChange={e=>setF("internalNotes",e.target.value)}
         />
+      </div>
+
+      {/* Attachments — internal only, never rendered on the client PDF */}
+      <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:8,padding:14,marginBottom:16}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4,flexWrap:"wrap"}}>
+          <span style={{fontSize:11,fontWeight:700,color:"#1e40af",textTransform:"uppercase",letterSpacing:"0.05em"}}>&#128206; Attachments</span>
+          <span style={{fontSize:10,color:"#1d4ed8",background:"#dbeafe",padding:"2px 8px",borderRadius:10,fontWeight:600}}>NOT shown on client PDF</span>
+          {(form.attachments||[]).length>0 &&
+            <span style={{fontSize:10,color:"#1d4ed8",fontWeight:600}}>{(form.attachments||[]).length} file{(form.attachments||[]).length!==1?"s":""}</span>}
+        </div>
+        <div style={{fontSize:11,color:"#3b82f6",marginBottom:10}}>
+          Emails, approvals, rate confirmations, photos &mdash; anything relevant to this quote. Max 25&nbsp;MB per file.
+        </div>
+
+        <input ref={fileInputRef} type="file" multiple style={{display:"none"}}
+          onChange={e=>addAttachments(e.target.files)} />
+
+        <div
+          onDragOver={e=>{e.preventDefault();}}
+          onDrop={e=>{e.preventDefault(); addAttachments(e.dataTransfer.files);}}
+          onClick={()=>fileInputRef.current&&fileInputRef.current.click()}
+          style={{border:"2px dashed #93c5fd",borderRadius:8,padding:"14px 12px",textAlign:"center",
+                  cursor:uploading?"wait":"pointer",background:"#f8fbff",marginBottom:(form.attachments||[]).length?10:0}}>
+          <div style={{fontSize:12,color:"#1d4ed8",fontWeight:600}}>
+            {uploading ? "Uploading..." : "Click to choose files, or drag & drop here"}
+          </div>
+          <div style={{fontSize:10,color:"#60a5fa",marginTop:3}}>PDF, images, Word, Excel, .eml / .msg emails</div>
+        </div>
+
+        {(form.attachments||[]).map((f,i)=>{
+          const kind = fileIcon(f.name);
+          const isEmail = kind==="email";
+          return (
+            <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 10px",background:"#fff",
+                                 border:"1px solid #dbeafe",borderRadius:6,marginBottom:6}}>
+              <span style={{fontSize:16}}>{ICON_CHAR[kind]}</span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12,fontWeight:600,color:"#1e293b",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div>
+                <div style={{fontSize:10,color:"#64748b"}}>
+                  {f.size?humanSize(f.size):""}{f.uploadedAt?` \u00b7 ${new Date(f.uploadedAt).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})}`:""}
+                  {isEmail?" \u00b7 downloads to open in your mail app":""}
+                </div>
+              </div>
+              <a href={f.url} target="_blank" rel="noopener noreferrer"
+                 style={{fontSize:11,fontWeight:600,color:"#2563eb",textDecoration:"none",padding:"4px 10px",
+                         border:"1px solid #bfdbfe",borderRadius:5,whiteSpace:"nowrap"}}>
+                {isEmail?"Download":"Open"}
+              </a>
+              <button onClick={()=>removeAttachment(i)}
+                 style={{fontSize:11,fontWeight:600,color:"#dc2626",background:"none",border:"1px solid #fecaca",
+                         borderRadius:5,padding:"4px 8px",cursor:"pointer",fontFamily:"inherit"}}>Remove</button>
+            </div>
+          );
+        })}
       </div>
 
       {/* Save buttons */}

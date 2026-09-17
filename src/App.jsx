@@ -9,9 +9,10 @@ const CompanyDocsPage = lazy(() => import("./CompanyDocsPage.jsx"));
 const MobileApp = lazy(() => import("./MobileApp.jsx"));
 const EventsPage = lazy(() => import("./EventsPage.jsx"));
 const QuotesPage = lazy(() => import("./QuotesPage.jsx"));
+const LettersPage = lazy(() => import("./LettersPage.jsx"));
 const IFTAPage = lazy(() => import("./IFTAPage.jsx"));
 const AdminPage = lazy(() => import("./AdminPage.jsx"));
-import { APP_NAME, APP_VERSION, COMPANY_NAME, DIVISIONS, ACCT_EMAILS as CFG_ACCT_EMAILS, REPORTS_EMAIL, CLOUD_FUNCTIONS, BOL_COMPANY_LABEL } from "./client.config.js";
+import { APP_NAME, APP_VERSION, COMPANY_NAME, DIVISIONS, ACCT_EMAILS as CFG_ACCT_EMAILS, REPORTS_EMAIL, CLOUD_FUNCTIONS, BOL_COMPANY_LABEL, DEFAULT_TERMS } from "./client.config.js";
 
 // ═══ CLOUD FUNCTION URLS (2nd Gen) ═══
 const CF_URLS = CLOUD_FUNCTIONS;
@@ -72,6 +73,64 @@ async function loadAllData() {
   return data;
 }
 
+// Full one-click backup: fetches EVERY collection fresh from Firestore (so the
+// backup is complete and current, not limited to what's loaded in the UI) and
+// downloads a single timestamped JSON file. Restorable later if ever needed.
+async function backupAllData() {
+  const backupCollections = [
+    // Core (App.jsx)
+    "clients","drivers","employees","trucks","trailers","locations",
+    "orders","stickers","events","quotes",
+    // Timesheets tab
+    "timesheets","expenses","driver_shared_docs",
+    // Letters + Company Docs tabs
+    "letters","company_docs",
+    // Safety tab
+    "safetyFlags","safetyReports",
+    // IFTA tab
+    "iftaFuelCards","iftaRates","iftaReports","iftaUploads",
+    // Equipment maintenance/repairs
+    "maintenance",
+  ];
+  const backup = {
+    _meta: {
+      app: "DBX Dispatch",
+      backupVersion: 1,
+      createdAt: new Date().toISOString(),
+    },
+  };
+  let totalRecords = 0;
+  for (const col of backupCollections) {
+    try {
+      const snap = await getDocs(collection(db, col));
+      backup[col] = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      totalRecords += backup[col].length;
+    } catch (e) {
+      console.warn(`Backup: failed to read ${col}:`, e.code || e.message);
+      backup[col] = [];
+    }
+  }
+  // Include counters/settings config docs (not regular collections)
+  try { const c = await getDoc(doc(db, "config", "counters")); backup._config_counters = c.exists() ? c.data() : null; } catch { backup._config_counters = null; }
+  // The settings collection holds app config (cert config, report columns, etc.)
+  try { const s = await getDocs(collection(db, "settings")); backup.settings = s.docs.map(d => ({ id: d.id, ...d.data() })); totalRecords += backup.settings.length; } catch { backup.settings = []; }
+  backup._meta.totalRecords = totalRecords;
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `DBX_Backup_${stamp}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  // Record the backup date so the app can remind you when it's been a while.
+  try { await setDoc(doc(db, "config", "backupMeta"), { lastBackup: new Date().toISOString(), totalRecords }, { merge: true }); } catch(e){ console.warn("Could not record backup date:", e); }
+  return { totalRecords, collections: backupCollections.length };
+}
+
 async function fbSave(col, item) {
   const { id, ...rest } = item;
   if (id && id.length > 5) {
@@ -110,6 +169,61 @@ async function uploadFile(file, folder) {
   return { name: file.name, type: file.type, url, path };
 }
 
+// ═══ FX: live rate fetch + snapshot builder (module-level so invoice-time can
+// recompute today's rate, matching the in-editor pricing logic exactly) ═══
+async function fetchFxRatesLive() {
+  // Returns { rates: {CUR: rateVsUSD, USD:1}, fxDate: "YYYY-MM-DD HH:MM" } or null on failure.
+  try {
+    const res = await fetch(`https://v6.exchangerate-api.com/v6/f33d099aa4e8c96e5a16d497/latest/USD`);
+    const data = await res.json();
+    if (!data || !data.conversion_rates) return null;
+    return {
+      rates: { ...data.conversion_rates, USD: 1 },
+      fxDate: data.time_last_update_utc ? data.time_last_update_utc.slice(0, 16) : new Date().toISOString().slice(0, 10),
+    };
+  } catch (e) { console.error("FX live fetch failed", e); return null; }
+}
+
+function fxConvertToTargetM(byCur, targetCur, rates) {
+  // Same math as the in-editor fxConvertToTarget. Returns null if a needed rate is missing.
+  let total = 0;
+  for (const [cur, amt] of Object.entries(byCur)) {
+    const rFrom = cur === "USD" ? 1 : rates[cur];
+    const rTo = targetCur === "USD" ? 1 : rates[targetCur];
+    if (!rFrom || !rTo) return null;
+    total += (amt / rFrom) * rTo;
+  }
+  return total;
+}
+
+function buildFxSnapshotFromOrder(order, rates, fxDate) {
+  // Rebuild the fxSnapshot from an order's event lines using freshly-fetched
+  // rates — mirrors the in-editor snapshot build so the invoice matches the BOL.
+  const p = order.price || {};
+  const evtLines = (p.eventLines || []).filter(l => l.desc || parseFloat(l.unitPrice) > 0 || parseFloat(l.qty) > 1);
+  const byCur = {};
+  evtLines.forEach(l => {
+    const cur = l.currency || p.cur || "CAD";
+    const ltp = l.taxMode === "HST" ? 13 : l.taxMode === "GST" ? 5 : l.taxMode === "CUSTOM" ? (parseFloat(l.taxCustom) || 0) : 0;
+    const lb = (parseFloat(l.qty) || 0) * (parseFloat(l.unitPrice) || 0);
+    const amt = lb + lb * (ltp / 100);
+    if (amt) byCur[cur] = (byCur[cur] || 0) + amt;
+  });
+  const target = p.totalCurrency || p.cur || "CAD";
+  const convertedBase = fxConvertToTargetM(byCur, target, rates);
+  const adjMode = p.adjMode || "pct";
+  const adjVal = parseFloat(p.adjVal) || 0;
+  const adjAmount = (convertedBase != null && adjVal !== 0) ? (adjMode === "pct" ? convertedBase * (adjVal / 100) : adjVal) : 0;
+  const grand = convertedBase != null ? convertedBase + adjAmount : null;
+  return {
+    byCur, target, convertedBase, adjMode, adjVal,
+    adjLabel: p.adjLabel || "Adjustment", adjAmount, grand, fxDate,
+    multi: Object.keys(byCur).length > 1,
+    applies: (Object.keys(byCur).length > 1) || (adjVal !== 0)
+      || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== target),
+  };
+}
+
 // ═══ EMAILJS SENDER ═══
 async function sendEmail(to, subject, htmlBody) {
   const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
@@ -139,7 +253,53 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
     <td style="padding:8px 10px;font-size:12px;border-bottom:1px solid #e2e8f0">${i.w||"—"}</td>
     <td style="padding:8px 10px;font-size:12px;border-bottom:1px solid #e2e8f0">${i.h||"—"}</td>
   </tr>`).join("");
-  const podSection = (o.podBy && includePod) ? `<div style="border:2px solid #22c55e;border-radius:8px;padding:14px;margin-top:20px;margin-bottom:16px"><div style="font-weight:700;font-size:11px;color:#22c55e;text-transform:uppercase;margin-bottom:6px">Proof of Delivery</div><div style="font-size:13px;line-height:1.6">Received by: <strong>${o.podBy}</strong><br>Date: ${fd(o.podDate)}<br>Time: ${o.podTime||"—"}</div></div>` : "";
+  // POD section: single order-level POD (o.podBy) OR per-stop PODs (multi-stop
+  // transport orders store POD on each delivery/pickup stop as stop.pod).
+  let podSection = "";
+  if (includePod) {
+    if (o.podBy) {
+      podSection = `<div style="border:2px solid #22c55e;border-radius:8px;padding:14px;margin-top:20px;margin-bottom:16px"><div style="font-weight:700;font-size:11px;color:#22c55e;text-transform:uppercase;margin-bottom:6px">Proof of Delivery</div><div style="font-size:13px;line-height:1.6">Received by: <strong>${o.podBy}</strong><br>Date: ${fd(o.podDate)}<br>Time: ${o.podTime||"—"}</div></div>`;
+    } else {
+      const podStops = ((o.delStops||[]).concat(o.pickStops||[])).filter(st => st && st.pod && st.pod.by);
+      if (podStops.length) {
+        const rows = podStops.map(st => `<div style="font-size:13px;line-height:1.6;padding:8px 0;border-bottom:1px solid #d1fae5"><strong>${st.co||st.company||st.name||"Stop"}</strong><br>Received by: <strong>${st.pod.by}</strong>${st.pod.date?` &nbsp;·&nbsp; ${fd(st.pod.date)}`:""}${st.pod.time?` ${st.pod.time}`:""}</div>`).join("");
+        podSection = `<div style="border:2px solid #22c55e;border-radius:8px;padding:14px;margin-top:20px;margin-bottom:16px"><div style="font-weight:700;font-size:11px;color:#22c55e;text-transform:uppercase;margin-bottom:6px">Proof of Delivery</div>${rows}</div>`;
+      }
+    }
+  }
+
+  // CBSA-approved customs barcode label (PARS 12cm×3.5cm / PAPS 63mm×28mm) — reuses
+  // the SAME dimensions, layout and barcode data rule as the standalone sticker
+  // generator so it matches what CBSA approved. The <svg> carries data-barcode; the
+  // print window (downloadBolPdf) runs JsBarcode over it after load.
+  const customsLabel = (o.stickerNum && o.customsType) ? (() => {
+    const isPaps = o.customsType === "PAPS";
+    const barcodeData = isPaps ? o.stickerNum.replace(" ", "") : o.stickerNum.replace(/\s/g, "");
+    const pageW = isPaps ? "63mm" : "12cm";
+    const pageH = isPaps ? "28mm" : "3.5cm";
+    const inner = isPaps ? `
+      <div style="width:${pageW};height:${pageH};box-sizing:border-box;position:relative;overflow:hidden;background:#fff;border:1px solid #999">
+        <div style="position:absolute;top:0;right:0;width:17mm;height:11mm;border-left:1.5px solid #000;border-bottom:1.5px solid #000">
+          <div style="font-size:5pt;font-weight:700;text-align:center;padding:0.5mm 0;letter-spacing:0.3px">FILER CODE</div>
+        </div>
+        <div style="padding:2mm 2.5mm 1.5mm 2.5mm;display:flex;flex-direction:column;height:100%">
+          <div style="font-size:6.5pt;font-weight:700;letter-spacing:0.3px;margin-top:5mm">DIAMOND BACK EXPRESS INC</div>
+          <div style="font-size:15pt;font-weight:700;font-family:'Courier New',monospace;letter-spacing:1px;margin-top:0.5mm">${o.stickerNum}</div>
+          <div style="margin-top:0.5mm;flex:1;display:flex;align-items:flex-start"><svg class="bol-customs-bc" data-barcode="${barcodeData}" data-paps="1"></svg></div>
+        </div>
+      </div>` : `
+      <div style="width:${pageW};height:${pageH};box-sizing:border-box;overflow:hidden;background:#fff;display:flex;flex-direction:column;border:1px solid #999">
+        <div style="height:3mm;flex-shrink:0"></div>
+        <div style="padding:0 4mm;flex-shrink:0"><svg class="bol-customs-bc" data-barcode="${barcodeData}" data-paps="0"></svg></div>
+        <div style="height:1mm;flex-shrink:0"></div>
+        <div style="padding:0 4mm;flex-shrink:0"><div style="font-size:14pt;font-weight:700;font-family:'Courier New',monospace;letter-spacing:1.5px">${o.stickerNum}</div></div>
+        <div style="padding:0.5mm 4mm 0;flex-shrink:0"><div style="font-size:8pt;font-weight:700;letter-spacing:0.4px">DIAMOND BACK EXPRESS INC</div></div>
+      </div>`;
+    return `<div class="bol-card" style="margin-bottom:18px;page-break-inside:avoid">
+      <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">${o.customsType} — Customs Barcode</div>
+      ${inner}
+    </div>`;
+  })() : "";
   const p = o.price||{}; const sym = ({CAD:"$",USD:"$",EUR:"€",GBP:"£"})[p.cur||"CAD"]||"$";
 
   // ── Event pricing section ──
@@ -191,33 +351,70 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
     }
     // Additional charges
     if(hasLines){
+      const fxSymPdf = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":c==="SGD"?"S$":c==="AED"?"AED ":"$";
       html+=`<div style="font-size:10px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">Additional Charges</div>
       <table style="width:100%;border-collapse:collapse">
         <thead><tr>
           <th style="${th}">Description</th>
           <th style="${thR}">Qty</th>
           <th style="${thR}">Unit Price</th>
+          <th style="${thR}">Cur</th>
           <th style="${thR}">Tax</th>
           <th style="${thR}">Amount</th>
         </tr></thead>
-        <tbody>${linesCalc.map(l=>`
+        <tbody>${linesCalc.map(l=>{const lc=l.currency||p.cur||"CAD";const ls=fxSymPdf(lc);return `
           <tr>
             <td style="${td}">${l.desc||"Charge"}</td>
             <td style="${tdR}">${l.qty}</td>
-            <td style="${tdR}">${sym}${parseFloat(l.unitPrice).toFixed(2)}</td>
+            <td style="${tdR}">${ls}${parseFloat(l.unitPrice).toFixed(2)}</td>
+            <td style="${tdR};font-size:10px;color:#888">${lc}</td>
             <td style="${tdR};font-size:10px;color:#888">${l.lt.label||"—"}</td>
-            <td style="${tdR};font-weight:600">${sym}${l.ltot.toFixed(2)}</td>
-          </tr>`).join("")}
+            <td style="${tdR};font-weight:600">${ls}${l.ltot.toFixed(2)}</td>
+          </tr>`;}).join("")}
         </tbody>
       </table>`;
     }
-    // Grand total
-    html+=`<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 8px;background:#f8fafc;margin-top:4px;border-top:2px solid #e2e8f0">
-        <span style="font-weight:700;font-size:12px;color:#dc2626;text-transform:uppercase">Total ${p.cur||"CAD"}</span>
-        <span style="font-weight:700;font-size:15px;color:#dc2626">${sym}${grandTotal.toFixed(2)} ${p.cur||"CAD"}</span>
+    // Grand total — multi-currency snapshot when present, else single-currency.
+    const fxSymPdf2 = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":c==="SGD"?"S$":c==="AED"?"AED ":"$";
+    const snap = p.fxSnapshot;
+    if (snap && (snap.applies || snap.multi) && snap.grand != null) {
+      const tSym = fxSymPdf2(snap.target);
+      html += `<div style="margin-top:10px;padding:12px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
+        <div style="font-size:10px;font-weight:700;color:#666;text-transform:uppercase;letter-spacing:0.4px;margin-bottom:6px">Subtotals by Currency</div>
+        ${Object.entries(snap.byCur||{}).map(([c,a])=>`<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px"><span style="color:#555">${c}</span><span style="font-weight:600">${fxSymPdf2(c)}${a.toFixed(2)} ${c}</span></div>`).join("")}
+        <div style="border-top:1px solid #e2e8f0;margin-top:8px;padding-top:8px">
+          ${snap.adjVal ? `<div style="display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:2px"><span>Subtotal (${snap.target})</span><span>${tSym}${snap.convertedBase.toFixed(2)}</span></div>
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:${snap.adjAmount<0?"#b45309":"#555"};margin-bottom:4px"><span>${snap.adjLabel} (${snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>${snap.adjAmount<0?"−":""}${tSym}${Math.abs(snap.adjAmount).toFixed(2)}</span></div>` : ""}
+          <div style="display:flex;justify-content:space-between;align-items:baseline">
+            <span style="font-weight:700;font-size:13px;color:#dc2626;text-transform:uppercase">Grand Total ${snap.target}</span>
+            <span style="font-weight:800;font-size:16px;color:#dc2626">${tSym}${snap.grand.toFixed(2)} ${snap.target}</span>
+          </div>
+        </div>
+        ${snap.fxDate?`<div style="font-size:9px;color:#999;margin-top:6px">Converted using exchange rates as of ${snap.fxDate} UTC.</div>`:""}
       </div>
       ${o.poNumber?`<div style="margin-top:8px;font-size:11px;color:#666">PO #: <strong>${o.poNumber}</strong></div>`:""}
     </div>`;
+    } else {
+      // Build a Subtotal / tax-by-rate / Total summary. Amounts on each line are
+      // tax-inclusive (ltot = base + tax), so we sum the bases for the subtotal
+      // and group each line's tax by its label — works for any mix of tax types
+      // (GST/HST/custom/exempt). Transport (if present) is included the same way.
+      let subTotal = 0; const taxByLabel = {};
+      if(hasTransport){ subTotal += transSub; if(transTaxAmt>0){ const tl=transTax.label||"Tax"; taxByLabel[tl]=(taxByLabel[tl]||0)+transTaxAmt; } }
+      if(hasLines){ linesCalc.forEach(l=>{ subTotal += l.lb; if(l.lta>0){ const tl=l.lt.label||"Tax"; taxByLabel[tl]=(taxByLabel[tl]||0)+l.lta; } }); }
+      const taxRows = Object.entries(taxByLabel).map(([lbl,amt])=>
+        `<tr><td style="padding:2px 8px;font-size:11px;color:#555">${lbl}</td><td style="padding:2px 8px;text-align:right;font-size:11px;color:#555">${sym}${amt.toFixed(2)}</td></tr>`
+      ).join("");
+      html+=`<div style="margin-top:4px;background:#f8fafc;border-top:2px solid #e2e8f0;padding:8px">
+        <table style="width:100%;border-collapse:collapse">
+          <tr><td style="padding:2px 8px;font-size:11px;color:#555">Subtotal</td><td style="padding:2px 8px;text-align:right;font-size:11px;color:#555">${sym}${subTotal.toFixed(2)}</td></tr>
+          ${taxRows}
+          <tr><td style="padding:6px 8px 2px;font-weight:700;font-size:12px;color:#dc2626;text-transform:uppercase;border-top:1px solid #e2e8f0">Total ${p.cur||"CAD"}</td><td style="padding:6px 8px 2px;text-align:right;font-weight:700;font-size:15px;color:#dc2626;border-top:1px solid #e2e8f0">${sym}${grandTotal.toFixed(2)} ${p.cur||"CAD"}</td></tr>
+        </table>
+      </div>
+      ${o.poNumber?`<div style="margin-top:8px;font-size:11px;color:#666">PO #: <strong>${o.poNumber}</strong></div>`:""}
+    </div>`;
+    }
     return html;
   })() : "";
 
@@ -228,16 +425,23 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
   const otherTaxTotal=(p.other||[]).reduce((s,c)=>s+ocCalc2(c).ltax,0);
   const taxPct=p.taxMode==="CUSTOM"?(parseFloat(p.taxCustom)||0):({NONE:0,HST:13,GST:5,GBP:20}[p.taxMode]||0);
   const taxAmt=(baseAmt+fuelAmt)*(taxPct/100); const total=baseAmt+fuelAmt+taxAmt+otherBaseTotal+otherTaxTotal;
-  const pricingSection = (!isEvent && includePricing && p.base && parseFloat(p.base)>0) ? `
+  const _hasOtherPx = (p.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0);
+  // Per-stop surcharges (multi-stop): each stop's price adds on top of the order price.
+  const _stopTot = (pr)=>{pr=pr||{};const b=parseFloat(pr.base)||0;const f=pr.fuelModel==="liter"?(parseFloat(pr.fuelAmt)||0):(b*((parseFloat(pr.fuelPct)||0)/100));const ob=(pr.other||[]).reduce((s,c)=>{const lb=(c.qty!==undefined||c.unitPrice!==undefined)?(parseFloat(c.qty)||0)*(parseFloat(c.unitPrice)||0):(parseFloat(c.amt)||0);const lt=c.taxMode==="HST"?13:c.taxMode==="GST"?5:c.taxMode==="CUSTOM"?(parseFloat(c.taxCustom)||0):0;return s+lb+lb*(lt/100);},0);const tp=pr.taxMode==="CUSTOM"?(parseFloat(pr.taxCustom)||0):pr.taxMode==="HST"?13:pr.taxMode==="GST"?5:0;const tx=(!pr.taxMode||pr.taxMode==="NONE")?0:(b+f)*(tp/100);return b+f+tx+ob;};
+  const _surStops = ((o.delStops||[]).concat(o.pickStops||[])).map((st,i)=>({name:st.co||st.company||st.name||`Stop ${i+1}`,amt:_stopTot(st.price)})).filter(s=>s.amt>0);
+  const _stopSurTotal = _surStops.reduce((s,x)=>s+x.amt,0);
+  const grandWithStops = total + _stopSurTotal;
+  const pricingSection = (!isEvent && includePricing && ((p.base && parseFloat(p.base)>0) || _hasOtherPx || parseFloat(p.fuelPct)>0 || _stopSurTotal>0)) ? `
 <div style="border:2px solid #dc2626;border-radius:8px;padding:14px;margin-bottom:16px">
   <div style="font-weight:700;font-size:11px;color:#dc2626;text-transform:uppercase;margin-bottom:10px">Pricing (${p.cur||"CAD"})</div>
   ${p.transDesc?`<div style="font-size:11px;color:#000;margin-bottom:8px"><strong>Description:</strong> ${p.transDesc}</div>`:""}
   <table style="width:100%;font-size:12px;border-collapse:collapse">
-    <tr><td style="padding:3px 0;color:#666">Base Price</td><td style="text-align:right;font-weight:600">${sym}${baseAmt.toFixed(2)}</td></tr>
+    ${baseAmt>0?`<tr><td style="padding:3px 0;color:#666">Base Price</td><td style="text-align:right;font-weight:600">${sym}${baseAmt.toFixed(2)}</td></tr>`:""}
     ${fuelAmt>0?`<tr><td style="padding:3px 0;color:#666">Fuel Surcharge (${fuelPct}%)</td><td style="text-align:right">${sym}${fuelAmt.toFixed(2)}</td></tr>`:""}
     ${taxAmt>0?`<tr><td style="padding:3px 0;color:#666">Tax on Base (${taxPct}%)</td><td style="text-align:right">${sym}${taxAmt.toFixed(2)}</td></tr>`:""}
     ${(p.other||[]).filter(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0).map(c=>{const cc=ocCalc2(c);const hasQty=(c.qty!==undefined&&c.qty!=="")||(c.unitPrice!==undefined&&c.unitPrice!=="");const lbl=(c.desc||"Charge")+(hasQty?` (${parseFloat(c.qty)||0} × ${sym}${(parseFloat(c.unitPrice)||0).toFixed(2)})`:"");return `<tr><td style="padding:3px 0;color:#666">${lbl}</td><td style="text-align:right">${sym}${cc.lbase.toFixed(2)}</td></tr>${cc.ltax>0?`<tr><td style="padding:1px 0 1px 12px;color:#999;font-size:10px">Tax (${cc.ltp}%)</td><td style="text-align:right;color:#999;font-size:10px">${sym}${cc.ltax.toFixed(2)}</td></tr>`:""}`;}).join("")}
-    <tr style="border-top:1.5px solid #cbd5e1"><td style="padding:6px 0 0;font-weight:700;font-size:14px">Total</td><td style="text-align:right;font-weight:700;font-size:14px">${sym}${total.toFixed(2)} ${p.cur||"CAD"}</td></tr>
+    ${_surStops.map(s=>`<tr><td style="padding:3px 0;color:#666">Surcharge — ${s.name}</td><td style="text-align:right">${sym}${s.amt.toFixed(2)}</td></tr>`).join("")}
+    <tr style="border-top:1.5px solid #cbd5e1"><td style="padding:6px 0 0;font-weight:700;font-size:14px">Total</td><td style="text-align:right;font-weight:700;font-size:14px">${sym}${grandWithStops.toFixed(2)} ${p.cur||"CAD"}</td></tr>
   </table>
   ${o.poNumber?`<div style="margin-top:8px;font-size:11px;color:#666">PO #: <strong>${o.poNumber}</strong></div>`:""}
 </div>` : "";
@@ -276,44 +480,69 @@ ${!isEvent?(()=>{
   const picks = o.pickStops || [{co:o.pickCo||"", addr:o.pickAddr||"", date:o.pickDate||""}];
   const dels = o.delStops || [{co:o.delCo||"", addr:o.delAddr||"", date:o.delDate||""}];
   const maxRows = Math.max(picks.length, dels.length);
+  // Per-stop items: prefer stop.items; fall back to the order-level o.items on
+  // the first pickup only, so single-stop and older orders still show items.
+  const stopItems = (stop, isFirstPick) => {
+    let list = (stop && stop.items) ? stop.items : [];
+    list = list.filter(i => i && (i.desc||i.pcs||i.wt||i.l||i.w||i.h));
+    if (!list.length && isFirstPick) list = (o.items||[]).filter(i => i.desc||i.pcs||i.wt||i.l||i.w||i.h);
+    return list;
+  };
+  // Compact item table rendered inside a stop card.
+  const stopItemsTable = (list) => {
+    if (!list.length) return "";
+    const th = "background:#f1f5f9;padding:4px 7px;text-align:left;font-weight:700;font-size:9px;border-bottom:1.5px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.2px";
+    const td = "padding:4px 7px;font-size:11px;border-bottom:1px solid #eef2f7";
+    const rows = list.map(i => `<tr>
+      <td style="${td}">${i.pcs||"—"}</td>
+      <td style="${td}">${i.desc||"—"}</td>
+      <td style="${td}">${i.wt?`${i.wt} ${i.wUnit||""}`.trim():"—"}</td>
+    </tr>`).join("");
+    return `<table style="width:100%;border-collapse:collapse;margin-top:8px">
+      <thead><tr><th style="${th}">Pces</th><th style="${th};width:55%">Description</th><th style="${th}">Weight</th></tr></thead>
+      <tbody>${rows}</tbody></table>`;
+  };
+  // Order totals — sum pieces and weight across every stop's items (one unit per
+  // order, per Manuel). De-duplicate: if the first pickup fell back to o.items,
+  // don't also count o.items again elsewhere.
+  const allStopItems = (() => {
+    const collected = [];
+    picks.forEach((s,i) => collected.push(...stopItems(s, i===0)));
+    dels.forEach((s) => collected.push(...stopItems(s, false)));
+    return collected;
+  })();
+  const totalPcs = allStopItems.reduce((s,i)=> s + (parseFloat(i.pcs)||0), 0);
+  const totalWt = allStopItems.reduce((s,i)=> s + (parseFloat(i.wt)||0), 0);
+  const wtUnit = (allStopItems.find(i=>i.wUnit)||{}).wUnit || "";
+  const totalsLine = (!isEvent && allStopItems.length) ? `<div class="bol-totals" style="display:flex;justify-content:flex-end;gap:24px;padding:8px 12px;background:#fff;border:1px solid #d5dae1;border-radius:6px;margin-bottom:18px;font-size:12px">
+    <span><b style="color:#64748b;text-transform:uppercase;font-size:10px;letter-spacing:0.3px">Total Pieces:</b> <b style="font-size:14px">${totalPcs}</b></span>
+    ${totalWt>0?`<span><b style="color:#64748b;text-transform:uppercase;font-size:10px;letter-spacing:0.3px">Total Weight:</b> <b style="font-size:14px">${totalWt} ${wtUnit}</b></span>`:""}
+  </div>` : "";
   return Array.from({length:maxRows}, (_,i) => {
     const pk = picks[i]; const dl = dels[i];
     const pLabel = picks.length>1 ? `Pick Up — Stop ${i+1}` : "Pick Up";
     const dLabel = dels.length>1 ? `Delivery — Stop ${i+1}` : "Delivery";
-    return `<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:10px">
-  ${pk ? `<div style="border:1.5px solid #cbd5e1;border-radius:8px;padding:14px;min-height:80px;background:#f8fafc">
-    <div style="font-weight:700;font-size:10px;text-transform:uppercase;color:#94a3b8;margin-bottom:6px;letter-spacing:0.5px">${pLabel}${pk.date?` <span style="color:#000;font-size:13px;font-weight:700;text-transform:none;letter-spacing:0">— ${fd(pk.date)}</span>`:""}</div>
-    ${pk.co?`<div style="font-weight:700;font-size:14px;margin-bottom:3px">${pk.co}</div>`:""}
-    <div style="font-size:12px;line-height:1.6;color:#334155">${(pk.addr||"—").replace(/\n/g,"<br>")}</div>
-    ${pk.contact?`<div style="font-size:11px;color:#475569;margin-top:5px">👤 ${pk.contact}${pk.phone?` &nbsp;·&nbsp; 📞 ${pk.phone}`:""}</div>`:pk.phone?`<div style="font-size:11px;color:#475569;margin-top:5px">📞 ${pk.phone}</div>`:""}
-    ${pk.notes?`<div style="font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:5px 8px;margin-top:6px;line-height:1.5;white-space:pre-wrap">📌 ${pk.notes}</div>`:""}
-  </div>` : `<div></div>`}
-  ${dl ? `<div style="border:1.5px solid #cbd5e1;border-radius:8px;padding:14px;min-height:80px;background:#f8fafc">
-    <div style="font-weight:700;font-size:10px;text-transform:uppercase;color:#94a3b8;margin-bottom:6px;letter-spacing:0.5px">${dLabel}${dl.date?` <span style="color:#000;font-size:13px;font-weight:700;text-transform:none;letter-spacing:0">— ${fd(dl.date)}</span>`:""}</div>
-    ${dl.co?`<div style="font-weight:700;font-size:14px;margin-bottom:3px">${dl.co}</div>`:""}
-    <div style="font-size:12px;line-height:1.6;color:#334155">${(dl.addr||"—").replace(/\n/g,"<br>")}</div>
-    ${dl.contact?`<div style="font-size:11px;color:#475569;margin-top:5px">👤 ${dl.contact}${dl.phone?` &nbsp;·&nbsp; 📞 ${dl.phone}`:""}</div>`:dl.phone?`<div style="font-size:11px;color:#475569;margin-top:5px">📞 ${dl.phone}</div>`:""}
-    ${dl.notes?`<div style="font-size:11px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:4px;padding:5px 8px;margin-top:6px;line-height:1.5;white-space:pre-wrap">📌 ${dl.notes}</div>`:""}
-  </div>` : `<div></div>`}
+    const noteBox = (n) => `<div style="font-size:11px;color:#92620a;background:#fffdf5;border:1px solid #fce9a8;border-radius:4px;padding:6px 9px;margin-top:8px;line-height:1.5;white-space:pre-wrap"><span style="font-weight:700;font-size:9px;text-transform:uppercase;color:#b45309">Notes:</span> ${n}</div>`;
+    const card = (s, label, isFirstPick) => s ? `<div class="bol-card" style="border:1px solid #d5dae1;border-radius:8px;padding:14px;min-height:80px;background:#fff">
+    <div style="font-weight:700;font-size:10px;text-transform:uppercase;color:#94a3b8;margin-bottom:6px;letter-spacing:0.5px">${label}${s.date?` <span style="color:#000;font-size:13px;font-weight:700;text-transform:none;letter-spacing:0">— ${fd(s.date)}</span>`:""}</div>
+    ${s.co?`<div style="font-weight:700;font-size:14px;margin-bottom:3px">${s.co}</div>`:""}
+    <div style="font-size:12px;line-height:1.6;color:#334155">${(s.addr||"—").replace(/\n/g,"<br>")}</div>
+    ${s.contact?`<div style="font-size:11px;color:#475569;margin-top:5px">${s.contact}${s.phone?` &nbsp;·&nbsp; ${s.phone}`:""}</div>`:s.phone?`<div style="font-size:11px;color:#475569;margin-top:5px">${s.phone}</div>`:""}
+    ${s.notes?noteBox(s.notes):""}
+    ${stopItemsTable(stopItems(s, isFirstPick))}
+  </div>` : `<div></div>`;
+    return `<div class="bol-row" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:10px">
+  ${card(pk, pLabel, i===0)}
+  ${card(dl, dLabel, false)}
 </div>`;
-  }).join("");
+  }).join("") + totalsLine;
 })():""}
 
-<!-- Items — transport only -->
-${!isEvent&&items.length?`<table style="width:100%;border-collapse:collapse;margin-bottom:18px">
-  <thead><tr>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px">Pces</th>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px;width:45%">Description</th>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px">Weight</th>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px">Length</th>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px">Width</th>
-    <th style="background:#f1f5f9;padding:8px 10px;text-align:left;font-weight:700;font-size:10px;border-bottom:2px solid #cbd5e1;text-transform:uppercase;letter-spacing:0.3px">Height</th>
-  </tr></thead>
-  <tbody>${itemRows}</tbody>
-</table>`:""}
+<!-- Items now render per-stop inside each stop card; order totals shown after the grid -->
 
 <!-- Notes -->
-${o.notes?'<div style="background:#f8fafc;border:1.5px solid #e2e8f0;border-radius:6px;padding:14px;font-size:12px;margin-bottom:18px;white-space:pre-line;line-height:1.6"><b style="font-size:11px;text-transform:uppercase;letter-spacing:0.3px;color:#64748b">Information / Notes</b><br><br>'+o.notes+'</div>':''}
+${o.notes?'<div class="bol-notes" style="background:#fff;border:1px solid #d5dae1;border-radius:6px;padding:14px;font-size:12px;margin-bottom:18px;white-space:pre-line;line-height:1.6"><b style="font-size:11px;text-transform:uppercase;letter-spacing:0.3px;color:#64748b">Information / Notes</b><br><br>'+o.notes+'</div>':''}
+${customsLabel}
 
 <!-- Event Pricing -->
 ${eventPricingSection}
@@ -323,10 +552,11 @@ ${pricingSection}
 
 <!-- POD -->
 ${podSection}
-${!isEvent?`<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:100px">
+${!isEvent?`<div class="bol-sign" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:40px;page-break-inside:avoid">
   <div><div style="border-top:1.5px solid #000;padding-top:8px;font-size:10px;color:#666">Signature and name in print</div></div>
   <div><div style="border-top:1.5px solid #000;padding-top:8px;font-size:10px;color:#666">Date and Time</div></div>
 </div>`:""}
+${(()=>{const t=termsOrDefault(o.terms);return t&&t.trim()?`<div class="bol-terms" style="margin-top:28px;padding-top:8px;border-top:1px solid #e2e8f0;page-break-inside:avoid"><div style="font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px">Terms &amp; Conditions</div><div style="font-size:7.5px;color:#94a3b8;line-height:1.35;white-space:pre-line">${t.replace(/</g,"&lt;")}</div></div>`:"";})()}
 
 </div>`;
 }
@@ -340,7 +570,13 @@ async function downloadBolPdf(o, divInfo, includePod=false, includePricing=false
     <meta charset="utf-8">
     <title>BOL ${o.bol}</title>
     <style>
-      @media print { body { margin: 0; } .no-print { display: none !important; } }
+      @page { margin: 12mm; }
+      @media print {
+        body { margin: 0; padding: 0; }
+        .no-print { display: none !important; }
+        /* Keep stop rows, cards, totals and signature from splitting across pages */
+        .bol-row, .bol-card, .bol-totals, .bol-sign, .bol-notes { page-break-inside: avoid; }
+      }
       body { font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 24px; background: #fff; }
     </style>
   </head><body>
@@ -350,6 +586,21 @@ async function downloadBolPdf(o, divInfo, includePod=false, includePricing=false
         🖨 Print / Save as PDF
       </button>
     </div>
+    <script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.6/dist/JsBarcode.all.min.js"><\/script>
+    <script>
+      // Render the CBSA customs barcode(s) using the SAME parameters as the
+      // approved standalone sticker (CODE128, width 2 / PAPS 1.3, height 45 / 28).
+      (function(){
+        function draw(){
+          if(typeof JsBarcode==="undefined"){ setTimeout(draw,80); return; }
+          document.querySelectorAll(".bol-customs-bc").forEach(function(el){
+            var data=el.getAttribute("data-barcode"); var isPaps=el.getAttribute("data-paps")==="1";
+            try{ JsBarcode(el,data,{format:"CODE128",width:isPaps?1.3:2,height:isPaps?28:45,displayValue:false,margin:0,background:"#ffffff",lineColor:"#000000"}); }catch(e){}
+          });
+        }
+        draw();
+      })();
+    <\/script>
   </body></html>`);
   w.document.close();
 }
@@ -390,6 +641,7 @@ const Icons = {
   calendar:<><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>,
   barcode:<><rect x="2" y="4" width="2" height="16"/><rect x="6" y="4" width="1" height="16"/><rect x="9" y="4" width="2" height="16"/><rect x="13" y="4" width="1" height="16"/><rect x="16" y="4" width="3" height="16"/><rect x="21" y="4" width="1" height="16"/></>,
   shield:<><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></>,
+  warn:<><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></>,
 };
 const Ic = ({n, s=16}) => <svg width={s} height={s} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{Icons[n]}</svg>;
 const Badge = ({s, billingType, poRequired, poNumber, orderType}) => {
@@ -694,6 +946,78 @@ export default function App() {
   // Opens the BOL number choice modal
   const newOrd = () => setShowBolModal(true);
 
+  // Convert an accepted quote into a pre-filled order and open the order editor.
+  // orderType: "transport" (pickup/delivery) or "event" (project line items).
+  const convertQuoteToOrder = async (quote, orderType) => {
+    setSaving(true);
+    try {
+      const bol = await getNextBol();
+      const isEvent = orderType === "event";
+      // Bill To = client name only (the address is captured on the client record;
+      // cramming the address lines here renders as one run-on string).
+      const billTo = quote.cliName || "";
+      const pickAddr = [quote.shipperStreet, [quote.shipperCity, quote.shipperProvState].filter(Boolean).join(", "),
+        quote.shipperPostalZip, quote.shipperCountry].filter(Boolean).join("\n");
+      const delAddr = [quote.consigneeStreet, [quote.consigneeCity, quote.consigneeProvState].filter(Boolean).join(", "),
+        quote.consigneePostalZip, quote.consigneeCountry].filter(Boolean).join("\n");
+      const items = (quote.freight||[]).filter(fr=>fr.desc||fr.pieces||fr.weight||fr.length||fr.commodity)
+        .map(fr=>({ pcs:fr.pieces||"", desc:fr.desc||fr.commodity||"", wt:fr.weight||"", wUnit:fr.weightUnit||"lbs",
+          l:fr.length||"", w:fr.width||"", h:fr.height||"", dUnit:fr.dimUnit||"in" }));
+      const cur = quote.totalCurrency || quote.currency || "CAD";
+      const eventLines = (quote.lines||[]).filter(l=>l.desc||parseFloat(l.unitPrice)>0)
+        .map(l=>({ id:(l.id||Date.now().toString()+Math.random().toString(36).slice(2,6)), desc:l.desc||"", qty:l.qty||"1",
+          unitPrice:l.unitPrice||"", currency:l.currency||cur, taxMode:l.taxMode||"NONE" }));
+      const linesTotal = eventLines.reduce((s,l)=>s+(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0),0);
+      const notes = [quote.scopeOfWork, quote.notes].filter(t=>t&&t.trim()).join("\n\n");
+
+      const baseO = {
+        bol, status:"unassigned",
+        divId: quote.divId||"", cliId: quote.cliId||"", cliName: quote.cliName||"",
+        billTo, reqDate: td(), ref: quote.clientRef||quote.quoteNum||"",
+        drvId:"", drvName:"", drvEmail:"", trkId:"", trkUnit:"", trkPlate:"", trlId:"", trlUnit:"",
+        customsType:"", stickerId:"", stickerNum:"",
+        notes, files: quote.attachments||[], specReqs:[], specReqCustom:"",
+        terms: termsOrDefault(quote.terms),
+        podBy:"", podDate:"", podTime:"",
+        fromQuote: quote.id || quote.quoteNum || null,
+        created:new Date().toISOString(),
+      };
+
+      let o;
+      if (isEvent) {
+        o = { ...baseO, orderType:"event", eventName: quote.project||quote.quoteNum||"",
+          pickCo: quote.shipperName||"", pickAddr, pickDate:"", delCo: quote.consigneeName||"", delAddr, delDate:"",
+          items: items.length?items:[{pcs:"",desc:"",wt:"",wUnit:"lbs",l:"",w:"",h:"",dUnit:"in"}],
+          price:{ cur, base:"", fuelPct:"", taxMode:"NONE", taxCustom:"", other:[{desc:"",amt:""}],
+            eventLines: eventLines.length?eventLines:[{id:Date.now().toString(),desc:"",qty:"1",unitPrice:"",taxMode:"NONE"}],
+            useEventPricing:true, totalCurrency:cur } };
+      } else {
+        // Transport order: map the quote's priced lines into per-line accessorial
+        // charges (the order's price.other[]). Base price left blank for you to
+        // set the line-haul rate; each quote line becomes an accessorial charge
+        // with its description, qty, and unit price. Accessorials don't carry a
+        // per-line currency (they use the order currency), so a line in a
+        // different currency than the order's is flagged in its description.
+        const accessorials = eventLines.map(l => {
+          const offCur = l.currency && l.currency !== cur;
+          return {
+            desc: (l.desc||"Charge") + (offCur ? ` (quoted ${l.currency})` : ""),
+            qty: l.qty || "1",
+            unitPrice: l.unitPrice || "",
+            taxMode: l.taxMode || "NONE",
+          };
+        });
+        o = { ...baseO, pickDate:"", delDate:"",
+          pickCo: quote.shipperName||"", pickAddr, delCo: quote.consigneeName||"", delAddr,
+          items: items.length?items:[{pcs:"",desc:"",wt:"",wUnit:"lbs",l:"",w:"",h:"",dUnit:"in"}],
+          price:{ cur, base:"", fuelPct:"", taxMode:"NONE", taxCustom:"",
+            other: accessorials.length ? accessorials : [{desc:"",amt:""}] } };
+      }
+      go("oe",{o,mode:"new"});
+    } catch(e) { console.error("convert quote failed:", e); alert("Error converting quote to order"); }
+    setSaving(false);
+  };
+
   // Actually creates the order — customBol optional
   const createOrd = async (customBol) => {
     setShowBolModal(false);
@@ -704,7 +1028,7 @@ export default function App() {
         drvId:"", drvName:"", drvEmail:"", trkId:"", trkUnit:"", trkPlate:"", trlId:"", trlUnit:"",
         pickCo:"", pickAddr:"", delCo:"", delAddr:"",
         customsType:"", stickerId:"", stickerNum:"",
-        items:[{pcs:"",desc:"",wt:"",wUnit:"lbs",l:"",w:"",h:"",dUnit:"in"}], notes:"", files:[], specReqs:[], specReqCustom:"",
+        items:[{pcs:"",desc:"",wt:"",wUnit:"lbs",l:"",w:"",h:"",dUnit:"in"}], notes:"", terms:termsOrDefault(undefined), files:[], specReqs:[], specReqCustom:"",
         podBy:"", podDate:"", podTime:"",
         price:{cur:"CAD",base:"",fuelPct:"",taxMode:"NONE",taxCustom:"",other:[{desc:"",amt:""}]},
         created:new Date().toISOString() };
@@ -841,12 +1165,12 @@ export default function App() {
 
   const orders = dbData.orders.filter(o => {
     const s = q.toLowerCase();
-    const m = !s || [o.bol,o.cliName,o.drvName,o.delAddr,o.pickAddr,o.ref,o.status,o.pickCo,o.delCo].join(" ").toLowerCase().includes(s);
+    const m = !s || [o.bol,o.cliName,o.drvName,o.delAddr,o.pickAddr,o.ref,o.status,o.pickCo,o.delCo,o.invoiceNum].join(" ").toLowerCase().includes(s);
     return m;
   }).sort((a,b)=>new Date(b.created)-new Date(a.created));
 
   const cnt = s => dbData.orders.filter(o=>o.status===s).length;
-  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"cl",l:"Clients",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"eq",l:"Equipment",i:"truck"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"ts",l:"Timesheets",i:"calendar"},{id:"sf",l:"Safety",i:"shield"},{id:"ifta",l:"IFTA Fuel Tax",i:"chart"},{id:"ev",l:"Events",i:"calendar"},{id:"qt",l:"Quotes",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sr",l:"Search",i:"search"},{id:"cd",l:"Documents",i:"file"},{id:"ed",l:"Employee Docs",i:"users"},{id:"ad",l:"Admin",i:"settings"}];
+  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"cl",l:"Clients",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"eq",l:"Equipment",i:"truck"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"ts",l:"Timesheets",i:"calendar"},{id:"sf",l:"Safety",i:"shield"},{id:"ifta",l:"IFTA Fuel Tax",i:"chart"},{id:"ev",l:"Events",i:"calendar"},{id:"qt",l:"Quotes",i:"file"},{id:"lt",l:"Letters",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sr",l:"Search",i:"search"},{id:"cd",l:"Documents",i:"file"},{id:"ed",l:"Employee Docs",i:"users"},{id:"xp",l:"Expirations",i:"warn"},{id:"ad",l:"Admin",i:"settings"}];
   const isOrd = pg.startsWith("o");
 
 
@@ -900,6 +1224,7 @@ export default function App() {
         <div style={{fontSize:13,fontWeight:600,color:"#fff"}}>👀 Demo Mode — Read Only &nbsp;·&nbsp; <span style={{fontWeight:400,opacity:0.9}}>You're exploring CargoDX. No changes can be saved.</span></div>
         <a href="mailto:mannydesl1@gmail.com" style={{fontSize:12,fontWeight:700,color:"#fff",background:"rgba(255,255,255,0.2)",padding:"4px 14px",borderRadius:20,textDecoration:"none",whiteSpace:"nowrap"}}>Get your own account →</a>
       </div>}
+      <BackupReminder/>
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
       <style>{RCSS}</style>
       <style>{`input[type=number]::-webkit-inner-spin-button,input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none;margin:0} input[type=number]{-moz-appearance:textfield}`}</style>
@@ -945,7 +1270,7 @@ export default function App() {
         {pg==="oa" && sub && <AssignOrder o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} savOrd={savOrd} go={go}/>}
         {pg==="op" && sub && <PodEntry o={dbData.orders.find(x=>x.id===sub.id)||sub} savOrd={savOrd} go={go}/>}
         {pg==="opr" && sub && <PricingEntry o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} savOrd={savOrd} go={go}/>}
-        {pg==="cl" && <CrudPage title="Clients" items={dbData.clients} fields={[{k:"name",l:"Company Name"},{k:"street",l:"Street Address"},{k:"city",l:"City"},{k:"provState",l:"Province / State"},{k:"country",l:"Country"},{k:"postalZip",l:"Postal / Zip Code"},{k:"contact",l:"Contact Person"},{k:"phone",l:"Phone"},{k:"email",l:"Email"},{k:"billingEmail",l:"Billing Email"},{k:"preferredCurrency",l:"Preferred Invoicing Currency",tp:"select",opts:["","CAD","USD","EUR","GBP"]},{k:"notes",l:"Internal Notes",tp:"textarea"}]} save={l=>saveColl("clients",l)} orders={dbData.orders} orderKey="cliId"/>}
+        {pg==="cl" && <CrudPage title="Clients" items={dbData.clients} fields={[{k:"name",l:"Company Name"},{k:"street",l:"Street Address"},{k:"city",l:"City"},{k:"provState",l:"Province / State"},{k:"country",l:"Country"},{k:"postalZip",l:"Postal / Zip Code"},{k:"contact",l:"Contact Person"},{k:"phone",l:"Phone"},{k:"email",l:"Email"},{k:"billingEmail",l:"Billing Email"},{k:"preferredCurrency",l:"Preferred Invoicing Currency",tp:"select",opts:["","CAD","USD","EUR","GBP"]},{k:"poRequired",l:"Purchase Order",tp:"checkbox",cbLabel:"PO required before invoicing"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} save={l=>saveColl("clients",l)} orders={dbData.orders} orderKey="cliId"/>}
         {pg==="lo" && <CrudPage title="Locations" items={dbData.locations} fields={[{k:"company",l:"Company Name"},{k:"street",l:"Street Address"},{k:"city",l:"City"},{k:"provState",l:"Province / State"},{k:"country",l:"Country"},{k:"postalZip",l:"Postal / Zip Code"},{k:"distanceKm",l:"Distance from Base (km)",tp:"number"},{k:"contact",l:"Contact Person"},{k:"phone",l:"Phone"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} save={l=>saveColl("locations",l)}/>}
         {pg==="dr" && <DriversPage items={dbData.drivers} save={l=>saveColl("drivers",l)} col="drivers"/>}
         {pg==="ts" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><TimesheetsPage/></Suspense>}
@@ -956,10 +1281,12 @@ export default function App() {
         {pg==="cd" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><CompanyDocsPage/></Suspense>}
         {pg==="ed" && <EmployeeDocsPage/>}
         {pg==="rp" && <ReportsPage db={dbData} go={go}/>}
-        {pg==="qt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]}/></Suspense>}
+        {pg==="qt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]} onConvertToOrder={convertQuoteToOrder}/></Suspense>}
+        {pg==="lt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><LettersPage/></Suspense>}
         {pg==="ifta" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><IFTAPage trucks={db.trucks}/></Suspense>}
         {pg==="ad" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><AdminPage/></Suspense>}
         {pg==="eq" && <EquipPage db={dbData} saveColl={saveColl}/>}
+        {pg==="xp" && <div style={{padding:20}}><h1 style={{fontSize:18,fontWeight:700,margin:0,marginBottom:12}}>Expirations</h1><ExpirationsTab db={dbData}/></div>}
         {pg==="pp" && <PapsParsPage db={dbData} savOrd={savOrd}/>}
       </main>
     </div>
@@ -1102,6 +1429,55 @@ function BolNumberModal({ onClose, onConfirm, existingBols=[] }) {
   </div>;
 }
 
+function BackupReminder() {
+  const [days, setDays] = useState(null);   // days since last backup, or Infinity if never
+  const [dismissed, setDismissed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    getDoc(doc(db, "config", "backupMeta"))
+      .then(snap => {
+        if (!alive) return;
+        const last = snap.exists() ? snap.data().lastBackup : null;
+        if (!last) { setDays(Infinity); return; }
+        const d = Math.floor((Date.now() - new Date(last).getTime()) / 86400000);
+        setDays(d);
+      })
+      .catch(() => { if (alive) setDays(null); });
+    return () => { alive = false; };
+  }, []);
+  // Only warn when it's been > 7 days (or never). Session-dismissible.
+  if (dismissed || days === null || days <= 7) return null;
+  const never = days === Infinity;
+  return <div style={{ background:"linear-gradient(135deg,#b45309,#92400e)", padding:"8px 20px", display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0, zIndex:100 }}>
+    <div style={{ fontSize:13, fontWeight:600, color:"#fff" }}>
+      ⚠️ {never ? "You haven't backed up your data yet." : `Your last backup was ${days} days ago.`} &nbsp;·&nbsp;
+      <span style={{ fontWeight:400, opacity:0.92 }}>Go to the Dashboard and click "Backup Data" to save a fresh copy.</span>
+    </div>
+    <button onClick={()=>setDismissed(true)} style={{ fontSize:12, fontWeight:700, color:"#fff", background:"rgba(255,255,255,0.2)", padding:"4px 14px", borderRadius:20, border:"none", cursor:"pointer", whiteSpace:"nowrap" }}>Dismiss</button>
+  </div>;
+}
+
+function BackupButton() {
+  const [state, setState] = useState("idle"); // idle | working | done
+  const run = async () => {
+    if (state === "working") return;
+    setState("working");
+    try {
+      const res = await backupAllData();
+      setState("done");
+      setTimeout(() => setState("idle"), 4000);
+      console.log(`Backup complete: ${res.totalRecords} records`);
+    } catch (e) {
+      console.error("Backup failed:", e);
+      alert("Backup failed. Please check your connection and try again.");
+      setState("idle");
+    }
+  };
+  return <button style={{...bS, marginRight: 8, opacity: state === "working" ? 0.6 : 1, ...(state === "done" ? { borderColor: "#22c55e", color: "#22c55e" } : {}) }} onClick={run} disabled={state === "working"}>
+    <Ic n={state === "done" ? "check" : "file"} s={14}/> {state === "working" ? "Backing up…" : state === "done" ? "Backup saved" : "Backup Data"}
+  </button>;
+}
+
 function Dashboard({db, cnt, go, newOrd}) {
   const [dashFilter, setDashFilter] = useState([]);
   const [divFilter, setDivFilter] = useState("all");
@@ -1141,7 +1517,7 @@ function Dashboard({db, cnt, go, newOrd}) {
   const hasFilter = divFilter!=="all"||cliFilter!=="all";
 
   return <div style={{padding:20}}>
-    <PageHdr title="Dashboard"><button style={bP} onClick={newOrd}><Ic n="plus" s={14}/> New Order</button></PageHdr>
+    <PageHdr title="Dashboard"><BackupButton/><button style={bP} onClick={newOrd}><Ic n="plus" s={14}/> New Order</button></PageHdr>
     <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:16,marginBottom:20,alignItems:"start"}}>
       <div style={{display:"grid",gridTemplateColumns:"1fr",gap:8}}>
         {[{l:"Total Orders",v:db.orders.length,c:"#3b82f6",flt:null},{l:"Unassigned",v:cnt("unassigned"),c:"#ef4444",flt:"unassigned"},{l:"Assigned / In Progress",v:cnt("assigned"),c:"#f59e0b",flt:"assigned"},{l:"In Transit",v:cnt("in-transit"),c:"#8b5cf6",flt:"in-transit"},{l:"Ready to Bill",v:cnt("ready-to-bill")+cnt("pod-received")+cnt("completed")+cnt("completed-noinvoice"),c:"#f97316",flt:"ready-to-bill"},{l:"Closed",v:db.orders.filter(o=>o.status==="closed"&&o.billingType!=="no-charge").length,c:"#22c55e",flt:"closed"},{l:"Closed – No Charge",v:db.orders.filter(o=>o.status==="no-charge"||o.billingType==="no-charge").length,c:"#14b8a6",flt:"no-charge"},{l:"Invoiced",v:cnt("invoiced"),c:"#06b6d4",flt:"invoiced"}].map(s =>
@@ -1493,6 +1869,52 @@ function OrderEdit({data, db, savOrd, go}) {
   const evtTotal = evtLines.reduce((s,l)=>s+(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0),0);
   const selEvt=(i,k,v)=>{const el=[...evtLines];el[i]={...el[i],[k]:v};setEvtLines(el);};
 
+  // ── Multi-currency for project lines (same engine as PricingEntry/Quotes) ──
+  const FX_CURRENCIES = ["USD","CAD","EUR","GBP","ZAR","SGD","AED"];
+  const fxSym = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":c==="SGD"?"S$":c==="AED"?"AED ":"$";
+  const [fxRates, setFxRates] = useState({});
+  const [fxLoading, setFxLoading] = useState(false);
+  const [fxDate, setFxDate] = useState("");
+  const fetchFxRates = async () => {
+    setFxLoading(true);
+    try {
+      const res = await fetch(`https://v6.exchangerate-api.com/v6/f33d099aa4e8c96e5a16d497/latest/USD`);
+      const data = await res.json();
+      setFxRates({ ...data.conversion_rates, USD: 1 });
+      setFxDate(data.time_last_update_utc ? data.time_last_update_utc.slice(0,16) : new Date().toISOString().slice(0,10));
+    } catch(e) { console.error("FX fetch failed", e); }
+    setFxLoading(false);
+  };
+  const evtSubtotalByCurrency = () => {
+    const map = {};
+    evtLines.forEach(l => {
+      const cur = l.currency || o.price?.cur || "CAD";
+      const ltp = l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+      const lb = (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+      const amt = lb + lb*(ltp/100);
+      if (amt===0) return;
+      map[cur] = (map[cur]||0) + amt;
+    });
+    return map;
+  };
+  const fxConvertToTarget = (byCur, targetCur, rates) => {
+    let total = 0;
+    for (const [cur, amt] of Object.entries(byCur)) {
+      const rFrom = cur==="USD"?1:rates[cur];
+      const rTo = targetCur==="USD"?1:rates[targetCur];
+      if (!rFrom || !rTo) return null;
+      total += (amt/rFrom)*rTo;
+    }
+    return total;
+  };
+  const evtCurrenciesUsed = () => {
+    const s = new Set(evtLines.filter(l=>l.desc||parseFloat(l.unitPrice)>0).map(l=>l.currency||o.price?.cur||"CAD"));
+    return [...s];
+  };
+  useEffect(() => { if (Object.keys(fxRates).length===0) fetchFxRates(); }, []);
+  useEffect(() => { fetchFxRates(); }, [o.price?.totalCurrency]);
+
+
   // Upload files to Firebase Storage
   const addFiles = async (files) => {
     setUploading(true);
@@ -1528,6 +1950,32 @@ function OrderEdit({data, db, savOrd, go}) {
     if(!o.divId||!o.cliId) { alert("Please select a Division and Client."); return; }
     const filledLines = evtLines.filter(l=>l.desc||parseFloat(l.unitPrice)>0||parseFloat(l.qty)>1);
     const hasPrice = filledLines.some(l=>parseFloat(l.unitPrice)>0) || (parseFloat(o.price?.base)||0)>0;
+    // FX snapshot so the PDF renders the same multi-currency total shown here.
+    const byCur = {};
+    filledLines.forEach(l => {
+      const cur = l.currency || o.price?.cur || "CAD";
+      const ltp = l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+      const lb = (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+      const amt = lb + lb*(ltp/100);
+      if (amt) byCur[cur] = (byCur[cur]||0) + amt;
+    });
+    const fxTarget = o.price?.totalCurrency || o.price?.cur || "CAD";
+    const convertedBase = fxConvertToTarget(byCur, fxTarget, fxRates);
+    const fxAdjMode = o.price?.adjMode || "pct";
+    const fxAdjVal = parseFloat(o.price?.adjVal)||0;
+    const fxAdjAmount = (convertedBase!=null && fxAdjVal!==0) ? (fxAdjMode==="pct"?convertedBase*(fxAdjVal/100):fxAdjVal) : 0;
+    const fxGrand = convertedBase!=null ? convertedBase + fxAdjAmount : null;
+    const fxSnapshot = {
+      byCur, target: fxTarget, convertedBase, adjMode: fxAdjMode, adjVal: fxAdjVal,
+      adjLabel: o.price?.adjLabel || "Adjustment", adjAmount: fxAdjAmount, grand: fxGrand,
+      fxDate, multi: Object.keys(byCur).length > 1,
+      // Snapshot "applies" (drives PDF/detail) whenever a real conversion or
+      // adjustment happened: multiple currencies, an adjustment, or the target
+      // currency differs from the lines' currency. Single-currency, no-fee,
+      // same-target orders fall back to the plain total.
+      applies: (Object.keys(byCur).length > 1) || (fxAdjVal !== 0)
+        || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== fxTarget),
+    };
     const saveData = {
       ...o,
       orderType:"event",
@@ -1537,6 +1985,7 @@ function OrderEdit({data, db, savOrd, go}) {
         cur: o.price?.cur||"CAD",
         eventLines: filledLines,
         useEventPricing: true,
+        fxSnapshot,
         // preserve transport fields exactly as entered — do NOT overwrite base with evtTotal
       },
     };
@@ -1565,6 +2014,7 @@ function OrderEdit({data, db, savOrd, go}) {
         set("cliId",id); set("cliName",c?.name||"");
         if(c?.name) set("billTo",c.name);
         if(c?.preferredCurrency) sep("cur",c.preferredCurrency);
+        if(c?.poRequired) set("poRequired",true);
       }} /></Field>
       <Field l="Assign to Event (optional)"><select style={sIn} value={o.linkedEventId||""} onChange={e=>{const ev=(db.events||[]).find(x=>x.id===e.target.value);set("linkedEventId",e.target.value||"");set("linkedEventName",ev?.name||"");}}><option value="">— No event —</option>{[...(db.events||[])].sort((a,b)=>(a.name||"").localeCompare(b.name||"")).map(ev=><option key={ev.id} value={ev.id}>{ev.name}</option>)}</select></Field>
       <div style={{marginTop:4,marginBottom:2}}>
@@ -1600,6 +2050,7 @@ function OrderEdit({data, db, savOrd, go}) {
         {[...(db.locations||[])].sort((a,b)=>(a.company||"").localeCompare(b.company||"")).map(loc=><option key={loc.id} value={loc.id}>{loc.company}{loc.city?` — ${loc.city}`:""}</option>)}
       </select></Field>
       <Field l="Notes"><textarea style={{...sIn,minHeight:70,resize:"vertical"}} value={o.notes||""} onChange={e=>set("notes",e.target.value)} placeholder="Project details, scope of work..."/></Field>
+      <Field l="Terms & Conditions (shown at bottom of PDF)"><textarea style={{...sIn,minHeight:70,resize:"vertical",fontSize:11}} value={termsOrDefault(o.terms)} onChange={e=>set("terms",e.target.value)} placeholder="Standard terms & conditions..."/></Field>
     </div>
 
     {/* Pricing */}
@@ -1653,21 +2104,25 @@ function OrderEdit({data, db, savOrd, go}) {
         <div style={{fontSize:11,color:T.muted,marginBottom:8}}>Ground crew, supervisors, other services — each line can have its own tax.</div>
 
         {/* Column headers */}
-        <div style={{display:"grid",gridTemplateColumns:"2fr 60px 80px 130px 70px 24px",gap:6,marginBottom:4}}>
-          {["Description","Qty","Unit Price","Tax","Total",""].map((h,i)=><div key={i} style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em",textAlign:i>=1&&i<=4?"right":"left"}}>{h}</div>)}
+        <div style={{display:"grid",gridTemplateColumns:"2fr 50px 74px 72px 110px 78px 24px",gap:6,marginBottom:4}}>
+          {["Description","Qty","Unit Price","Cur","Tax","Total",""].map((h,i)=><div key={i} style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em",textAlign:i>=1&&i<=5?"right":"left"}}>{h}</div>)}
         </div>
 
         {evtLines.map((line,idx)=>{
-          const sym=csym(o.price?.cur||"CAD");
+          const lineCur=line.currency||o.price?.cur||"CAD";
+          const sym=fxSym(lineCur);
           const ltp=line.taxMode==="HST"?13:line.taxMode==="GST"?5:line.taxMode==="CUSTOM"?(parseFloat(line.taxCustom)||0):0;
           const lbase=(parseFloat(line.qty)||0)*(parseFloat(line.unitPrice)||0);
           const ltax=lbase*(ltp/100);
           const ltot=lbase+ltax;
           return <div key={line.id||idx} style={{marginBottom:6}}>
-            <div style={{display:"grid",gridTemplateColumns:"2fr 60px 80px 130px 70px 24px",gap:6,alignItems:"center"}}>
+            <div style={{display:"grid",gridTemplateColumns:"2fr 50px 74px 72px 110px 78px 24px",gap:6,alignItems:"center"}}>
               <input style={sIn} value={line.desc} onChange={e=>selEvt(idx,"desc",e.target.value)} placeholder="Description..."/>
               <input style={{...sIn,textAlign:"right"}} type="number" value={line.qty} onChange={e=>selEvt(idx,"qty",e.target.value)} placeholder="1"/>
               <input style={{...sIn,textAlign:"right"}} type="number" step="0.01" value={line.unitPrice} onChange={e=>selEvt(idx,"unitPrice",e.target.value)} placeholder="0.00"/>
+              <select style={{...sIn,fontSize:10,padding:"5px 4px"}} value={lineCur} onChange={e=>selEvt(idx,"currency",e.target.value)}>
+                {FX_CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
               <select style={{...sIn,fontSize:10,padding:"5px 6px"}} value={line.taxMode||"NONE"} onChange={e=>selEvt(idx,"taxMode",e.target.value)}>
                 {TAX_MODES.map(t=><option key={t.k} value={t.k}>{t.l}</option>)}
               </select>
@@ -1678,27 +2133,75 @@ function OrderEdit({data, db, savOrd, go}) {
           </div>;
         })}
 
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
+        <div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
           <button style={{...bS,padding:"4px 10px",fontSize:11}} onClick={()=>setEvtLines([...evtLines,{id:Date.now().toString(),desc:"",qty:"1",unitPrice:"",taxMode:"NONE"}])}><Ic n="plus" s={10}/> Add Line</button>
-          {(()=>{
-            const sym=csym(o.price?.cur||"CAD");
-            const addlTotal=evtLines.reduce((s,l)=>{
-              const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
-              const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
-              return s+lb+lb*(ltp/100);
-            },0);
-            const base=parseFloat(o.price?.base)||0;
-            const fuel=base*(parseFloat(o.price?.fuelPct)||0)/100;
-            const tp=o.price?.taxMode==="HST"?13:o.price?.taxMode==="GST"?5:o.price?.taxMode==="CUSTOM"?(parseFloat(o.price?.taxCustom)||0):0;
-            const tax=(base+fuel)*(tp/100);
-            const transport=base+fuel+tax;
-            const grand=transport+addlTotal;
-            return <div style={{textAlign:"right"}}>
-              {addlTotal>0&&<div style={{fontSize:11,color:T.muted}}>Additional: {sym}{addlTotal.toFixed(2)}</div>}
-              <div style={{fontSize:14,fontWeight:700,color:"#0ea5e9"}}>Grand Total: {sym}{grand.toFixed(2)} {o.price?.cur||"CAD"}</div>
-            </div>;
-          })()}
         </div>
+
+        {/* Multi-currency grand total */}
+        {(()=>{
+          const byCur = evtSubtotalByCurrency();
+          const curList = Object.keys(byCur);
+          if (!curList.length) return null;
+          const target = o.price?.totalCurrency || o.price?.cur || "CAD";
+          const targetSym = fxSym(target);
+          const multi = evtCurrenciesUsed().length > 1;
+          const convertedBase = fxConvertToTarget(byCur, target, fxRates);
+          const adjMode = o.price?.adjMode || "pct";
+          const adjVal = parseFloat(o.price?.adjVal)||0;
+          const adjLabel = o.price?.adjLabel || "Adjustment";
+          let adjAmount = 0;
+          if (convertedBase!=null && adjVal!==0) adjAmount = adjMode==="pct" ? convertedBase*(adjVal/100) : adjVal;
+          const grand = convertedBase!=null ? convertedBase + adjAmount : null;
+          return <div style={{marginTop:10,padding:12,background:T["bg"],borderRadius:8,border:`1px solid ${T.border}`}}>
+            <div style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.4px",marginBottom:6}}>Subtotals by currency</div>
+            {curList.map(c=>(
+              <div key={c} style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:2}}>
+                <span style={{color:T.muted}}>{c}</span>
+                <span style={{fontWeight:600}}>{fxSym(c)}{byCur[c].toFixed(2)} {c}</span>
+              </div>
+            ))}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+              <div>
+                <div style={{fontSize:10,color:T.muted,marginBottom:3}}>Grand total in</div>
+                <select style={{...sIn,fontSize:12}} value={target} onChange={e=>sep("totalCurrency",e.target.value)}>
+                  {FX_CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
+              </div>
+              <div>
+                <div style={{fontSize:10,color:T.muted,marginBottom:3}}>Adjustment name</div>
+                <input style={{...sIn,fontSize:12}} value={o.price?.adjLabel||""} onChange={e=>sep("adjLabel",e.target.value)} placeholder="e.g. Admin Fee, Discount"/>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"90px 1fr",gap:8,marginTop:8}}>
+              <select style={{...sIn,fontSize:12}} value={adjMode} onChange={e=>sep("adjMode",e.target.value)}>
+                <option value="pct">%</option>
+                <option value="flat">Flat {target}</option>
+              </select>
+              <input style={{...sIn,fontSize:12,textAlign:"right"}} type="number" step="0.01" value={o.price?.adjVal||""} onChange={e=>sep("adjVal",e.target.value)} placeholder={adjMode==="pct"?"e.g. 10 or -5":"amount (− to reduce)"}/>
+            </div>
+            {multi && <div style={{fontSize:10,color:T.dim,marginTop:8}}>
+              {fxLoading ? "Fetching exchange rates…"
+                : convertedBase==null ? "⚠ Exchange rates unavailable — check connection."
+                : `Converted using rates ${fxDate?`as of ${fxDate} UTC`:"(live)"}. `}
+              {!fxLoading && <button style={{background:"none",border:"none",color:"#0ea5e9",cursor:"pointer",fontSize:10,padding:0,textDecoration:"underline"}} onClick={fetchFxRates}>refresh</button>}
+            </div>}
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+              {convertedBase!=null && adjVal!==0 && <>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:T.muted,marginBottom:2}}>
+                  <span>Subtotal ({target})</span><span>{targetSym}{convertedBase.toFixed(2)}</span>
+                </div>
+                <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:adjAmount<0?"#f59e0b":T.muted,marginBottom:4}}>
+                  <span>{adjLabel} ({adjMode==="pct"?`${adjVal}%`:"flat"})</span>
+                  <span>{adjAmount<0?"−":""}{targetSym}{Math.abs(adjAmount).toFixed(2)}</span>
+                </div>
+              </>}
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}>
+                <span style={{fontSize:13,fontWeight:700}}>Grand Total</span>
+                <span style={{fontSize:16,fontWeight:800,color:"#0ea5e9"}}>{grand!=null?`${targetSym}${grand.toFixed(2)} ${target}`:"—"}</span>
+              </div>
+            </div>
+          </div>;
+        })()}
       </div>
     </div>
 
@@ -1739,6 +2242,7 @@ function OrderEdit({data, db, savOrd, go}) {
         set("cliId",id); set("cliName",c?.name||"");
         if(c?.name) set("billTo",c.name);
         if(c?.preferredCurrency) sep("cur",c.preferredCurrency);
+        if(c?.poRequired) set("poRequired",true);
       }} /></Field>
       <Field l="Assign to Event (optional)"><select style={sIn} value={o.linkedEventId||""} onChange={e=>{const ev=(db.events||[]).find(x=>x.id===e.target.value);set("linkedEventId",e.target.value||"");set("linkedEventName",ev?.name||"");}}><option value="">— No event —</option>{[...(db.events||[])].sort((a,b)=>(a.name||"").localeCompare(b.name||"")).map(ev=><option key={ev.id} value={ev.id}>{ev.name}</option>)}</select></Field>
       <div style={{marginTop:4,marginBottom:2}}>
@@ -1899,7 +2403,7 @@ function OrderEdit({data, db, savOrd, go}) {
         <div style={{fontSize:11,fontWeight:600,color:T.muted}}>PRICING / NOTES (INTERNAL ONLY)</div>
         <span style={{fontSize:12,color:T.muted}}>{o._showPrice?"▾":"▸"}</span>
       </div>
-      {(o._showPrice || (o.price && (parseFloat(o.price?.base)>0 || o.price?.pricingNotes))) && (() => {
+      {(o._showPrice || (o.price && (parseFloat(o.price?.base)>0 || o.price?.pricingNotes || (o.price?.other||[]).some(c=>c.desc||parseFloat(c.unitPrice)>0||parseFloat(c.amt)>0)))) && (() => {
         const dp = {cur:"CAD",base:"",fuelPct:"",taxMode:"NONE",taxCustom:"",other:[{desc:"",amt:""}]};
         const pr = {...dp,...(o.price||{}), other:[...(o.price?.other||[{desc:"",amt:""}])]};
         const spr = (k,v) => set("price",{...pr,[k]:v});
@@ -1988,7 +2492,8 @@ function OrderEdit({data, db, savOrd, go}) {
         <input style={sIn} value={o.specReqCustom||""} onChange={e=>set("specReqCustom",e.target.value)} placeholder="Custom requirement..."/>
       </Field>
     </div>
-    <div style={sCrd}><Field l="Notes / Information"><textarea style={{...sIn,resize:"vertical",minHeight:120}} rows={6} value={o.notes} onChange={e=>set("notes",e.target.value)} placeholder="AWB numbers, special instructions, truck/plate info..."/></Field></div>
+    <div style={sCrd}><Field l="Notes / Information"><textarea style={{...sIn,resize:"vertical",minHeight:120}} rows={6} value={o.notes} onChange={e=>set("notes",e.target.value)} placeholder="AWB numbers, special instructions, truck/plate info..."/></Field>
+    <Field l="Terms & Conditions (shown at bottom of PDF)"><textarea style={{...sIn,resize:"vertical",minHeight:80,fontSize:11}} rows={4} value={termsOrDefault(o.terms)} onChange={e=>set("terms",e.target.value)} placeholder="Standard terms & conditions..."/></Field></div>
 
     {/* Attachments — Firebase Storage */}
     <div style={sCrd}>
@@ -2027,9 +2532,9 @@ function AssignOrder({o:io, db, savOrd, go}) {
   const addDriver = () => setExtras(ex=>[...ex,{...emptyDriver}]);
   const removeDriver = i => setExtras(ex=>ex.filter((_,j)=>j!==i));
 
-  const drivers = db.drivers.filter(d=>d.isDriver!==false).sort((a,b)=>(a.name||"").toLowerCase().localeCompare((b.name||"").toLowerCase()));
-  const trucks = [...db.trucks].sort((a,b)=>parseFloat(a.unit||0)-parseFloat(b.unit||0));
-  const trailers = [...db.trailers].sort((a,b)=>parseFloat(a.unit||0)-parseFloat(b.unit||0));
+  const drivers = db.drivers.filter(d=>d.isDriver!==false && d.archived!==true).sort((a,b)=>(a.name||"").toLowerCase().localeCompare((b.name||"").toLowerCase()));
+  const trucks = [...db.trucks].filter(t=>t.archived!==true).sort((a,b)=>parseFloat(a.unit||0)-parseFloat(b.unit||0));
+  const trailers = [...db.trailers].filter(t=>t.archived!==true).sort((a,b)=>parseFloat(a.unit||0)-parseFloat(b.unit||0));
 
   const DriverRow = ({drv, setDrv, label, onRemove, onDriverChange}) => <div style={{...sCrd,borderColor:T.border,marginBottom:10}}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
@@ -2093,7 +2598,7 @@ function AssignOrder({o:io, db, savOrd, go}) {
               senderEmail,
               subject: `Your assignment — BOL ${io.bol}`,
               includePod: false,
-              includeAttachments: false,
+              includeAttachments: true,
             })
           });
           okSent.push(d.drvEmail);
@@ -2225,23 +2730,34 @@ function buildXeroCsvString(o, p) {
   const contact = o.cliName||"";
   const hdr = ["ContactName","EmailAddress","POAddressLine1","POCity","POPostalCode","POCountry","InvoiceNumber","Reference","InvoiceDate","DueDate","InventoryItemCode","Description","Quantity","UnitAmount","AccountCode","TaxType","TrackingName1","TrackingOption1","Currency","BrandingTheme"];
   const rows = [hdr];
-  const row = (desc,qty,unit,tax) => [contact,"","","","","",xeroInvNum,xeroRef,invoiceDate,dueDate,"",desc,String(qty),unit,"4000",xeroTaxCode(tax||"NONE"),"","",cur,""];
+  const row = (desc,qty,unit,tax,rowCur) => [contact,"","","","","",xeroInvNum,xeroRef,invoiceDate,dueDate,"",desc,String(qty),unit,"4000",xeroTaxCode(tax||"NONE"),"","",rowCur||cur,""];
   const hasBase = p.base && parseFloat(p.base)>0;
   const hasEvtLines = (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0);
   // ── Multi-stop: pricing lives per-stop on the multi side (delStops or pickStops) ──
   const nPick=(o.pickStops||[]).length, nDel=(o.delStops||[]).length;
   const isMultiStop = nPick>1 || nDel>1;
   if(isMultiStop && !(p.useEventPricing||hasEvtLines)) {
-    const priceSide = nDel>=nPick ? "delStops" : "pickStops";
-    const stops = o[priceSide]||[];
-    const sideLabel = priceSide==="delStops" ? "Delivery" : "Pickup";
-    stops.forEach((st,i)=>{
+    // Order-level price (whole-BOL) first — this is the primary price on multi-stop
+    // orders. Per-stop entries below are optional surcharges.
+    const olBase=parseFloat(p.base||0);
+    const olFuel=p.fuelModel==="liter"?(parseFloat(p.fuelAmt)||0):(olBase*((parseFloat(p.fuelPct)||0)/100));
+    if(olBase>0) rows.push(row(p.transDesc||"Transport Charge",1,olBase.toFixed(2),p.taxMode));
+    if(olFuel>0) rows.push(row(p.fuelModel==="liter"?`Fuel (${p.liters||"?"}L)`:"Fuel Surcharge",1,olFuel.toFixed(2),"NONE"));
+    (p.other||[]).filter(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0).forEach(c=>{
+      const hasQty=(c.qty!==undefined&&c.qty!=="")||(c.unitPrice!==undefined&&c.unitPrice!=="");
+      const qty=hasQty?(parseFloat(c.qty)||0):1;
+      const unit=hasQty?(parseFloat(c.unitPrice)||0):(parseFloat(c.amt)||0);
+      rows.push(row(c.desc||"Additional Charge",qty,unit.toFixed(2),c.taxMode||"NONE"));
+    });
+    // Per-stop surcharges (both sides), labeled by stop.
+    const allStops=(o.pickStops||[]).map((s,i)=>({s,label:`Pickup Stop ${i+1}`})).concat((o.delStops||[]).map((s,i)=>({s,label:`Delivery Stop ${i+1}`})));
+    allStops.forEach(({s:st,label})=>{
       const sp=st.price||{};
       const sbase=parseFloat(sp.base||0);
       const sfuel = sp.fuelModel==="liter" ? (parseFloat(sp.fuelAmt)||0) : (sbase*((parseFloat(sp.fuelPct)||0)/100));
       const fuelDesc = sp.fuelModel==="liter" ? `Fuel (${sp.liters||"?"}L)` : "Fuel Surcharge";
-      const stopName = st.co || `${sideLabel} Stop ${i+1}`;
-      if(sbase>0) rows.push(row(`${stopName} — Transport Charge`,1,sbase.toFixed(2),sp.taxMode));
+      const stopName = st.co || label;
+      if(sbase>0) rows.push(row(`${stopName} — Surcharge`,1,sbase.toFixed(2),sp.taxMode));
       if(sfuel>0) rows.push(row(`${stopName} — ${fuelDesc}`,1,sfuel.toFixed(2),"NONE"));
       (sp.other||[]).filter(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0).forEach(c=>{
         const hasQty=(c.qty!==undefined&&c.qty!=="")||(c.unitPrice!==undefined&&c.unitPrice!=="");
@@ -2259,7 +2775,7 @@ function buildXeroCsvString(o, p) {
       if(fuel>0) rows.push(row("Fuel Surcharge",1,fuel.toFixed(2),"NONE"));
     }
     (p.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).forEach(l=>{
-      rows.push(row(l.desc,parseFloat(l.qty)||1,(parseFloat(l.unitPrice)||0).toFixed(2),l.taxMode||"NONE"));
+      rows.push(row(l.desc,parseFloat(l.qty)||1,(parseFloat(l.unitPrice)||0).toFixed(2),l.taxMode||"NONE",l.currency||cur));
     });
   } else {
     const routeDesc = [o.pickCo?`from ${o.pickCo}`:"",o.pickCity||"",o.delCo?`to ${o.delCo}`:"",o.delCity||""].filter(Boolean).join(" ");
@@ -2295,9 +2811,63 @@ function PricingEntry({o:io, db, savOrd, go}) {
   const [pendingSave, setPendingSave] = useState(false);
   const [showEventPricing, setShowEventPricing] = useState(io.price?.useEventPricing||false);
   const [expandedStops, setExpandedStops] = useState({});
+  const _anyStopSurcharge = ((io.delStops||[]).concat(io.pickStops||[])).some(st=>st&&st.price&&(parseFloat(st.price.base)>0||(st.price.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0)));
+  const [showStopSurcharges, setShowStopSurcharges] = useState(_anyStopSurcharge);
   const p = o.price; const sp=(k,v)=>setO(pr=>({...pr,price:{...pr.price,[k]:v}}));
   const soc=(i,k,v)=>{const oc=[...p.other];oc[i]={...oc[i],[k]:v};sp("other",oc)};
   const sel=(i,k,v)=>{const el=[...p.eventLines];el[i]={...el[i],[k]:v};sp("eventLines",el)};
+
+  // ── Multi-currency for project/event lines (same engine as QuotesPage) ──
+  // Rates fetched FROM USD base: { CAD:1.36, EUR:0.92, ... } meaning 1 USD = X.
+  const FX_CURRENCIES = ["USD","CAD","EUR","GBP","ZAR","SGD","AED"];
+  const fxSym = (c) => c==="EUR"?"€":c==="GBP"?"£":c==="ZAR"?"R":c==="SGD"?"S$":c==="AED"?"AED ":"$";
+  const [fxRates, setFxRates] = useState({});
+  const [fxLoading, setFxLoading] = useState(false);
+  const [fxDate, setFxDate] = useState("");
+  const fetchFxRates = async () => {
+    setFxLoading(true);
+    try {
+      const res = await fetch(`https://v6.exchangerate-api.com/v6/f33d099aa4e8c96e5a16d497/latest/USD`);
+      const data = await res.json();
+      setFxRates({ ...data.conversion_rates, USD: 1 });
+      setFxDate(data.time_last_update_utc ? data.time_last_update_utc.slice(0,16) : new Date().toISOString().slice(0,10));
+    } catch(e) { console.error("FX fetch failed", e); }
+    setFxLoading(false);
+  };
+  // Per-currency subtotals across event lines (line currency falls back to p.cur).
+  // Includes each line's own tax so the subtotal is the real payable per currency.
+  const evtSubtotalByCurrency = () => {
+    const map = {};
+    (p.eventLines||[]).forEach(l => {
+      const cur = l.currency || p.cur || "CAD";
+      const ltp = l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+      const lb = (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+      const amt = lb + lb*(ltp/100);
+      if (amt===0) return;
+      map[cur] = (map[cur]||0) + amt;
+    });
+    return map;
+  };
+  // Convert a {cur:amt} map into a single target currency using USD-base rates.
+  const fxConvertToTarget = (byCur, targetCur, rates) => {
+    let total = 0;
+    for (const [cur, amt] of Object.entries(byCur)) {
+      const rFrom = cur==="USD" ? 1 : rates[cur];
+      const rTo = targetCur==="USD" ? 1 : rates[targetCur];
+      if (!rFrom || !rTo) return null;
+      total += (amt / rFrom) * rTo;
+    }
+    return total;
+  };
+  // Whether more than one currency is actually in play on the lines.
+  const evtCurrenciesUsed = () => {
+    const s = new Set((p.eventLines||[]).filter(l=>l.desc||parseFloat(l.unitPrice)>0).map(l=>l.currency||p.cur||"CAD"));
+    return [...s];
+  };
+  // Fetch rates when the event pricing panel is shown or the target changes.
+  useEffect(() => { if (showEventPricing && Object.keys(fxRates).length===0) fetchFxRates(); }, [showEventPricing]);
+  useEffect(() => { if (showEventPricing && (p.totalCurrency)) fetchFxRates(); }, [p.totalCurrency]);
+
   // ── Multi-stop pricing (mirrors order-creation per-stop model) ──
   const nPick=(o.pickStops||[]).length, nDel=(o.delStops||[]).length;
   const isMultiStop = nPick>1 || nDel>1;
@@ -2313,6 +2883,9 @@ function PricingEntry({o:io, db, savOrd, go}) {
     const tx=(!pr.taxMode||pr.taxMode==="NONE")?0:sub*(tp/100);
     return {b,f,ob,ot,tx,total:sub+tx+ob+ot};};
   const orderGrandTotal = (o[priceSide]||[]).reduce((s,st)=>s+calcStop(st.price).total,0);
+  // Multi-stop model: order-level price (o.price) is the whole-BOL price; per-stop
+  // prices are optional SURCHARGES added on top. stopSurchargeTotal sums them.
+  const stopSurchargeTotal = orderGrandTotal;
   const sym = csym(p.cur);
   const isEvent = io.orderType === "event";
 
@@ -2383,6 +2956,8 @@ function PricingEntry({o:io, db, savOrd, go}) {
   const taxAmt = p.taxMode==="NONE"?0:subtotal*(taxPct/100);
   const transportTotal = subtotal + taxAmt + otherTotal; // base+fuel+baseTax + (other lines incl their tax)
   const total = transportTotal; // used for display
+  // Multi-stop: whole-BOL grand total = order-level price + optional per-stop surcharges.
+  const multiStopGrandTotal = total + stopSurchargeTotal;
 
   const emailAcct = async (emails, message="", attachCsv=false) => {
     setSending(true);
@@ -2438,12 +3013,16 @@ function PricingEntry({o:io, db, savOrd, go}) {
       <Field l="Currency"><select style={{...sIn,maxWidth:180}} value={p.cur} onChange={e=>sp("cur",e.target.value)}>{CURRS.map(c=><option key={c.v} value={c.v}>{c.v} ({c.s})</option>)}</select></Field>
 
       {/* Transport Charge block — single-stop only; multi-stop uses per-stop pricing below */}
-      {!isMultiStop && <div style={{marginTop:12,padding:"12px",background:"rgba(220,38,38,0.04)",borderRadius:8,border:`1px solid ${T.border}`}}>
-        <div style={{fontSize:10,fontWeight:700,color:T.red,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>Transport Charge {isEvent&&<span style={{fontSize:9,fontWeight:400,color:T.dim,textTransform:"none"}}>(leave empty if no transport charge)</span>}</div>
+      {<div style={{marginTop:12,padding:"12px",background:"rgba(220,38,38,0.04)",borderRadius:8,border:`1px solid ${T.border}`}}>
+        <div style={{fontSize:10,fontWeight:700,color:T.red,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:10}}>{isMultiStop?"Order Price (whole BOL)":"Transport Charge"} {isEvent&&<span style={{fontSize:9,fontWeight:400,color:T.dim,textTransform:"none"}}>(leave empty if no transport charge)</span>}</div>
 
         <Field l={`Base Price (${sym})`}><input style={sIn} type="number" step="0.01" value={p.base} onChange={e=>sp("base",e.target.value)} placeholder={isEvent?"Leave empty if no transport charge":"0.00"}/></Field>
 
-        {baseAmt>0 && <>
+        {(baseAmt>0
+          || (p.other||[]).some(oc=>oc.desc||parseFloat(oc.amt)>0||parseFloat(oc.unitPrice)>0)
+          || parseFloat(p.fuelPct)>0
+          || (p.transDesc||"").trim()
+        ) && <>
           <Field l="Transport Description">
             <input style={sIn} value={p.transDesc||""} onChange={e=>sp("transDesc",e.target.value)} placeholder="e.g. 10 trucks × $1,000 — Montreal to Toronto"/>
           </Field>
@@ -2514,7 +3093,12 @@ function PricingEntry({o:io, db, savOrd, go}) {
 
       {/* Multi-stop per-stop pricing */}
       {isMultiStop && <div style={{marginTop:12}}>
-        <div style={{fontSize:10,fontWeight:700,color:T.red,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Per-Stop Pricing — {priceSide==="delStops"?"Delivery":"Pickup"} Stops</div>
+        <button onClick={()=>setShowStopSurcharges(v=>!v)} style={{...bS,width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",background:showStopSurcharges?"rgba(220,38,38,0.06)":"transparent",border:`1px solid ${showStopSurcharges?T.red:T.border}`,marginBottom:showStopSurcharges?10:0}}>
+          <span style={{color:showStopSurcharges?T.red:T.muted,fontWeight:700,fontSize:11,textTransform:"uppercase",letterSpacing:"0.05em"}}>Per-Stop Surcharges (optional){stopSurchargeTotal>0?` — ${sym}${stopSurchargeTotal.toFixed(2)}`:""}</span>
+          <span style={{color:T.muted}}>{showStopSurcharges?"▲":"▼"}</span>
+        </button>
+        {showStopSurcharges && <div>
+        <div style={{fontSize:11,color:T.muted,marginBottom:10}}>Add an extra charge to a specific {priceSide==="delStops"?"delivery":"pickup"} stop — on top of the order price above.</div>
         {sched && <div style={{marginBottom:10,padding:"10px 12px",background:"rgba(14,165,233,0.08)",border:`1px solid #0ea5e9`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,flexWrap:"wrap"}}>
           <div style={{fontSize:11,color:T.text}}><b style={{color:"#0ea5e9"}}>{schedClient.name}</b> has a rate schedule{sched.perKm?` (${sym}${sched.perKm}/km`:""}{sched.perExtraStop?`, ${sym}${sched.perExtraStop}/extra stop)`:sched.perKm?")":""}. Enter km per stop, then auto-fill.</div>
           <button style={{...bP,padding:"7px 12px",fontSize:11,whiteSpace:"nowrap"}} onClick={applySchedAllStops}><Ic n="dollar" s={11}/> Auto-fill all stops</button>
@@ -2585,13 +3169,15 @@ function PricingEntry({o:io, db, savOrd, go}) {
                 {pr.taxMode==="CUSTOM" && <Field l="Custom Tax (%)"><input style={sIn} type="number" step="0.01" value={pr.taxCustom||""} onChange={e=>setStP(i,"taxCustom",e.target.value)} placeholder="e.g. 20"/></Field>}
               </>}
             </div>
-            {stc.total>0 && <div style={{borderTop:`1px solid ${T.border}`,marginTop:8,paddingTop:6,fontSize:13,fontWeight:700}}>Stop Total: {sym}{stc.total.toFixed(2)}</div>}
+            {stc.total>0 && <div style={{borderTop:`1px solid ${T.border}`,marginTop:8,paddingTop:6,fontSize:13,fontWeight:700}}>Stop Surcharge: {sym}{stc.total.toFixed(2)}</div>}
           </div>;
         })}
-        <div style={{...sCrd,borderColor:"#0ea5e9",marginTop:4}}>
-          <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:6}}>Order Total (all stops)</div>
-          {(o[priceSide]||[]).map((st,i)=>{const t=calcStop(st.price).total;return t>0?<div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:2}}><span style={{color:T.muted}}>{st.co||`Stop ${i+1}`}</span><span>{sym}{t.toFixed(2)}</span></div>:null;})}
-          <div style={{borderTop:`1px solid ${T.border}`,marginTop:6,paddingTop:6,display:"flex",justifyContent:"space-between",fontSize:15,fontWeight:700}}><span>Grand Total</span><span style={{color:"#0ea5e9"}}>{sym}{orderGrandTotal.toFixed(2)} {p.cur}</span></div>
+        </div>}
+        <div style={{...sCrd,borderColor:"#0ea5e9",marginTop:10}}>
+          <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:6}}>Order Total</div>
+          {total>0 && <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:2}}><span style={{color:T.muted}}>Order price (whole BOL)</span><span>{sym}{total.toFixed(2)}</span></div>}
+          {(o[priceSide]||[]).map((st,i)=>{const t=calcStop(st.price).total;return t>0?<div key={i} style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:2}}><span style={{color:T.muted}}>Surcharge — {st.co||`Stop ${i+1}`}</span><span>{sym}{t.toFixed(2)}</span></div>:null;})}
+          <div style={{borderTop:`1px solid ${T.border}`,marginTop:6,paddingTop:6,display:"flex",justifyContent:"space-between",fontSize:15,fontWeight:700}}><span>Grand Total</span><span style={{color:"#0ea5e9"}}>{sym}{multiStopGrandTotal.toFixed(2)} {p.cur}</span></div>
         </div>
       </div>}
 
@@ -2622,50 +3208,143 @@ function PricingEntry({o:io, db, savOrd, go}) {
             const lineBase=(parseFloat(line.qty)||0)*(parseFloat(line.unitPrice)||0);
             const lineTaxAmt=lineBase*(lineTaxPct/100);
             const lineTotal=lineBase+lineTaxAmt;
+            const lineCur=line.currency||p.cur||"CAD";
+            const lineSym=fxSym(lineCur);
             return <div key={line.id||idx} style={{marginBottom:6}}>
-              <div style={{display:"grid",gridTemplateColumns:"2fr 60px 80px 130px 70px 24px",gap:6,alignItems:"center"}}>
+              <div style={{display:"grid",gridTemplateColumns:"2fr 50px 74px 72px 110px 78px 24px",gap:6,alignItems:"center"}}>
                 <input style={sIn} value={line.desc} onChange={e=>sel(idx,"desc",e.target.value)} placeholder="Description..."/>
                 <input style={{...sIn,textAlign:"right"}} type="number" value={line.qty} onChange={e=>sel(idx,"qty",e.target.value)} placeholder="1"/>
                 <input style={{...sIn,textAlign:"right"}} type="number" step="0.01" value={line.unitPrice} onChange={e=>sel(idx,"unitPrice",e.target.value)} placeholder="0.00"/>
+                <select style={{...sIn,fontSize:10,padding:"5px 4px"}} value={lineCur} onChange={e=>sel(idx,"currency",e.target.value)}>
+                  {FX_CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}
+                </select>
                 <select style={{...sIn,fontSize:10,padding:"5px 6px"}} value={line.taxMode||"NONE"} onChange={e=>sel(idx,"taxMode",e.target.value)}>
                   {TAX_MODES.map(t=><option key={t.k} value={t.k}>{t.l}</option>)}
                 </select>
-                <div style={{textAlign:"right",fontSize:12,fontWeight:700,color:lineTotal>0?"#22c55e":T.dim}}>{sym}{lineTotal.toFixed(2)}</div>
+                <div style={{textAlign:"right",fontSize:12,fontWeight:700,color:lineTotal>0?"#22c55e":T.dim}}>{lineSym}{lineTotal.toFixed(2)}</div>
                 <button onClick={()=>sp("eventLines",(p.eventLines||[]).filter((_,j)=>j!==idx))} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:14,padding:0}}>×</button>
               </div>
               {lineTaxAmt>0&&<div style={{fontSize:10,color:T.muted,textAlign:"right",marginTop:1,paddingRight:34}}>
-                Tax ({lineTaxPct}%): {sym}{lineTaxAmt.toFixed(2)} · Base: {sym}{lineBase.toFixed(2)}
+                Tax ({lineTaxPct}%): {lineSym}{lineTaxAmt.toFixed(2)} · Base: {lineSym}{lineBase.toFixed(2)}
               </div>}
             </div>;
           })}
 
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:8,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
+          <div style={{marginTop:8,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
             <button style={{...bS,padding:"4px 10px",fontSize:11}} onClick={()=>sp("eventLines",[...(p.eventLines||[]),emptyEventLine()])}><Ic n="plus" s={10}/> Add Line</button>
-            <div style={{textAlign:"right"}}>
-              {(()=>{
-                const addlTotal=(p.eventLines||[]).reduce((s,l)=>{
-                  const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
-                  const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
-                  return s+lb+lb*(ltp/100);
-                },0);
-                const grandTotal=transportTotal+addlTotal;
-                return <>
-                  <div style={{fontSize:12,color:T.muted}}>Additional: {sym}{addlTotal.toFixed(2)}</div>
-                  <div style={{fontSize:14,fontWeight:700,color:"#0ea5e9"}}>Grand Total: {sym}{grandTotal.toFixed(2)} {p.cur}</div>
-                </>;
-              })()}
-            </div>
           </div>
+
+          {/* Multi-currency grand total (same engine as Quotes). Shows a subtotal
+              per currency, an optional named adjustment (% or flat), then the
+              converted grand total in the chosen target currency. */}
+          {(()=>{
+            const byCur = evtSubtotalByCurrency();
+            const curList = Object.keys(byCur);
+            if (!curList.length) return null;
+            const target = p.totalCurrency || p.cur || "CAD";
+            const targetSym = fxSym(target);
+            const multi = evtCurrenciesUsed().length > 1;
+            const convertedBase = fxConvertToTarget(byCur, target, fxRates); // pre-adjustment
+            // Adjustment: named, either % of the converted total or a flat amount
+            // in the target currency. Positive adds, negative reduces.
+            const adjMode = p.adjMode || "pct"; // "pct" | "flat"
+            const adjVal = parseFloat(p.adjVal)||0;
+            const adjLabel = p.adjLabel || "Adjustment";
+            let adjAmount = 0;
+            if (convertedBase!=null && adjVal!==0) {
+              adjAmount = adjMode==="pct" ? convertedBase*(adjVal/100) : adjVal;
+            }
+            const grand = convertedBase!=null ? convertedBase + adjAmount : null;
+            return <div style={{marginTop:10,padding:12,background:T["bg"],borderRadius:8,border:`1px solid ${T.border}`}}>
+              {/* Per-currency subtotals */}
+              <div style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.4px",marginBottom:6}}>Subtotals by currency</div>
+              {curList.map(c=>(
+                <div key={c} style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:2}}>
+                  <span style={{color:T.muted}}>{c}</span>
+                  <span style={{fontWeight:600}}>{fxSym(c)}{byCur[c].toFixed(2)} {c}</span>
+                </div>
+              ))}
+
+              {/* Target currency + adjustment controls */}
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+                <div>
+                  <div style={{fontSize:10,color:T.muted,marginBottom:3}}>Grand total in</div>
+                  <select style={{...sIn,fontSize:12}} value={target} onChange={e=>sp("totalCurrency",e.target.value)}>
+                    {FX_CURRENCIES.map(c=><option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div style={{fontSize:10,color:T.muted,marginBottom:3}}>Adjustment name</div>
+                  <input style={{...sIn,fontSize:12}} value={p.adjLabel||""} onChange={e=>sp("adjLabel",e.target.value)} placeholder="e.g. Admin Fee, Discount"/>
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"90px 1fr",gap:8,marginTop:8}}>
+                <select style={{...sIn,fontSize:12}} value={adjMode} onChange={e=>sp("adjMode",e.target.value)}>
+                  <option value="pct">%</option>
+                  <option value="flat">Flat {target}</option>
+                </select>
+                <input style={{...sIn,fontSize:12,textAlign:"right"}} type="number" step="0.01" value={p.adjVal||""} onChange={e=>sp("adjVal",e.target.value)} placeholder={adjMode==="pct"?"e.g. 10 or -5":"amount (− to reduce)"}/>
+              </div>
+
+              {/* FX status */}
+              {multi && <div style={{fontSize:10,color:T.dim,marginTop:8}}>
+                {fxLoading ? "Fetching exchange rates…"
+                  : convertedBase==null ? "⚠ Exchange rates unavailable — check connection, or amounts stay in their own currency."
+                  : `Converted using rates ${fxDate?`as of ${fxDate} UTC`:"(live)"}. `}
+                {!fxLoading && <button style={{background:"none",border:"none",color:"#0ea5e9",cursor:"pointer",fontSize:10,padding:0,textDecoration:"underline"}} onClick={fetchFxRates}>refresh</button>}
+              </div>}
+
+              {/* Totals */}
+              <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+                {convertedBase!=null && (adjVal!==0) && <>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:T.muted,marginBottom:2}}>
+                    <span>Subtotal ({target})</span><span>{targetSym}{convertedBase.toFixed(2)}</span>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:adjAmount<0?"#f59e0b":T.muted,marginBottom:4}}>
+                    <span>{adjLabel} ({adjMode==="pct"?`${adjVal}%`:"flat"})</span>
+                    <span>{adjAmount<0?"−":""}{targetSym}{Math.abs(adjAmount).toFixed(2)}</span>
+                  </div>
+                </>}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline"}}>
+                  <span style={{fontSize:13,fontWeight:700}}>Grand Total</span>
+                  <span style={{fontSize:16,fontWeight:800,color:"#0ea5e9"}}>{grand!=null?`${targetSym}${grand.toFixed(2)} ${target}`:"—"}</span>
+                </div>
+                {transportTotal>0 && <div style={{fontSize:10,color:T.dim,marginTop:4}}>Note: transport pricing ({sym}{transportTotal.toFixed(2)} {p.cur}) is tracked separately from these project lines.</div>}
+              </div>
+            </div>;
+          })()}
         </div>}
       </div>}
       <div style={{display:"flex",gap:8,marginTop:14,flexWrap:"wrap"}}>
-        <button style={{...sBtn,background:"#0ea5e9"}} onClick={()=>{savOrd({...o,status:"completed"});go("od",o);}}><Ic n="dollar" s={13}/> Save Pricing</button>
+        <button style={{...sBtn,background:"#0ea5e9"}} onClick={()=>{
+          // Snapshot the multi-currency computation so the PDF (which has no live
+          // FX access) renders exactly what was shown here at save time.
+          const byCur = evtSubtotalByCurrency();
+          const target = p.totalCurrency || p.cur || "CAD";
+          const convertedBase = fxConvertToTarget(byCur, target, fxRates);
+          const adjMode = p.adjMode || "pct";
+          const adjVal = parseFloat(p.adjVal)||0;
+          const adjAmount = (convertedBase!=null && adjVal!==0) ? (adjMode==="pct"?convertedBase*(adjVal/100):adjVal) : 0;
+          const grand = convertedBase!=null ? convertedBase+adjAmount : null;
+          const fxSnapshot = {
+            byCur, target, convertedBase, adjMode, adjVal,
+            adjLabel: p.adjLabel||"Adjustment", adjAmount, grand,
+            fxDate, multi: evtCurrenciesUsed().length>1,
+            applies: (Object.keys(byCur).length > 1) || (adjVal !== 0)
+              || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== target),
+          };
+          // Save pricing WITHOUT changing status — you can price at any stage and
+          // stay there. (Previously this forced status:"completed", bumping the
+          // order to Ready to Bill on every pricing save.)
+          const oToSave = {...o, price:{...o.price, fxSnapshot}};
+          savOrd(oToSave); go("od", oToSave);
+        }}><Ic n="dollar" s={13}/> Save Pricing</button>
         <button style={bS} onClick={()=>go("od",o)}>Cancel</button>
       </div>
     </div>
   </div>
   {showEmailModal && <AccountingEmailModal
-    showCsvOption={!!(p.base && parseFloat(p.base)>0) || (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0)}
+    showCsvOption={!!(p.base && parseFloat(p.base)>0) || (p.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0) || (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0) || ((o.pickStops||[]).concat(o.delStops||[])).some(st=>st&&st.price&&(parseFloat(st.price.base)>0||(st.price.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0)))}
     onSend={async(emails,msg,attachCsv)=>{setShowEmailModal(false);if(pendingSave)await savOrd({...o,status:"completed"});await emailAcct(emails,msg,attachCsv);setPendingSave(false);}}
     onSkipEmail={async()=>{setShowEmailModal(false);await savOrd({...o,status:"closed",billingType:"invoiced"});setPendingSave(false);go("ol",null,{highlightBol:o.bol});}}
     onCancel={()=>{setShowEmailModal(false);setPendingSave(false);}}
@@ -2773,7 +3452,7 @@ function AccountingEmailModal({onSend, onCancel, onSkipEmail, showCsvOption=fals
   const [checked, setChecked] = useState(ACCT_EMAILS.map(()=>false));
   const [custom, setCustom] = useState("");
   const [message, setMessage] = useState("");
-  const [attachCsv, setAttachCsv] = useState(showCsvOption);
+  const [attachCsv, setAttachCsv] = useState(true);  // Xero CSV ticked by default
   const allSelected = checked.every(Boolean);
   const toggle = i => setChecked(c => c.map((v,j)=>j===i?!v:v));
   const toggleAll = () => setChecked(ACCT_EMAILS.map(()=>!allSelected));
@@ -2817,7 +3496,7 @@ function AccountingEmailModal({onSend, onCancel, onSkipEmail, showCsvOption=fals
         </label>
       </div>}
       <div style={{display:"flex",gap:8}}>
-        <button style={{...sBtn,background:"#06b6d4",opacity:canSend?1:0.4,cursor:canSend?"pointer":"not-allowed"}} disabled={!canSend} onClick={()=>onSend(selected, message.trim(), attachCsv)}>
+        <button style={{...sBtn,background:"#06b6d4",opacity:canSend?1:0.4,cursor:canSend?"pointer":"not-allowed"}} disabled={!canSend} onClick={()=>onSend(selected, message.trim(), attachCsv && showCsvOption)}>
           <Ic n="mail" s={13}/> Send to {selected.length} recipient{selected.length!==1?"s":""}
         </button>
         <button style={bS} onClick={onCancel}>Cancel</button>
@@ -3085,8 +3764,17 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
   });
   const hasStopPricing = _checkStopPrice(o.delStops) || _checkStopPrice(o.pickStops);
   const hasOrderPrice = (parseFloat(o.price?.base)||0)>0;
+  // Accessorial-only pricing (base blank, charges in price.other[]) counts too —
+  // e.g. a quote converted to a transport order puts everything in other[].
+  const hasOtherPrice = (o.price?.other||[]).some(c=>{
+    const lb = (c.qty!==undefined||c.unitPrice!==undefined) ? (parseFloat(c.qty)||0)*(parseFloat(c.unitPrice)||0) : (parseFloat(c.amt)||0);
+    return lb>0;
+  });
   const hasEvtLinesPrice = (o.price?.eventLines||[]).some(l=>parseFloat(l.unitPrice)>0);
-  const hasAnyPricing = hasOrderPrice || hasEvtLinesPrice || hasStopPricing;
+  const hasAnyPricing = hasOrderPrice || hasOtherPrice || hasEvtLinesPrice || hasStopPricing;
+  // POD exists if the order has a single POD (o.podBy) OR any stop has a POD
+  // (multi-stop transport orders store POD per delivery/pickup stop as stop.pod.by).
+  const hasAnyPod = !!o.podBy || ((o.delStops||[]).concat(o.pickStops||[])).some(st => st && st.pod && st.pod.by);
 
   const allOrderDrivers = [{drvName:o.drvName?.split(", ")[0]||o.drvName, drvEmail:o.drvEmail, trkUnit:o.trkUnit, trkPlate:o.trkPlate, trlUnit:o.trlUnit, trlPlate:o.trlPlate}, ...(o.extraDrivers||[])].filter(d=>d.drvName);
   const emailDriver = async (driverIdx=0) => {
@@ -3109,12 +3797,31 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
   const emailAcctFromDetail = async (emails, message="", attachCsv=false) => {
     setSending(true);
     const cli = db.clients.find(c=>c.id===o.cliId);
-    const xeroCSVBase64 = attachCsv ? btoa(unescape(encodeURIComponent(buildXeroCsvString(o, p)))) : null;
+    // FX: if this order uses a currency conversion, pull TODAY's rate now (at
+    // invoice time), rebuild the snapshot, and save it back so the record matches
+    // exactly what accounting receives. Falls back to the stored snapshot if the
+    // live fetch fails, so invoicing is never blocked.
+    let orderForInvoice = o;
+    const existingSnap = o.price && o.price.fxSnapshot;
+    if (existingSnap && (existingSnap.applies || existingSnap.multi)) {
+      const live = await fetchFxRatesLive();
+      if (live) {
+        const freshSnap = buildFxSnapshotFromOrder(o, live.rates, live.fxDate);
+        if (freshSnap.grand != null) {
+          orderForInvoice = { ...o, price: { ...o.price, fxSnapshot: freshSnap } };
+          try { await savOrd(orderForInvoice); } catch(saveErr){ console.warn("FX snapshot save-back failed (email still uses fresh rate):", saveErr); }
+        }
+      } else {
+        console.warn("Live FX fetch failed at invoice time — using stored snapshot.");
+      }
+    }
+    const oSend = orderForInvoice;
+    const xeroCSVBase64 = attachCsv ? btoa(unescape(encodeURIComponent(buildXeroCsvString(oSend, oSend.price||p)))) : null;
     try {
       for(const email of emails) {
         await callCloudFn("sendInvoiceEmail", {
-          order: { ...o, divName: div?.name || "" },
-          pricing: { ...p, billingEmail: cli?.billingEmail || "" },
+          order: { ...oSend, divName: div?.name || "" },
+          pricing: { ...(oSend.price||p), billingEmail: cli?.billingEmail || "" },
           client: cli ? {
             name: cli.name||"",
             street: cli.street||"",
@@ -3164,11 +3871,9 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         return allDrv.map((d,i)=><span key={i} style={{display:"inline-flex",gap:4,flexWrap:"wrap"}}>
           {hasMulti && <span style={{fontSize:10,color:T.muted,alignSelf:"center",whiteSpace:"nowrap"}}>{d.drvName||`Driver ${i+1}`}:</span>}
           <button style={bS} onClick={()=>downloadBolPdf(o,div,false,false,i,cli)}><Ic n="pdf" s={13}/> PDF</button>
-          {isEvent
-            ? <button style={bS} onClick={()=>downloadBolPdf(o,div,false,true,i,cli)}><Ic n="pdf" s={13}/> +Price</button>
-            : o.price?.base && parseFloat(o.price.base)>0 && <button style={bS} onClick={()=>downloadBolPdf(o,div,false,true,i,cli)}><Ic n="pdf" s={13}/> +Price</button>}
-          {o.podBy && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,false,i,cli)}><Ic n="pdf" s={13}/> +POD</button>}
-          {o.podBy && o.price?.base && parseFloat(o.price.base)>0 && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,true,i,cli)}><Ic n="pdf" s={13}/> +POD+Price</button>}
+          {hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,false,true,i,cli)}><Ic n="pdf" s={13}/> +Price</button>}
+          {hasAnyPod && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,false,i,cli)}><Ic n="pdf" s={13}/> +POD</button>}
+          {hasAnyPod && hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,true,i,cli)}><Ic n="pdf" s={13}/> +POD+Price</button>}
         </span>);
       })()}
       <button style={bS} onClick={()=>go("oe",{o:{...o,items:[...o.items.map(i=>({...i}))]},mode:"edit"})}><Ic n="edit" s={13}/> Edit</button>
@@ -3177,6 +3882,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
       {o.status==="unassigned" && <>
         {!isEvent && <button style={{...sBtn,background:"#3b82f6"}} onClick={()=>go("oa",o)}><Ic n="truck" s={13}/> Assign</button>}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="edit" s={13}/> Enter POD</button>}
+        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#f59e0b",color:"#000"}} onClick={()=>confirmStatus("assigned",`Mark BOL ${o.bol} as In Progress?`)}>▶ In Progress</button>}
       </>}
@@ -3187,6 +3893,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         {!isEvent && <button style={{...sBtn,background:"#8b5cf6"}} onClick={()=>confirmStatus("in-transit",`Move BOL ${o.bol} to In Transit?`)}>In Transit</button>}
         {!isEvent && allOrderDrivers.map((d,i)=><button key={i} style={bS} disabled={sending} onClick={()=>emailDriver(i)}><Ic n="mail" s={13}/> Email {allOrderDrivers.length>1?d.drvName||`Driver ${i+1}`:"Driver"}</button>)}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="edit" s={13}/> Enter POD</button>}
+        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#f97316"}} onClick={()=>confirmStatus("ready-to-bill",`Mark BOL ${o.bol} as Ready to Bill?`)}>Ready to Bill</button>}
       </>}
@@ -3202,6 +3909,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         }}>Ready to Bill</button>}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="check" s={13}/> {o.podBy?"Edit POD":"Enter POD"}</button>}
         {!isEvent && allOrderDrivers.map((d,i)=><button key={i} style={bS} disabled={sending} onClick={()=>emailDriver(i)}><Ic n="mail" s={13}/> {allOrderDrivers.length>1?`Email ${d.drvName||`Driver ${i+1}`}`:"Email Driver"}</button>)}
+        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#0ea5e9"}} onClick={()=>confirmStatus("ready-to-bill",`Mark BOL ${o.bol} as Ready to Bill?`)}>Ready to Bill</button>}
       </>}
@@ -3381,24 +4089,45 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
                 <th style={{textAlign:"left",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 0",paddingRight:8}}>Description</th>
                 <th style={{textAlign:"right",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 4px"}}>Qty</th>
                 <th style={{textAlign:"right",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 4px"}}>Unit</th>
+                <th style={{textAlign:"right",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 4px"}}>Cur</th>
                 <th style={{textAlign:"right",fontSize:9,color:T.muted,fontWeight:700,textTransform:"uppercase",padding:"2px 0"}}>Total</th>
               </tr></thead>
               <tbody>
-                {linesCalc.map((l,i)=><tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
+                {linesCalc.map((l,i)=>{const lc=l.currency||p.cur||"CAD";const ls=csym(lc);return <tr key={i} style={{borderBottom:`1px solid ${T.border}`}}>
                   <td style={{padding:"4px 8px 4px 0",fontSize:11}}>
                     {l.desc}{l.ltax>0&&<span style={{fontSize:9,color:T.muted,marginLeft:4}}>({l.ltaxLabel})</span>}
                   </td>
                   <td style={{textAlign:"right",padding:"4px",fontSize:11,color:T.muted}}>{l.qty}</td>
-                  <td style={{textAlign:"right",padding:"4px",fontSize:11,color:T.muted}}>{sym}{parseFloat(l.unitPrice).toFixed(2)}</td>
-                  <td style={{textAlign:"right",padding:"4px 0",fontWeight:600,fontSize:11,color:"#22c55e"}}>{sym}{l.ltot.toFixed(2)}</td>
-                </tr>)}
+                  <td style={{textAlign:"right",padding:"4px",fontSize:11,color:T.muted}}>{ls}{parseFloat(l.unitPrice).toFixed(2)}</td>
+                  <td style={{textAlign:"right",padding:"4px",fontSize:10,color:T.muted}}>{lc}</td>
+                  <td style={{textAlign:"right",padding:"4px 0",fontWeight:600,fontSize:11,color:"#22c55e"}}>{ls}{l.ltot.toFixed(2)}</td>
+                </tr>;})}
               </tbody>
             </table>
           </div>}
-          {/* Grand total */}
-          {(hasTransport||hasLines) && <div style={{fontWeight:700,marginTop:8,fontSize:14,borderTop:`1px solid ${T.border}`,paddingTop:6}}>
-            {hasLines?`Grand Total: ${sym}${grandTotal.toFixed(2)} ${p.cur||"CAD"}`:`Total: ${sym}${transportTotal.toFixed(2)} ${p.cur||"CAD"}`}
-          </div>}
+          {/* Grand total — use FX snapshot when a conversion/adjustment applies */}
+          {(hasTransport||hasLines) && (()=>{
+            const snap = p.fxSnapshot;
+            if (snap && (snap.applies || snap.multi) && snap.grand!=null) {
+              const tsym = csym(snap.target);
+              return <div style={{marginTop:8,borderTop:`1px solid ${T.border}`,paddingTop:6}}>
+                <div style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.3px",marginBottom:4}}>Subtotals by currency</div>
+                {Object.entries(snap.byCur||{}).map(([c,a])=>(
+                  <div key={c} style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.muted,marginBottom:2}}>
+                    <span>{c}</span><span>{csym(c)}{a.toFixed(2)} {c}</span>
+                  </div>
+                ))}
+                {snap.adjVal ? <>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:T.muted,marginTop:4}}><span>Subtotal ({snap.target})</span><span>{tsym}{snap.convertedBase.toFixed(2)}</span></div>
+                  <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:snap.adjAmount<0?"#f59e0b":T.muted}}><span>{snap.adjLabel} ({snap.adjMode==="pct"?`${snap.adjVal}%`:"flat"})</span><span>{snap.adjAmount<0?"−":""}{tsym}{Math.abs(snap.adjAmount).toFixed(2)}</span></div>
+                </> : null}
+                <div style={{display:"flex",justifyContent:"space-between",fontWeight:700,fontSize:14,marginTop:4}}><span>Grand Total</span><span style={{color:"#0ea5e9"}}>{tsym}{snap.grand.toFixed(2)} {snap.target}</span></div>
+              </div>;
+            }
+            return <div style={{fontWeight:700,marginTop:8,fontSize:14,borderTop:`1px solid ${T.border}`,paddingTop:6}}>
+              {hasLines?`Grand Total: ${sym}${grandTotal.toFixed(2)} ${p.cur||"CAD"}`:`Total: ${sym}${transportTotal.toFixed(2)} ${p.cur||"CAD"}`}
+            </div>;
+          })()}
           {p.pricingNotes && <div style={{fontSize:12,fontWeight:600,color:"#f97316",marginTop:6,background:T.hover,padding:"6px 10px",borderRadius:4}}>📝 {p.pricingNotes}</div>}
         </div>;
       })()}
@@ -3434,7 +4163,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
     </div>
   </div>
   {showEmailModal && <AccountingEmailModal
-    showCsvOption={!!(p.base && parseFloat(p.base)>0) || (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0)}
+    showCsvOption={!!(p.base && parseFloat(p.base)>0) || (p.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0) || (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0) || ((o.pickStops||[]).concat(o.delStops||[])).some(st=>st&&st.price&&(parseFloat(st.price.base)>0||(st.price.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0)))}
     onSend={async(emails,msg,attachCsv)=>{setShowEmailModal(false);await emailAcctFromDetail(emails,msg,attachCsv);if(["ready-to-bill","pod-received","completed","completed-noinvoice"].includes(o.status)){await savOrd({...o,status:"closed",billingType:"invoiced"});go("ol",null,{highlightBol:o.bol});}}}
     onSkipEmail={async()=>{setShowEmailModal(false);await savOrd({...o,status:"closed",billingType:"invoiced"});go("ol",null,{highlightBol:o.bol});}}
     onCancel={()=>setShowEmailModal(false)}
@@ -3602,10 +4331,10 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
   const filtered = items.filter(item => {
     if (!srch) return true;
     const s = srch.toLowerCase();
-    return fields.some(f => (item[f.k]||"").toLowerCase().includes(s));
+    return fields.some(f => String(item[f.k] ?? "").toLowerCase().includes(s));
   }).sort((a,b) => {
-    const aName = (a.name||a.company||a[fields[0].k]||"").toLowerCase();
-    const bName = (b.name||b.company||b[fields[0].k]||"").toLowerCase();
+    const aName = String(a.name||a.company||a[fields[0].k]||"").toLowerCase();
+    const bName = String(b.name||b.company||b[fields[0].k]||"").toLowerCase();
     return aName.localeCompare(bName);
   });
 
@@ -3643,6 +4372,12 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
           </Field>;
         }
         if(f.tp==="select") return <Field key={f.k} l={f.l}><select style={sIn} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}>{(f.opts||[]).map(o=><option key={o} value={o}>{o||"— None —"}</option>)}</select></Field>;
+        if(f.tp==="checkbox") return <Field key={f.k} l={f.l}>
+          <label style={{display:"flex",alignItems:"center",gap:8,cursor:"pointer",padding:"6px 0"}}>
+            <input type="checkbox" checked={!!fmData[f.k]} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.checked}))} style={{accentColor:T.red,width:16,height:16}}/>
+            <span style={{fontSize:13,color:T.text}}>{f.cbLabel||"Yes"}</span>
+          </label>
+        </Field>;
         return <Field key={f.k} l={f.l}>{
           f.tp==="textarea"
             ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
@@ -3784,6 +4519,95 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
   </div>;
 }
 
+// ═══ SHARED DOCS (company → driver, read-only in the timesheet app) ═══
+// Uploads to Storage and writes to the SEPARATE `driver_shared_docs` collection,
+// tagged with the driver's employeeId (trimmed+lowercased — the exact key the
+// timesheet login matches on). Kept apart from the person record's own `docs`
+// array and from `employee_documents` (which is the driver→manager direction),
+// so the driver app can read only what's deliberately shared here.
+function SharedDocsSection({ employeeId, driverName }) {
+  const empKey = String(employeeId || "").trim().toLowerCase();
+  const [docs, setDocs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef(null);
+
+  const load = useCallback(async () => {
+    if (!empKey) { setDocs([]); setLoading(false); return; }
+    setLoading(true);
+    try {
+      const snap = await getDocs(query(collection(db, "driver_shared_docs"), where("employeeId", "==", empKey)));
+      const list = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a,b) => (b.uploadedAt||0) - (a.uploadedAt||0));
+      setDocs(list);
+    } catch (e) { console.error("shared docs load failed:", e); }
+    setLoading(false);
+  }, [empKey]);
+  useEffect(() => { load(); }, [load]);
+
+  const onFiles = async (files) => {
+    if (!empKey || !files || !files.length) return;
+    setBusy(true);
+    try {
+      for (const file of Array.from(files)) {
+        const up = await uploadFile(file, `driver_shared_docs/${empKey}`);
+        await addDoc(collection(db, "driver_shared_docs"), {
+          employeeId: empKey,
+          driverName: driverName || "",
+          label: (label.trim() || file.name),
+          name: up.name, type: up.type, url: up.url, path: up.path,
+          uploadedAt: Date.now(),
+        });
+      }
+      setLabel("");
+      if (fileRef.current) fileRef.current.value = "";
+      await load();
+    } catch (e) { console.error("shared doc upload failed:", e); alert("Upload failed — try again."); }
+    setBusy(false);
+  };
+
+  const remove = async (d) => {
+    if (!window.confirm(`Remove "${d.label}" from this driver's app? This deletes the file.`)) return;
+    setBusy(true);
+    try {
+      if (d.path) { try { await deleteObject(storageRef(storage, d.path)); } catch {} }
+      await deleteDoc(doc(db, "driver_shared_docs", d.id));
+      setDocs(ds => ds.filter(x => x.id !== d.id));
+    } catch (e) { console.error("shared doc delete failed:", e); alert("Could not remove — try again."); }
+    setBusy(false);
+  };
+
+  return <div style={{ marginTop: 10, padding: 12, background: T.bg, borderRadius: 8, border: `1px solid ${T.border}` }}>
+    <div style={{ fontSize: 11, fontWeight: 700, color: T.green, marginBottom: 2 }}>📤 Documents Shared With This Driver</div>
+    <div style={{ fontSize: 10, color: T.muted, marginBottom: 8 }}>
+      The driver sees these read-only in their timesheet app (e.g. to show at customs). They can view &amp; download, not edit or delete.
+    </div>
+
+    {!empKey ? (
+      <div style={{ fontSize: 11, color: T.amber, background: T.amberDim, border: `1px solid ${T.amber}`, borderRadius: 6, padding: "8px 10px" }}>
+        Set this person's <strong>Employee ID</strong> (in Portal Access above) and save first — shared documents are tied to it so the right driver sees them.
+      </div>
+    ) : <>
+      <input value={label} onChange={e => setLabel(e.target.value)} placeholder="Label (e.g. Drug screen — Aug 2026)"
+        style={{ width: "100%", boxSizing: "border-box", background: T.surface, border: `1px solid ${T.border}`, borderRadius: 6, color: T.text, fontSize: 12, padding: "7px 10px", fontFamily: "inherit", outline: "none", marginBottom: 4 }} />
+      <div style={{ fontSize: 9, color: T.dim, marginBottom: 6 }}>Tip: set the label before dropping the file; blank uses the filename.</div>
+      <DropZone label="Share a document" uploading={busy} docKey="__shared__" fileRef={fileRef} onFiles={onFiles} />
+
+      {loading ? <div style={{ fontSize: 11, color: T.muted }}>Loading…</div>
+        : docs.length === 0 ? <div style={{ fontSize: 11, color: T.dim, fontStyle: "italic" }}>Nothing shared with this driver yet.</div>
+        : docs.map(d => <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", background: T.hover, borderRadius: 5, marginBottom: 4 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 12, color: T.text, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.label}</div>
+              <div style={{ fontSize: 10, color: T.muted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{d.name}</div>
+            </div>
+            <a href={d.url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: T.blue, textDecoration: "none", whiteSpace: "nowrap" }}>View</a>
+            <button onClick={() => remove(d)} disabled={busy} style={{ fontSize: 11, color: T.red, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", whiteSpace: "nowrap" }}>Remove</button>
+          </div>)}
+    </>}
+  </div>;
+}
+
 // ═══ DROP ZONE (drag & drop + click button) ═══
 function DropZone({label, uploading, docKey, fileRef, onFiles}) {
   const [dragging, setDragging] = useState(false);
@@ -3815,6 +4639,337 @@ function DropZone({label, uploading, docKey, fileRef, onFiles}) {
   </div>;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// BUILT-IN CERT CONFIG — makes the hardcoded certifications renamable and lets
+// their behaviour mode be changed from Admin, live, without a code change.
+//
+// AdminPage writes settings/certConfig { certs: { <k>: {label?, mode?, months?} } }.
+// Only overridden certs appear in that doc; anything absent uses the default
+// below. Three modes map onto the existing {months, direct} engine:
+//   "complete" → months:0, direct:false   (date recorded, never expires)
+//   "window"   → months:N, direct:false   (expiry = completion + N months)
+//   "direct"   → direct:true              (the stored date IS the expiry)
+// Everything downstream (form, badges, reports, digest) reads the merged shape,
+// so a rename or a window change recomputes everywhere at once.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The immutable defaults. `k` is the Firestore field on each person record;
+// docKey holds its uploaded documents. These never change — overrides layer on.
+const CERT_DEFAULTS = [
+  { k: "acrDate",       l: "ACR Training",           months: 12, docKey: "acrDocs" },
+  { k: "hazmatDate",    l: "HazMat Training",        months: 36, docKey: "hazmatDocs" },
+  { k: "crimDate",      l: "Criminal Record Check",  months: 60, docKey: "crimDocs" },
+  { k: "bgDate",        l: "Background Verification", months: 0, docKey: "bgDocs" },
+  { k: "conductDate",   l: "Code of Conduct",        months: 0, docKey: "conductDocs" },
+  { k: "licenseExpiry", l: "Driver's Licence",       direct: true, docKey: "licenseDocs" },
+];
+
+// Translate a stored mode + months into the {months, direct} the engine wants.
+function certModeToShape(mode, months) {
+  if (mode === "direct")   return { direct: true, months: 0 };
+  if (mode === "complete") return { direct: false, months: 0 };
+  if (mode === "window")   return { direct: false, months: Number(months) || 12 };
+  return null; // unknown → caller keeps the default
+}
+// Report a cert's current mode from its default shape (for the Admin UI's
+// starting value when no override exists yet).
+function certShapeToMode(def) {
+  if (def.direct) return "direct";
+  if (Number(def.months) > 0) return "window";
+  return "complete";
+}
+
+// Merge settings/certConfig over CERT_DEFAULTS → the effective cert list.
+function mergeCerts(config) {
+  const over = (config && config.certs) || {};
+  return CERT_DEFAULTS.map(def => {
+    const o = over[def.k];
+    if (!o) return { ...def };
+    const merged = { ...def };
+    if (o.label && String(o.label).trim()) merged.l = String(o.label).trim();
+    const shape = o.mode ? certModeToShape(o.mode, o.months) : null;
+    if (shape) { merged.direct = shape.direct; merged.months = shape.months; }
+    return merged;
+  });
+}
+
+// Live subscription to certConfig, returning the merged effective cert list.
+// Returns CERT_DEFAULTS until the first snapshot lands.
+function useCerts() {
+  const [config, setConfig] = useState(null);
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "settings", "certConfig"),
+      snap => setConfig(snap.exists() ? snap.data() : { certs: {} }),
+      err => { console.warn("certConfig load failed:", err); });
+    return () => unsub();
+  }, []);
+  return useMemo(() => mergeCerts(config), [config]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BUILT-IN FIELD LAYOUT — rename or remove (hide) the standard fields on the
+// person and equipment forms, from Admin, live. Writes settings/fieldLayout
+// { fields: { <key>: {label?, hidden?} } }. Only overridden keys appear.
+//
+// Load-bearing fields (name, phone, email, unit, pin) can be renamed but never
+// hidden — hiding them would break duplicate detection, login, or equipment
+// sorting. FIELD_PROTECTED enforces that on the read side too, so even a
+// hand-edited config can't hide them.
+// ═══════════════════════════════════════════════════════════════════════════
+const FIELD_PROTECTED = new Set(["name", "phone", "email", "unit", "pin"]);
+
+// Default labels for every renamable/hideable built-in field, by key.
+const FIELD_DEFAULTS = {
+  // People
+  name: "Full Name", phone: "Phone", email: "Email",
+  contactPerson: "Contact Person", serviceType: "Service Type",
+  license: "License Class", notes: "Internal Notes", address: "Address",
+  // Equipment
+  unit: "Unit #", plate: "Plate #", year: "Year", make: "Make",
+  model: "Model", type: "Type", vin: "VIN", safetyExp: "Safety Expiration",
+};
+
+// Live subscription to the field layout. Returns { fields: {...} }.
+function useFieldLayout() {
+  const [layout, setLayout] = useState({ fields: {} });
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "settings", "fieldLayout"),
+      snap => setLayout(snap.exists() ? (snap.data() || { fields: {} }) : { fields: {} }),
+      err => { console.warn("fieldLayout load failed:", err); });
+    return () => unsub();
+  }, []);
+  return layout;
+}
+
+// Effective label for a field key given the layout (falls back to default).
+function fieldLabel(layout, key) {
+  const o = (layout && layout.fields && layout.fields[key]) || {};
+  return (o.label && String(o.label).trim()) || FIELD_DEFAULTS[key] || key;
+}
+// Is a field hidden? Protected keys can never be hidden regardless of config.
+function fieldHidden(layout, key) {
+  if (FIELD_PROTECTED.has(key)) return false;
+  const o = (layout && layout.fields && layout.fields[key]) || {};
+  return !!o.hidden;
+}
+// Module-level (non-hook) readers for the report code, kept live by a
+// subscription the same way RPT_CERTS is. Reports run on a click, well after
+// the first snapshot, so a mutable module variable is correct here.
+let FIELD_LAYOUT_LIVE = { fields: {} };
+try {
+  onSnapshot(doc(db, "settings", "fieldLayout"),
+    snap => { FIELD_LAYOUT_LIVE = snap.exists() ? (snap.data() || { fields: {} }) : { fields: {} }; },
+    err => { console.warn("fieldLayout (reports) load failed:", err); });
+} catch (e) { console.warn("fieldLayout subscription skipped:", e); }
+function rptFieldLabel(key) { return fieldLabel(FIELD_LAYOUT_LIVE, key); }
+function rptFieldHidden(key) { return fieldHidden(FIELD_LAYOUT_LIVE, key); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CUSTOM FIELDS — consumption layer for definitions authored in AdminPage.jsx
+//
+// AdminPage writes settings/customFields { fields:[ {id,label,targets,kind,
+// docs,alert,alertDays}, ... ] }. Everything below READS those defs and makes
+// them show up on forms, on reports, and (server side, separately) in alerts.
+//
+// A field's value lives on the record under its own id (e.g. driver.cf_abc123).
+// If docs are enabled, uploads live under `${id}Docs`, matching the acrDocs
+// convention already used for built-in certs.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Load the custom-field defs once and keep them fresh in real time, so a field
+// added in Admin appears on forms without a page reload. Returns [] until the
+// first snapshot arrives, so callers can render nothing meanwhile.
+function useCustomFields() {
+  const [defs, setDefs] = useState([]);
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "settings", "customFields"),
+      snap => setDefs(snap.exists() ? (snap.data().fields || []) : []),
+      err => { console.warn("customFields load failed:", err); });
+    return () => unsub();
+  }, []);
+  return defs;
+}
+
+// Named general-profile sections authored in AdminPage (settings/sections).
+// Each: { id, label, targets:[...] }. Fields reference a section by its id via
+// field.section; fields with no matching section fall into a default block.
+function useSections() {
+  const [secs, setSecs] = useState([]);
+  useEffect(() => {
+    const unsub = onSnapshot(doc(db, "settings", "sections"),
+      snap => setSecs(snap.exists() ? (snap.data().sections || []) : []),
+      err => { console.warn("sections load failed:", err); });
+    return () => unsub();
+  }, []);
+  return secs;
+}
+
+// Group a list of field defs into ordered named sections for one record type.
+// Returns [{ id, label, fields:[...] }]. Fields whose section is missing or not
+// applicable to this target collect under a trailing "Custom Fields" block, so
+// nothing an operator created before sections existed ever disappears.
+function groupBySection(fields, sections, target) {
+  const applicableSecs = (sections || []).filter(s => (s.targets || []).includes(target));
+  const byId = new Map(applicableSecs.map(s => [s.id, { id: s.id, label: s.label, fields: [] }]));
+  const loose = [];
+  (fields || []).forEach(f => {
+    const g = f.section && byId.get(f.section);
+    if (g) g.fields.push(f); else loose.push(f);
+  });
+  const out = applicableSecs.map(s => byId.get(s.id)).filter(g => g.fields.length);
+  if (loose.length) out.push({ id: "__loose", label: "Custom Fields", fields: loose });
+  return out;
+}
+
+// Fields for one or more targets, split by which form area they belong to.
+// Accepts a single target ("trucks") or a list (["drivers","employees"]) and
+// de-dupes so a driver+employee sees each field once.
+//   general: shown in the General Profile area (default block or a section)
+//   certs:   shown in the Certifications & Checks area
+// Backward-compat: older defs have no `area`. An expiry-kind field with no area
+// was previously shown in the certs block, so it maps to certs; everything else
+// maps to general.
+function cfForTarget(defs, target) {
+  const targets = Array.isArray(target) ? target : [target];
+  const seen = new Set();
+  const all = (defs || []).filter(f => {
+    if (!(f.targets || []).some(t => targets.includes(t))) return false;
+    if (seen.has(f.id)) return false;
+    seen.add(f.id); return true;
+  });
+  const areaOf = f => f.area || (f.kind === "expiry" ? "certs" : "general");
+  return {
+    all,
+    certs:   all.filter(f => areaOf(f) === "certs"),
+    general: all.filter(f => areaOf(f) === "general"),
+    // legacy aliases kept so existing call sites don't break
+    expiry:  all.filter(f => areaOf(f) === "certs"),
+    plain:   all.filter(f => areaOf(f) === "general"),
+  };
+}
+
+// Which custom-field targets apply to a person record (they can be both a
+// driver and an employee; suppliers are exclusive).
+function cfPersonTargets(p) {
+  if (p.isSupplier) return ["suppliers"];
+  const t = [];
+  if (p.isDriver !== false) t.push("drivers");
+  if (p.isEmployee) t.push("employees");
+  return t.length ? t : ["drivers"];
+}
+
+// Expiry helpers for custom expiry fields (the value IS the expiry date).
+function cfExpColor(dateStr) {
+  if (!dateStr) return null;
+  const diff = Math.floor((new Date(dateStr + "T12:00:00") - new Date()) / 864e5);
+  if (diff < 0) return "#ef4444";
+  if (diff <= 30) return "#eab308";
+  if (diff <= 90) return "#f97316";
+  return "#22c55e";
+}
+function cfExpLabel(dateStr) {
+  if (!dateStr) return "";
+  const diff = Math.floor((new Date(dateStr + "T12:00:00") - new Date()) / 864e5);
+  if (diff < 0) return "EXPIRED";
+  if (diff <= 90) return `${diff}d left`;
+  return "Valid";
+}
+
+// Renders the inputs for a set of custom field defs against a form object `fm`,
+// wiring changes back through setFm. Reuses the same DropZone as built-in docs.
+// `onFiles(files, docKey)` and `removeFile(docKey, idx)` are supplied by the
+// host component so uploads follow its existing storage-path convention.
+function CustomFieldInputs({ fieldDefs, fm, setFm, uploading, onFiles, removeFile, fileRefs, editing, saveBtn, plain }) {
+  if (!fieldDefs.length) return null;
+  return fieldDefs.map(f => {
+    const val = fm[f.id] ?? "";
+    const docs = fm[`${f.id}Docs`] || [];
+    // Plain mode: render as a normal built-in-style field (grey label, plain
+    // input, no card/blue label/"· custom"), so General Profile fields blend in
+    // with Name/Email/etc. Only used for simple text/number general fields.
+    if (plain) {
+      return (
+        <Field key={f.id} l={f.label}>
+          {f.kind === "number"
+            ? <input style={sIn} type="number" value={val} onChange={e => setFm(p => ({ ...p, [f.id]: e.target.value }))} />
+            : <input style={sIn} value={val} onChange={e => setFm(p => ({ ...p, [f.id]: e.target.value }))} />}
+        </Field>
+      );
+    }
+    return (
+      <div key={f.id} style={{ marginBottom: 6, padding: 12, background: T["bg"], borderRadius: 8, border: `1px solid ${T.border}` }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "#3b82f6", marginBottom: 6 }}>
+          {f.label}
+          <span style={{ fontSize: 9, color: T.dim, fontWeight: 400, marginLeft: 6 }}>· custom</span>
+        </div>
+        {f.kind === "text" &&
+          <input style={sIn} value={val} onChange={e => setFm(p => ({ ...p, [f.id]: e.target.value }))} />}
+        {f.kind === "number" &&
+          <input style={sIn} type="number" value={val} onChange={e => setFm(p => ({ ...p, [f.id]: e.target.value }))} />}
+        {(f.kind === "date" || f.kind === "expiry") &&
+          <div style={{ fontSize: 10, color: T.muted, textTransform: "uppercase", marginBottom: 3 }}>
+            {f.kind === "expiry" && f.certMode !== "window" ? "Expiration Date" : "Date Completed"}
+          </div>}
+        {(f.kind === "date" || f.kind === "expiry") &&
+          <DatePicker value={val} onChange={v => setFm(p => ({ ...p, [f.id]: v }))} placeholder="Select date..." />}
+        {/* Direct expiry: the value IS the expiry date. */}
+        {f.kind === "expiry" && f.certMode !== "window" && val &&
+          <div style={{ fontSize: 10, marginTop: 3, color: cfExpColor(val) || T.muted }}>
+            Expires: {fd(val)} — {cfExpLabel(val)}{f.alert ? ` · alerts on (${f.alertDays}d)` : ""}
+          </div>}
+        {/* Window: value is the completion date, expiry = completion + months. */}
+        {f.kind === "expiry" && f.certMode === "window" && val && (() => {
+          const exp = expDate(val, f.months || 12);
+          return <div style={{ fontSize: 10, marginTop: 3, color: cfExpColor(exp) || T.muted }}>
+            Completed {fd(val)} — Expires {fd(exp)} — Renewal every {f.months} months — {cfExpLabel(exp)}{f.alert ? " · alerts on" : ""}
+          </div>;
+        })()}
+        {f.kind === "date" && val &&
+          <div style={{ fontSize: 10, marginTop: 3, color: "#22c55e" }}>Completed on {fd(val)} — No renewal required</div>}
+        {f.docs && <>
+          <DropZone label="Document" uploading={uploading} docKey={`${f.id}Docs`}
+            fileRef={fileRefs?.[`${f.id}Docs`]} onFiles={files => onFiles(files, `${f.id}Docs`)} />
+          {docs.length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>
+            {docs.map((a, i) => (
+              <div key={i} style={{ padding: "2px 6px", background: T["bg"], borderRadius: 3, fontSize: 9, display: "flex", alignItems: "center", gap: 2 }}>
+                <a href={a.url || a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{ color: T.text, textDecoration: "none", display: "flex", alignItems: "center", gap: 2 }}><Ic n="dl" s={9} />{a.name}</a>
+                {editing && <button onClick={() => removeFile(`${f.id}Docs`, i)} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 11 }}>×</button>}
+              </div>
+            ))}
+          </div>}
+        </>}
+        {saveBtn}
+      </div>
+    );
+  });
+}
+
+// ─── Report helpers for custom fields ───
+// Render a custom field's value for reports (detail rows + flat table cells).
+function cfReportValue(f, rec) {
+  const v = rec[f.id];
+  if (v == null || v === "") {
+    return f.docs ? (rec[`${f.id}Docs`]?.length ? `${rec[`${f.id}Docs`].length} doc(s)` : "") : "";
+  }
+  if (f.kind === "expiry") {
+    // Window mode: value is the completion date; expiry = completion + months.
+    if (f.certMode === "window") {
+      const exp = expDate(v, f.months || 12);
+      return `${fd(v)} → ${fd(exp)} (${cfExpLabel(exp)})`;
+    }
+    const lbl = cfExpLabel(v);
+    return `${fd(v)}${lbl ? ` (${lbl})` : ""}`;
+  }
+  if (f.kind === "date") return fd(v);
+  return String(v);
+}
+// Column tuples [label, fn] for the custom fields targeting a given scope.
+function cfColsFor(defs, target) {
+  return (defs || [])
+    .filter(f => (f.targets || []).includes(target))
+    .map(f => [f.label, rec => cfReportValue(f, rec)]);
+}
+
 // ═══ DRIVERS PAGE (with certifications + expiry tracking) ═══
 function DriversPage({items, save, col}) {
   const [ed, setEd] = useState(null);
@@ -3827,20 +4982,30 @@ function DriversPage({items, save, col}) {
   const [certsOpen, setCertsOpen] = useState(false); // Certifications & Checks section collapsed by default
   const { confirm: cfm, modal: cfmModal } = useConfirm();
   const formRef = useRef(null);
-  // Refs keyed by docKey for reliable matching
-  const fileRefs = { acrDocs: useRef(), hazmatDocs: useRef(), crimDocs: useRef(), bgDocs: useRef(), conductDocs: useRef(), licenseDocs: useRef(), docs: useRef() };
+  const customDefs = useCustomFields();
+  // Refs keyed by docKey for reliable matching. Custom-field doc refs are added
+  // lazily via a Proxy-like getter so any cf_<id>Docs key resolves to a stable ref.
+  const cfRefStore = useRef({});
+  const fileRefs = useMemo(() => {
+    const base = { acrDocs: { current: null }, hazmatDocs: { current: null }, crimDocs: { current: null }, bgDocs: { current: null }, conductDocs: { current: null }, licenseDocs: { current: null }, docs: { current: null } };
+    return new Proxy(base, { get(t, k) {
+      if (k in t) return t[k];
+      if (typeof k === "string" && k.endsWith("Docs")) {
+        if (!cfRefStore.current[k]) cfRefStore.current[k] = { current: null };
+        return cfRefStore.current[k];
+      }
+      return undefined;
+    }});
+  }, []);
 
-  const CERTS = [
-    { k: "acrDate", l: "ACR Training", months: 12, docKey: "acrDocs" },
-    { k: "hazmatDate", l: "HazMat Training", months: 36, docKey: "hazmatDocs" },
-    { k: "crimDate", l: "Criminal Record Check", months: 60, docKey: "crimDocs" },
-    { k: "bgDate", l: "Background Verification", months: 0, docKey: "bgDocs" },
-    { k: "conductDate", l: "Code of Conduct", months: 0, docKey: "conductDocs" },
-    { k: "licenseExpiry", l: "Driver's Licence", direct: true, docKey: "licenseDocs" },
-  ];
+  const CERTS = useCerts();
+  const layout = useFieldLayout();
+  const sections = useSections();
+  const fL = k => fieldLabel(layout, k);
+  const fH = k => fieldHidden(layout, k);
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", conductDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", logRestricted:false, driverLog:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], conductDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", conductDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", certSnooze:{}, logRestricted:false, driverLog:false, archived:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], conductDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
     setCertsOpen(false);
     setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], conductDocs:item.conductDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
@@ -4048,6 +5213,8 @@ function DriversPage({items, save, col}) {
     const s = srch.toLowerCase();
     return ["name","phone","email","license"].some(k => (item[k] || "").toLowerCase().includes(s));
   }).filter(item => {
+    if (roleFilter === "archived") return item.archived === true;
+    if (item.archived === true) return false; // archived people hidden from all active chips
     if (roleFilter === "all") return true;
     if (roleFilter === "drivers") return item.isDriver !== false && !item.isSupplier;
     if (roleFilter === "employees") return item.isEmployee === true && !item.isSupplier;
@@ -4090,7 +5257,7 @@ function DriversPage({items, save, col}) {
 
     {/* Role filter */}
     <div style={{display:"flex",gap:4,marginBottom:12}}>
-      {[{k:"all",l:"All"},{k:"drivers",l:"Drivers"},{k:"employees",l:"Employees"},{k:"suppliers",l:"Suppliers"}].map(f=><button key={f.k} onClick={()=>setRoleFilter(f.k)} style={{padding:"4px 12px",borderRadius:5,border:`1px solid ${roleFilter===f.k?T.red:T.border}`,background:roleFilter===f.k?"rgba(220,38,38,0.08)":"transparent",color:roleFilter===f.k?T.red:T.muted,fontSize:10,cursor:"pointer",fontWeight:500,fontFamily:"inherit"}}>{f.l}</button>)}
+      {[{k:"all",l:"All"},{k:"drivers",l:"Drivers"},{k:"employees",l:"Employees"},{k:"suppliers",l:"Suppliers"},{k:"archived",l:"Archived"}].map(f=><button key={f.k} onClick={()=>setRoleFilter(f.k)} style={{padding:"4px 12px",borderRadius:5,border:`1px solid ${roleFilter===f.k?T.red:T.border}`,background:roleFilter===f.k?"rgba(220,38,38,0.08)":"transparent",color:roleFilter===f.k?T.red:T.muted,fontSize:10,cursor:"pointer",fontWeight:500,fontFamily:"inherit"}}>{f.l}</button>)}
     </div>
 
     {/* Expiry alerts */}
@@ -4105,7 +5272,8 @@ function DriversPage({items, save, col}) {
 
     {/* Edit / Add form */}
     {ed && <div ref={formRef} style={sCrd}>
-      <Field l="Full Name"><input style={sIn} value={fm.name || ""} onChange={e => setFm(p => ({ ...p, name: e.target.value }))} /></Field>
+      <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 10 }}>General Profile</div>
+      <Field l={fL("name")}><input style={sIn} value={fm.name || ""} onChange={e => setFm(p => ({ ...p, name: e.target.value }))} /></Field>
       <div style={{display:"flex",gap:16,marginBottom:10}}>
         <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",fontSize:12,color:T.text}}>
           <input type="checkbox" checked={fm.isDriver!==false} onChange={e=>setFm(p=>({...p,isDriver:e.target.checked}))} style={{accentColor:T.red}}/> Driver
@@ -4117,11 +5285,11 @@ function DriversPage({items, save, col}) {
           <input type="checkbox" checked={fm.isSupplier===true} onChange={e=>setFm(p=>({...p,isSupplier:e.target.checked}))} style={{accentColor:"#f97316"}}/> Supplier
         </label>
       </div>
-      <Field l="Phone"><input style={sIn} value={fm.phone || ""} onChange={e => setFm(p => ({ ...p, phone: normalizePhone(e.target.value) }))} /></Field>
-      <Field l="Email"><input style={sIn} value={fm.email || ""} onChange={e => setFm(p => ({ ...p, email: e.target.value }))} /></Field>
+      <Field l={fL("phone")}><input style={sIn} value={fm.phone || ""} onChange={e => setFm(p => ({ ...p, phone: normalizePhone(e.target.value) }))} /></Field>
+      <Field l={fL("email")}><input style={sIn} value={fm.email || ""} onChange={e => setFm(p => ({ ...p, email: e.target.value }))} /></Field>
       {fm.isSupplier && <>
-        <Field l="Contact Person"><input style={sIn} value={fm.contactPerson || ""} onChange={e => setFm(p => ({ ...p, contactPerson: e.target.value }))} placeholder="e.g. John Smith"/></Field>
-        <Field l="Service Type"><input style={sIn} value={fm.serviceType || ""} onChange={e => setFm(p => ({ ...p, serviceType: e.target.value }))} placeholder="e.g. Trucking, Customs Broker"/></Field>
+        {!fH("contactPerson") && <Field l={fL("contactPerson")}><input style={sIn} value={fm.contactPerson || ""} onChange={e => setFm(p => ({ ...p, contactPerson: e.target.value }))} placeholder="e.g. John Smith"/></Field>}
+        {!fH("serviceType") && <Field l={fL("serviceType")}><input style={sIn} value={fm.serviceType || ""} onChange={e => setFm(p => ({ ...p, serviceType: e.target.value }))} placeholder="e.g. Trucking, Customs Broker"/></Field>}
         <Field l="Street Address"><input style={sIn} value={fm.street || ""} onChange={e => setFm(p => ({ ...p, street: e.target.value }))} placeholder="e.g. 123 Main St"/></Field>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
           <Field l="City"><input style={sIn} value={fm.city || ""} onChange={e => setFm(p => ({ ...p, city: e.target.value }))} placeholder="e.g. Montreal"/></Field>
@@ -4132,8 +5300,34 @@ function DriversPage({items, save, col}) {
           <Field l="Country"><input style={sIn} value={fm.country || ""} onChange={e => setFm(p => ({ ...p, country: e.target.value }))} placeholder="e.g. Canada"/></Field>
         </div>
       </>}
-      {!fm.isSupplier && <Field l="License Class"><input style={sIn} value={fm.license || ""} onChange={e => setFm(p => ({ ...p, license: e.target.value }))} /></Field>}
-      <Field l="Internal Notes"><textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fm.notes || ""} onChange={e => setFm(p => ({ ...p, notes: e.target.value }))} /></Field>
+      {!fm.isSupplier && !fH("license") && <Field l={fL("license")}><input style={sIn} value={fm.license || ""} onChange={e => setFm(p => ({ ...p, license: e.target.value }))} /></Field>}
+      {!fH("notes") && <Field l={fL("notes")}><textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fm.notes || ""} onChange={e => setFm(p => ({ ...p, notes: e.target.value }))} /></Field>}
+
+      {/* General Profile custom fields. Fields you assigned to a named section
+          render under that section's header. Fields with no section blend
+          straight into General Profile — no "Custom Fields" sub-header — since
+          you already chose General Profile when creating them. */}
+      {(() => {
+        const grp = cfForTarget(customDefs, cfPersonTargets(fm));
+        const here = grp.general;
+        if (!here.length) return null;
+        const primaryTarget = fm.isSupplier ? "suppliers" : (fm.isEmployee && fm.isDriver === false ? "employees" : "drivers");
+        const groups = groupBySection(here, sections, primaryTarget);
+        return groups.map(g => {
+          const loose = g.id === "__loose";
+          const inputs = <CustomFieldInputs fieldDefs={g.fields} fm={fm} setFm={setFm} uploading={uploading}
+            onFiles={addFile} removeFile={removeFile} fileRefs={fileRefs} editing={ed} plain />;
+          // Loose (unassigned) fields: no header, no divider — part of General Profile.
+          if (loose) return <div key={g.id}>{inputs}</div>;
+          // Named section: its own headed block.
+          return (
+            <div key={g.id} style={{ borderTop: `1px solid ${T.border}`, marginTop: 4, paddingTop: 12, marginBottom: 4 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>{g.label}</div>
+              {inputs}
+            </div>
+          );
+        });
+      })()}
 
       {!fm.isSupplier && <>
       {/* Driver App Access */}
@@ -4161,35 +5355,42 @@ function DriversPage({items, save, col}) {
                   <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Hourly Rate</span>
             <span style={{fontSize:12,color:T.muted}}>$</span>
-            <input type="number" min="0" step="0.25" value={fm.payCfg?.hourly||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",hourly:e.target.value}}))}
+            <input type="number" min="0" step="0.25" value={fm.payCfg?.hourly||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",hourly:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
               style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
             <span style={{fontSize:12,color:T.muted}}>/h</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Working Day Rate</span>
             <span style={{fontSize:12,color:T.muted}}>$</span>
-            <input type="number" min="0" step="1" value={fm.payCfg?.workDay||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",workDay:e.target.value}}))}
+            <input type="number" min="0" step="1" value={fm.payCfg?.workDay||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",workDay:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
               style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
             <span style={{fontSize:12,color:T.muted}}>/day</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Non-Working Day Rate</span>
             <span style={{fontSize:12,color:T.muted}}>$</span>
-            <input type="number" min="0" step="1" value={fm.payCfg?.nonWorkDay||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",nonWorkDay:e.target.value}}))}
+            <input type="number" min="0" step="1" value={fm.payCfg?.nonWorkDay||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",nonWorkDay:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
+              style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
+            <span style={{fontSize:12,color:T.muted}}>/day</span>
+          </div>
+          <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
+            <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Traveling Day Rate</span>
+            <span style={{fontSize:12,color:T.muted}}>$</span>
+            <input type="number" min="0" step="1" value={fm.payCfg?.travelDay||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",travelDay:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
               style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
             <span style={{fontSize:12,color:T.muted}}>/day</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Per Diem</span>
             <span style={{fontSize:12,color:T.muted}}>$</span>
-            <input type="number" min="0" step="1" value={fm.payCfg?.perDiem||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",perDiem:e.target.value}}))}
+            <input type="number" min="0" step="1" value={fm.payCfg?.perDiem||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",perDiem:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
               style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
             <span style={{fontSize:12,color:T.muted}}>/day</span>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
             <span style={{fontSize:11,color:T.muted,width:160,flexShrink:0}}>Trip Rate</span>
             <span style={{fontSize:12,color:T.muted}}>$</span>
-            <input type="number" min="0" step="1" value={fm.payCfg?.tripRate||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",tripRate:e.target.value}}))}
+            <input type="number" min="0" step="1" value={fm.payCfg?.tripRate||""} onChange={e=>setFm(p=>({...p,payCfg:{...(p.payCfg||{}),type:"mixed",tripRate:e.target.value===""?"":(parseFloat(e.target.value)||0)}}))}
               style={{...sIn,width:100,padding:"5px 8px",fontSize:12}} placeholder="0.00"/>
             <span style={{fontSize:12,color:T.muted}}>/trip</span>
           </div>
@@ -4302,23 +5503,80 @@ function DriversPage({items, save, col}) {
               {fm[c.k] && !c.direct && c.months === 0 && <div style={{ fontSize: 10, marginTop: 3, color: "#22c55e" }}>
                 Completed on {fd(fm[c.k])} — No renewal required
               </div>}
+              {(() => {
+                const snz = (fm.certSnooze || {})[c.k] || "";
+                const active = snz && todayIso <= snz;
+                const setSnz = v => setFm(p => {
+                  const next = { ...(p.certSnooze || {}) };
+                  if (v) next[c.k] = v; else delete next[c.k];
+                  return { ...p, certSnooze: next };
+                });
+                return <div style={{ marginTop: 8, paddingTop: 8, borderTop: `1px dashed ${T.border}` }}>
+                  {active ? <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 10, padding: "2px 8px", borderRadius: 10, background: "rgba(245,158,11,0.12)", color: "#f59e0b", border: "1px solid #f59e0b", fontWeight: 600 }}>
+                      🔕 Reminders snoozed — resume {fd(snz)}
+                    </span>
+                    <button type="button" style={{ ...bS, padding: "4px 10px", fontSize: 10 }} onClick={() => setSnz("")}>Resume now</button>
+                  </div> : <div>
+                    <div style={{ fontSize: 10, color: T.muted, marginBottom: 4 }}>Snooze this reminder until (other certs keep alerting):</div>
+                    <div style={{ maxWidth: 200 }}>
+                      <DatePicker value={snz} onChange={setSnz} placeholder="Pick a resume date..." />
+                    </div>
+                  </div>}
+                </div>;
+              })()}
             </Field>
             <DropZone label="Certificate / Document" uploading={uploading} docKey={c.docKey} fileRef={fileRefs[c.docKey]} onFiles={files => addFile(files, c.docKey)} />
             {(fm[c.docKey] || []).length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>{fm[c.docKey].map((a, i) => docChip(c.docKey, i, a))}</div>}
             <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : `Save ${c.l}`}</button>
           </div>
         ))}
+        {/* Custom expiry fields for this person type live alongside the built-in
+            certs so they share the same expiry look and the alert opt-in. */}
+        <CustomFieldInputs
+          fieldDefs={cfForTarget(customDefs, cfPersonTargets(fm)).expiry}
+          fm={fm} setFm={setFm} uploading={uploading} onFiles={addFile} removeFile={removeFile}
+          fileRefs={fileRefs} editing={ed}
+          saveBtn={<button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : "Save"}</button>} />
+
+        {/* Other Documents — general, non-cert docs (moved inside the collapse) */}
+        <div style={{ marginTop: 10, padding: 12, background: T["bg"], borderRadius: 8, border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#3b82f6", marginBottom: 6 }}>Other Documents</div>
+          <DropZone label="Documents" uploading={uploading} docKey="docs" fileRef={fileRefs.docs} onFiles={files => addFile(files, "docs")} />
+          {(fm.docs || []).length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>{fm.docs.map((a, i) => docChip("docs", i, a))}</div>}
+          <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : "Save Documents"}</button>
+        </div>
+
+        {/* Company → driver shared docs (read-only in the timesheet app) */}
+        <SharedDocsSection employeeId={fm.employeeId} driverName={fm.name} />
         </>}
       </div>
       </>}
 
-      {/* General docs */}
-      <div style={{ marginTop: 10, padding: 12, background: T["bg"], borderRadius: 8, border: `1px solid ${T.border}` }}>
-        <div style={{ fontSize: 11, fontWeight: 700, color: "#3b82f6", marginBottom: 6 }}>Other Documents</div>
-        <DropZone label="Documents" uploading={uploading} docKey="docs" fileRef={fileRefs.docs} onFiles={files => addFile(files, "docs")} />
-        {(fm.docs || []).length > 0 && <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 4 }}>{fm.docs.map((a, i) => docChip("docs", i, a))}</div>}
-        <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : "Save Documents"}</button>
-      </div>
+      {/* Suppliers get an (empty for now) Certifications & Checks section too,
+          so custom certs can be added here in a later step. Same collapsible
+          look as drivers/employees. */}
+      {fm.isSupplier && <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
+        <div onClick={() => setCertsOpen(o => !o)} style={{ display: "flex", alignItems: "center",
+          gap: 8, cursor: "pointer", userSelect: "none", marginBottom: certsOpen ? 8 : 0,
+          padding: "6px 8px", borderRadius: 6, background: certsOpen ? "transparent" : T["bg"],
+          border: `1px solid ${certsOpen ? "transparent" : T.border}` }}>
+          <span style={{ fontSize: 11, color: T.muted, transform: certsOpen ? "rotate(90deg)" : "none",
+            transition: "transform .15s", display: "inline-block" }}>▶</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase" }}>Certifications & Checks</span>
+        </div>
+        {certsOpen && (() => {
+          const certFields = cfForTarget(customDefs, "suppliers").certs;
+          if (!certFields.length) return <div style={{ fontSize: 11, color: T.dim, padding: "8px 8px 4px" }}>
+            No certifications set up for suppliers yet. Add one from Admin → Add a Field.
+          </div>;
+          return <CustomFieldInputs fieldDefs={certFields} fm={fm} setFm={setFm} uploading={uploading}
+            onFiles={addFile} removeFile={removeFile} fileRefs={fileRefs} editing={ed}
+            saveBtn={<button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>{saving ? "Saving..." : "Save"}</button>} />;
+        })()}
+      </div>}
+
+      {/* General docs + shared docs moved into the collapsible Certifications & Checks section above */}
 
       <div style={{ display: "flex", gap: 8, marginTop: 12 }}><button style={{...bP, padding:"8px 20px"}} disabled={saving} onClick={doSaveAll}>{saving ? "Saving..." : "Save All & Close"}</button><button style={bS} onClick={() => setEd(null)}>Cancel</button></div>
     </div>}
@@ -4331,6 +5589,7 @@ function DriversPage({items, save, col}) {
           <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
             {item.name || "—"}
             <span style={{marginLeft:8}}>
+              {item.archived === true && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"rgba(148,163,184,0.15)",color:"#94a3b8",border:"1px solid #94a3b8",marginRight:3,fontWeight:600}}>📦 Archived</span>}
               {item.isSupplier && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#f9731618",color:"#f97316",border:"1px solid #f97316",marginRight:3,fontWeight:600}}>Supplier</span>}
               {!item.isSupplier && item.isDriver!==false && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#3b82f618",color:"#3b82f6",border:"1px solid #3b82f6",marginRight:3,fontWeight:600}}>Driver</span>}
               {!item.isSupplier && item.isEmployee && <span style={{fontSize:9,padding:"1px 6px",borderRadius:10,background:"#8b5cf618",color:"#8b5cf6",border:"1px solid #8b5cf6",fontWeight:600,marginRight:3}}>Employee</span>}
@@ -4362,6 +5621,7 @@ function DriversPage({items, save, col}) {
                 if(cfg.hourly) parts.push("$"+parseFloat(cfg.hourly).toFixed(2)+"/h");
                 if(cfg.workDay) parts.push("$"+parseFloat(cfg.workDay).toFixed(0)+"/day");
                 if(cfg.nonWorkDay) parts.push("$"+parseFloat(cfg.nonWorkDay).toFixed(0)+"/NW");
+                if(cfg.travelDay) parts.push("$"+parseFloat(cfg.travelDay).toFixed(0)+"/travel");
                 if(cfg.perDiem) parts.push("$"+parseFloat(cfg.perDiem).toFixed(0)+" diem");
                 if(cfg.tripRate) parts.push("$"+parseFloat(cfg.tripRate).toFixed(0)+"/trip");
                 return parts.length ? parts.join(" · ") : "Configured";
@@ -4373,11 +5633,14 @@ function DriversPage({items, save, col}) {
               const ec = expColor(item[c.k], c.months, c.direct);
               const el = expLabel(item[c.k], c.months, c.direct);
               const shortLabel = c.l.replace(" Training", "").replace(" Check", "").replace(" Verification", "");
+              const snz = (item.certSnooze || {})[c.k] || "";
+              const snoozed = snz && todayIso <= snz;
               return <div key={c.k} style={{ fontSize: 10, padding: "3px 8px", borderRadius: 6, background: ec ? ec + "18" : Tbg, color: ec || T.dim, border: `1px solid ${ec || T.border}` }}>
                 {shortLabel}: {item[c.k] ? ((c.direct || c.months > 0)
                   ? <><span style={{ fontWeight: 700 }}>{el}</span> <span style={{ color: T.muted }}>({fd(expDate(item[c.k], c.months, c.direct))})</span></>
                   : <><span style={{ fontWeight: 700 }}>Done</span> <span style={{ color: T.muted }}>({fd(item[c.k])})</span></>
                 ) : <span style={{ color: T.dim }}>Not set</span>}
+                {snoozed && <span title={`Reminders snoozed until ${fd(snz)}`} style={{ marginLeft: 4 }}>🔕</span>}
               </div>;
             })}
           </div>}
@@ -4395,8 +5658,28 @@ function DriversPage({items, save, col}) {
               <a key={i} href={a.url || a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{ padding: "2px 6px", background: T["bg"], borderRadius: 3, fontSize: 9, display: "flex", alignItems: "center", gap: 2, color: T.text, textDecoration: "none" }}><Ic n="dl" s={9} />{a.name}</a>
             ))}</div>
           </div>}
+          {/* Custom-field documents (view/download only on the card) */}
+          {cfForTarget(customDefs, cfPersonTargets(item)).all.filter(f=>f.docs&&(item[`${f.id}Docs`]||[]).length>0).map(f=>(
+            <div key={f.id} style={{ marginTop: 4 }}>
+              <div style={{ fontSize: 9, color: T.muted }}>{f.label} ({(item[`${f.id}Docs`]||[]).length}):</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>{(item[`${f.id}Docs`]||[]).map((a, i) => (
+                <a key={i} href={a.url || a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{ padding: "2px 6px", background: T["bg"], borderRadius: 3, fontSize: 9, display: "flex", alignItems: "center", gap: 2, color: T.text, textDecoration: "none" }}><Ic n="dl" s={9} />{a.name}</a>
+              ))}</div>
+            </div>
+          ))}
 
           <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 8, marginTop: 12, paddingTop: 8, borderTop: `1px solid ${T.border}` }}>
+            {item.archived === true ? (
+              <button style={{ ...bS, padding: "6px 18px", fontSize: 11 }} onClick={async () => {
+                await writeDriver(item.id, { archived: false });
+              }}>♻️ Restore</button>
+            ) : (
+              <button style={{ ...bS, padding: "6px 18px", fontSize: 11 }} onClick={async () => {
+                const ok = await cfm("Archive", `Archive ${item.name||"this person"}?\n\nThey'll be hidden from the active list and roster reports, but all their information and timesheet history is kept. You can restore them anytime from the Archived tab.`, { confirmLabel: "Archive", confirmColor: "#f59e0b" });
+                if(!ok) return;
+                await writeDriver(item.id, { archived: true });
+              }}>📦 Archive</button>
+            )}
             <button style={{ ...bS, padding: "6px 18px", fontSize: 11 }} onClick={() => startEdit(item)}>✏️ Edit</button>
             <button style={{ ...bD, padding: "6px 18px", fontSize: 11 }} onClick={async () => {
               const ok = await cfm("Delete Employee", `Are you sure you want to permanently delete ${item.name||"this employee"}?\n\nThis will remove their profile and all uploaded certificates. This cannot be undone.`);
@@ -4411,6 +5694,211 @@ function DriversPage({items, save, col}) {
 }
 
 // ═══ EQUIPMENT PAGE ═══
+
+// ═══ MAINTENANCE & REPAIRS ═══
+// Tracks repair/maintenance records per equipment unit (maintenance collection):
+// { unitId, unitType, unitLabel, date, description, cost, vendor, invoiceNum }.
+// Provides a fleet spend report (time-windowed) and a per-unit repair history.
+function MaintenancePage({ db: data }) {
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [sel, setSel] = useState(null);          // selected unit for drill-in
+  const [win, setWin] = useState("12mo");        // 30d | 6mo | 12mo | all | custom
+  const [fleetSearch, setFleetSearch] = useState("");
+  const [hideEmpty, setHideEmpty] = useState(true);  // collapse units with no records
+  const [collapsedGroups, setCollapsedGroups] = useState({});  // "truck"/"trailer" collapsed?
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [editRec, setEditRec] = useState(null);  // record being added/edited
+  const [saving, setSaving] = useState(false);
+  const { confirm: cfm, modal: cfmModal } = useConfirm();
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const snap = await getDocs(collection(db, "maintenance"));
+      setRecords(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    } catch (e) { console.error("maintenance load failed:", e); }
+    setLoading(false);
+  };
+  useEffect(() => { load(); }, []);
+
+  // All units (trucks + trailers), non-archived, for the fleet list + picker.
+  const units = [
+    ...(data.trucks || []).filter(t => t.archived !== true).map(t => ({ id: t.id, type: "truck", label: t.unit || t.plate || "Truck", sub: [t.year, t.make, t.model].filter(Boolean).join(" ") })),
+    ...(data.trailers || []).filter(t => t.archived !== true).map(t => ({ id: t.id, type: "trailer", label: t.unit || t.plate || "Trailer", sub: [t.year, t.make, t.model].filter(Boolean).join(" ") })),
+  ];
+
+  // Date window → cutoff (or null for all-time / custom handled separately).
+  const inWindow = (dateStr) => {
+    if (!dateStr) return false;
+    const d = new Date(dateStr + "T12:00:00");
+    if (win === "all") return true;
+    if (win === "custom") {
+      if (customFrom && d < new Date(customFrom + "T00:00:00")) return false;
+      if (customTo && d > new Date(customTo + "T23:59:59")) return false;
+      return true;
+    }
+    const days = win === "30d" ? 30 : win === "6mo" ? 182 : 365;
+    return d >= new Date(Date.now() - days * 86400000);
+  };
+
+  const unitSpend = (unitId) => records.filter(r => r.unitId === unitId && inWindow(r.date)).reduce((s, r) => s + (parseFloat(r.cost) || 0), 0);
+  const unitCount = (unitId) => records.filter(r => r.unitId === unitId && inWindow(r.date)).length;
+  const fleetTotal = units.reduce((s, u) => s + unitSpend(u.id), 0);
+
+  const winLabel = { "30d": "Last 30 days", "6mo": "Last 6 months", "12mo": "Last 12 months", "all": "All time", "custom": "Custom range" }[win];
+
+  const saveRec = async () => {
+    if (saving) return;
+    const r = editRec;
+    if (!r.date || !(parseFloat(r.cost) > 0)) { alert("Please enter at least a date and a cost."); return; }
+    setSaving(true);
+    try {
+      const unit = units.find(u => u.id === r.unitId) || {};
+      const payload = { unitId: r.unitId, unitType: unit.type || r.unitType || "", unitLabel: unit.label || r.unitLabel || "", date: r.date, description: r.description || "", cost: parseFloat(r.cost) || 0, vendor: r.vendor || "", invoiceNum: r.invoiceNum || "", updatedAt: Date.now() };
+      if (r.id) { await updateDoc(doc(db, "maintenance", r.id), payload); setRecords(rs => rs.map(x => x.id === r.id ? { ...x, ...payload } : x)); }
+      else { payload.createdAt = Date.now(); const ref = await addDoc(collection(db, "maintenance"), payload); setRecords(rs => [{ id: ref.id, ...payload }, ...rs]); }
+      setEditRec(null);
+    } catch (e) { console.error("save maintenance failed:", e); alert("Couldn't save. " + (e.code || e.message || "")); }
+    setSaving(false);
+  };
+
+  const delRec = async (id) => {
+    if (!(await cfm("Delete record", "Delete this maintenance record? This can't be undone.", { confirmLabel: "Delete", confirmColor: T.red }))) return;
+    try { await deleteDoc(doc(db, "maintenance", id)); setRecords(rs => rs.filter(x => x.id !== id)); }
+    catch (e) { console.error("delete maintenance failed:", e); }
+  };
+
+  const winButtons = <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+    {[["30d", "30 days"], ["6mo", "6 months"], ["12mo", "12 months"], ["all", "All time"], ["custom", "Custom"]].map(([k, l]) =>
+      <button key={k} onClick={() => setWin(k)} style={{ padding: "5px 12px", borderRadius: 6, border: `1px solid ${win === k ? T.red : T.border}`, background: win === k ? "rgba(220,38,38,0.08)" : "transparent", color: win === k ? T.red : T.muted, fontSize: 11, cursor: "pointer", fontWeight: 600, fontFamily: "inherit" }}>{l}</button>)}
+    {win === "custom" && <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      <input type="date" value={customFrom} onChange={e => setCustomFrom(e.target.value)} style={{ ...sIn, width: "auto", fontSize: 11, padding: "5px 8px" }} />
+      <span style={{ color: T.muted, fontSize: 11 }}>to</span>
+      <input type="date" value={customTo} onChange={e => setCustomTo(e.target.value)} style={{ ...sIn, width: "auto", fontSize: 11, padding: "5px 8px" }} />
+    </span>}
+  </div>;
+
+  // ── Add/Edit record modal ──
+  const recModal = editRec && <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }} onClick={e => { if (e.target === e.currentTarget) setEditRec(null); }}>
+    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: 20, width: 460, maxWidth: "100%" }}>
+      <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 14 }}>{editRec.id ? "Edit" : "Add"} Maintenance Record</div>
+      <div style={{ marginBottom: 10 }}>
+        <label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Unit</label>
+        <SearchSelect
+          options={units.map(u => ({ value: u.id, label: `${u.label} (${u.type})`, sub: u.sub }))}
+          value={editRec.unitId || ""}
+          emptyLabel="Select unit..."
+          placeholder="Type unit #, make or model..."
+          onChange={id => setEditRec(p => ({ ...p, unitId: id }))}
+        />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+        <div><label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Date</label><DatePicker value={editRec.date || ""} onChange={v => setEditRec(p => ({ ...p, date: v }))} placeholder="Select date..." /></div>
+        <div><label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Cost ($)</label><input type="number" step="0.01" style={sIn} value={editRec.cost || ""} onChange={e => setEditRec(p => ({ ...p, cost: e.target.value }))} placeholder="0.00" /></div>
+      </div>
+      <div style={{ marginBottom: 10 }}><label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Description</label><input style={sIn} value={editRec.description || ""} onChange={e => setEditRec(p => ({ ...p, description: e.target.value }))} placeholder="e.g. Brake job, oil change, tire replacement" /></div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 16 }}>
+        <div><label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Vendor</label><input style={sIn} value={editRec.vendor || ""} onChange={e => setEditRec(p => ({ ...p, vendor: e.target.value }))} placeholder="Shop / supplier" /></div>
+        <div><label style={{ fontSize: 11, color: T.muted, display: "block", marginBottom: 4 }}>Invoice #</label><input style={sIn} value={editRec.invoiceNum || ""} onChange={e => setEditRec(p => ({ ...p, invoiceNum: e.target.value }))} placeholder="Invoice number" /></div>
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button style={{ ...sBtn, background: T.red }} disabled={saving} onClick={saveRec}>{saving ? "Saving…" : "Save Record"}</button>
+        <button style={{ ...sBtn, background: T.surface, color: T.muted }} onClick={() => setEditRec(null)}>Cancel</button>
+      </div>
+    </div>
+  </div>;
+
+  // ── Per-unit drill-in view ──
+  if (sel) {
+    const unit = units.find(u => u.id === sel) || {};
+    const unitRecs = records.filter(r => r.unitId === sel).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    const shown = unitRecs.filter(r => inWindow(r.date));
+    const total = shown.reduce((s, r) => s + (parseFloat(r.cost) || 0), 0);
+    return <div>
+      {cfmModal}{recModal}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <button style={{ ...sBtn, background: T.surface, color: T.muted }} onClick={() => setSel(null)}>← Fleet</button>
+        <div style={{ fontSize: 17, fontWeight: 700 }}>{unit.label} <span style={{ fontSize: 12, color: T.muted, fontWeight: 400 }}>({unit.type}){unit.sub ? ` · ${unit.sub}` : ""}</span></div>
+        <button style={{ ...sBtn, background: T.red, marginLeft: "auto" }} onClick={() => setEditRec({ unitId: sel, date: new Date().toLocaleDateString("en-CA") })}>+ Add Record</button>
+      </div>
+      {winButtons}
+      <div style={{ background: "rgba(220,38,38,0.06)", border: `1px solid ${T.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
+        <div style={{ fontSize: 11, color: T.muted, textTransform: "uppercase" }}>{winLabel} — Total Spend</div>
+        <div style={{ fontSize: 24, fontWeight: 800, color: T.red }}>${total.toFixed(2)}</div>
+        <div style={{ fontSize: 12, color: T.muted }}>{shown.length} record{shown.length !== 1 ? "s" : ""}</div>
+      </div>
+      {shown.length === 0 ? <div style={{ padding: 24, textAlign: "center", color: T.muted, fontSize: 13 }}>No maintenance records in this window.</div>
+        : shown.map(r => <div key={r.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: 12, marginBottom: 8, display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>{r.description || "(no description)"}</div>
+            <div style={{ fontSize: 11, color: T.muted, marginTop: 2 }}>{fd(r.date)}{r.vendor ? ` · ${r.vendor}` : ""}{r.invoiceNum ? ` · Inv# ${r.invoiceNum}` : ""}</div>
+          </div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: T.text }}>${(parseFloat(r.cost) || 0).toFixed(2)}</div>
+          <button style={{ ...sBtn, background: T.surface, color: T.muted, padding: "6px 10px" }} onClick={() => setEditRec(r)}>Edit</button>
+          <button style={{ ...sBtn, background: "transparent", color: T.red, padding: "6px 10px" }} onClick={() => delRec(r.id)}>✕</button>
+        </div>)}
+    </div>;
+  }
+
+  // ── Fleet report view ──
+  const ranked = units.map(u => ({ ...u, spend: unitSpend(u.id), count: unitCount(u.id) })).sort((a, b) => b.spend - a.spend);
+  // Search: match on unit label/make/model, OR on any of the unit's records
+  // (invoice #, vendor, description) — so searching an invoice/vendor finds its unit.
+  const fq = fleetSearch.trim().toLowerCase();
+  const unitMatchesSearch = (u) => {
+    if (!fq) return true;
+    if (`${u.label} ${u.sub || ""} ${u.type}`.toLowerCase().includes(fq)) return true;
+    return records.some(r => r.unitId === u.id && [r.invoiceNum, r.vendor, r.description].some(v => String(v || "").toLowerCase().includes(fq)));
+  };
+  const visible = ranked.filter(u => unitMatchesSearch(u) && (!hideEmpty || u.count > 0 || fq));
+  return <div>
+    {cfmModal}{recModal}
+    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+      <div style={{ fontSize: 15, fontWeight: 700 }}>Fleet Maintenance</div>
+      <button style={{ ...sBtn, background: T.red, marginLeft: "auto" }} onClick={() => setEditRec({ unitId: "", date: new Date().toLocaleDateString("en-CA") })}>+ Add Record</button>
+    </div>
+    {winButtons}
+    <div style={{ background: "rgba(220,38,38,0.06)", border: `1px solid ${T.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
+      <div style={{ fontSize: 11, color: T.muted, textTransform: "uppercase" }}>{winLabel} — Total Fleet Spend</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: T.red }}>${fleetTotal.toFixed(2)}</div>
+    </div>
+    <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
+      <input value={fleetSearch} onChange={e => setFleetSearch(e.target.value)} placeholder="Search unit #, invoice #, vendor, or description..." style={{ ...sIn, flex: 1, minWidth: 220 }} />
+      <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: T.muted, cursor: "pointer", whiteSpace: "nowrap" }}>
+        <input type="checkbox" checked={hideEmpty} onChange={e => setHideEmpty(e.target.checked)} style={{ accentColor: T.red, width: 15, height: 15 }} />
+        Hide units with no records
+      </label>
+    </div>
+    {loading ? <div style={{ padding: 20, color: T.muted, fontSize: 13 }}>Loading…</div>
+      : <div>
+        {visible.length === 0 && <div style={{ padding: 24, textAlign: "center", color: T.muted, fontSize: 13 }}>{fq ? "No units match your search." : "No maintenance spend recorded in this window. Click \"+ Add Record\" to log a repair."}</div>}
+        {[["trailer", "Trailers"], ["truck", "Trucks"]].map(([typeKey, typeLabel]) => {
+          const grp = visible.filter(u => u.type === typeKey);
+          if (grp.length === 0) return null;
+          const grpTotal = grp.reduce((s, u) => s + u.spend, 0);
+          const isCollapsed = !!collapsedGroups[typeKey];
+          return <div key={typeKey} style={{ marginBottom: 14 }}>
+            <button onClick={() => setCollapsedGroups(c => ({ ...c, [typeKey]: !c[typeKey] }))} style={{ width: "100%", display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderRadius: 10, border: `1px solid ${T.border}`, background: T.surface, cursor: "pointer", fontFamily: "inherit", marginBottom: isCollapsed ? 0 : 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 700, color: T.text, textTransform: "uppercase", letterSpacing: "0.05em" }}>{typeLabel} <span style={{ color: T.muted, fontWeight: 400 }}>({grp.length})</span></span>
+              <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 14, fontWeight: 700, color: grpTotal > 0 ? T.red : T.dim }}>${grpTotal.toFixed(2)}</span>
+                <span style={{ color: T.muted }}>{isCollapsed ? "▼" : "▲"}</span>
+              </span>
+            </button>
+            {!isCollapsed && grp.map(u => <button key={u.id} onClick={() => setSel(u.id)} style={{ width: "100%", textAlign: "left", background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: 12, marginBottom: 8, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: T.text }}>{u.label} <span style={{ fontSize: 11, color: T.muted, fontWeight: 400 }}>({u.type})</span></div>
+                <div style={{ fontSize: 11, color: T.muted, marginTop: 2 }}>{u.sub || "—"} · {u.count} record{u.count !== 1 ? "s" : ""}</div>
+              </div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: u.spend > 0 ? T.red : T.dim }}>${u.spend.toFixed(2)}</div>
+            </button>)}
+          </div>;
+        })}
+      </div>}
+  </div>;
+}
 
 function VehicleHistory() {
   const [unitSearch, setUnitSearch] = useState("");
@@ -4573,13 +6061,223 @@ function VehicleHistory() {
   </div>;
 }
 
+// ─── EXPIRATIONS TAB ─────────────────────────────────────────────────────────
+// Consolidated read-only view of everything with an expiry date: personnel
+// certs (from drivers), truck & trailer safety, and custom expiry fields.
+// Groups by type, defaults to expired + within-30-days, filterable to wider
+// windows, and prints to PDF via the same window.print() pattern used by the
+// BOL / roster / revenue reports. No emails, no mute logic — pure pull.
+function ExpirationsTab({ db }) {
+  const certs = useCerts();
+  const customDefs = useCustomFields();
+  const [windowDays, setWindowDays] = useState(30); // "expiring soon" horizon
+  const [view, setView] = useState("due");          // "due" = expired+soon, "all", "expired"
+  const [grp, setGrp] = useState("all");             // "people" | "equipment" | "all"
+  const [sortKey, setSortKey] = useState("days");    // "unit" | "item" | "days" | "overdue"
+  const [sortDir, setSortDir] = useState("asc");     // "asc" | "desc"
+  const toggleSort = (key, defaultDir = "asc") => {
+    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir(defaultDir); }
+  };
+
+  // Self-contained expiry math (mirrors DriversPage's resolveExp/expLabel so the
+  // numbers always agree with the yellow alert boxes, without depending on that
+  // component's internals).
+  const resolveExp = (dateStr, months, direct) => {
+    if (!dateStr) return null;
+    let d;
+    if (direct) {
+      d = new Date(dateStr + "T12:00:00");
+    } else {
+      if (!months) return null; // months 0 / undefined → no expiry (e.g. "completed" certs)
+      d = new Date(dateStr + "T12:00:00");
+      if (!isNaN(d)) d.setMonth(d.getMonth() + Number(months));
+    }
+    return isNaN(d) ? null : d; // guard malformed date strings → treat as no date, never crash
+  };
+  const daysLeft = exp => (exp && !isNaN(exp)) ? Math.floor((exp - new Date()) / 864e5) : null;
+  const statusOf = dl => dl == null ? null : dl < 0 ? "expired" : dl <= windowDays ? "soon" : "valid";
+
+  // Build a flat list of { group, unit, item, expStr, days, status } rows.
+  const rows = [];
+  const pushRow = (group, unit, item, exp) => {
+    const dl = daysLeft(exp);
+    const st = statusOf(dl);
+    if (!st) return;                       // no expiry date (or unparseable) → skip
+    if (view === "expired" && st !== "expired") return; // expired-only view
+    if (view === "due" && st === "valid") return; // hide valid unless "all"
+    rows.push({
+      group, unit, item,
+      expStr: (exp && !isNaN(exp)) ? fd(exp.toISOString().slice(0, 10)) : "—",
+      days: dl,
+      status: st,
+    });
+  };
+
+  // Personnel certifications (built-in + custom expiry fields on people).
+  (db.drivers || []).filter(p => !p.archived).forEach(p => {
+    const who = p.name || "(unnamed)";
+    certs.forEach(c => pushRow("Personnel", who, c.l, resolveExp(p[c.k], c.months, c.direct)));
+    cfForTarget(customDefs, cfPersonTargets(p)).certs.forEach(f => {
+      const v = p[f.id];
+      if (!v) return;
+      const exp = f.certMode === "window"
+        ? resolveExp(v, f.months || 12, false)
+        : new Date(v + "T12:00:00");
+      pushRow("Personnel", who, f.label, exp);
+    });
+  });
+
+  // Truck & trailer safety (+ any custom expiry fields on equipment).
+  [["trucks", "Trucks"], ["trailers", "Trailers"]].forEach(([col, label]) => {
+    (db[col] || []).filter(u => !u.archived).forEach(u => {
+      const unit = u.unit || u.plate || "(no unit #)";
+      pushRow(label, unit, "Safety Inspection", u.safetyExp ? new Date(u.safetyExp + "T12:00:00") : null);
+      cfForTarget(customDefs, col).certs.forEach(f => {
+        const v = u[f.id];
+        if (!v) return;
+        const exp = f.certMode === "window"
+          ? resolveExp(v, f.months || 12, false)
+          : new Date(v + "T12:00:00");
+        pushRow(label, unit, f.label, exp);
+      });
+    });
+  });
+
+  // Sort each group by the chosen order.
+  // Column-driven sort. "days" ascending = soonest first; "overdue" = longest-expired first.
+  const dirMul = sortDir === "asc" ? 1 : -1;
+  const baseCmp = {
+    unit: (a, b) => a.unit.localeCompare(b.unit),
+    item: (a, b) => (a.item || "").localeCompare(b.item || "") || a.unit.localeCompare(b.unit),
+    days: (a, b) => (a.days ?? 1e9) - (b.days ?? 1e9),
+    overdue: (a, b) => (a.days ?? 1e9) - (b.days ?? 1e9), // ascending = most-negative (longest expired) first
+  }[sortKey] || ((a, b) => (a.days ?? 1e9) - (b.days ?? 1e9));
+  rows.sort((a, b) => dirMul * baseCmp(a, b));
+
+  // People / Equipment / All switch decides which sections show.
+  const groupsFor = grp === "people" ? ["Personnel"]
+    : grp === "equipment" ? ["Trucks", "Trailers"]
+    : ["Personnel", "Trucks", "Trailers"];
+  const byGroup = groupsFor.map(g => [g, rows.filter(r => r.group === g)]).filter(([, r]) => r.length);
+  const expiredCount = rows.filter(r => r.status === "expired" && groupsFor.includes(r.group)).length;
+  const soonCount = rows.filter(r => r.status === "soon" && groupsFor.includes(r.group)).length;
+
+  const stColor = s => s === "expired" ? "#ef4444" : s === "soon" ? "#eab308" : "#22c55e";
+  const stLabel = r => r.status === "expired"
+    ? `EXPIRED ${Math.abs(r.days)}d ago`
+    : r.days === 0 ? "Expires today" : `${r.days}d left`;
+
+  // Print-to-PDF: open a clean HTML window and invoke the browser print dialog,
+  // exactly like the roster/revenue reports elsewhere in this file.
+  const printReport = () => {
+    const today = new Date().toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
+    const grpLbl = grp === "people" ? "People" : grp === "equipment" ? "Equipment" : "People + Equipment";
+    const scopeLbl = (view === "expired"
+      ? "Expired items only"
+      : view === "due"
+      ? `Expired + expiring within ${windowDays} days`
+      : "All tracked items") + " · " + grpLbl;
+    const sections = byGroup.map(([g, rs]) => `
+      <h2 style="font-size:14px;margin:18px 0 6px;color:#dc2626">${g} (${rs.length})</h2>
+      <table style="width:100%;border-collapse:collapse;font-size:12px">
+        <tr style="background:#f1f5f9"><th style="text-align:left;border:1px solid #cbd5e1;padding:5px">Unit / Name</th><th style="text-align:left;border:1px solid #cbd5e1;padding:5px">Item</th><th style="text-align:left;border:1px solid #cbd5e1;padding:5px">Expires</th><th style="text-align:left;border:1px solid #cbd5e1;padding:5px">Status</th></tr>
+        ${rs.map(r => `<tr>
+          <td style="border:1px solid #cbd5e1;padding:5px"><b>${r.unit}</b></td>
+          <td style="border:1px solid #cbd5e1;padding:5px">${r.item}</td>
+          <td style="border:1px solid #cbd5e1;padding:5px">${r.expStr}</td>
+          <td style="border:1px solid #cbd5e1;padding:5px;color:${stColor(r.status)};font-weight:700">${stLabel(r)}</td>
+        </tr>`).join("")}
+      </table>`).join("");
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>DBX Expirations — ${today}</title>
+      <style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:28px;color:#0f172a}
+      h1{font-size:18px;margin:0 0 2px}.sub{color:#64748b;font-size:12px;margin-bottom:4px}
+      @media print{.no-print{display:none!important}}@page{margin:14mm}</style></head><body>
+      <h1>⚠️ DBX — Certification &amp; Safety Expirations</h1>
+      <div class="sub">${scopeLbl} · ${expiredCount} expired, ${soonCount} expiring soon · Generated ${today}</div>
+      ${sections || '<p style="color:#64748b">Nothing in this window.</p>'}
+      <div class="no-print" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%)">
+        <button onclick="window.print()" style="padding:10px 24px;background:#dc2626;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px;font-weight:600">🖨 Print / Save as PDF</button>
+      </div></body></html>`;
+    const w = window.open("", "_blank");
+    if (w) { w.document.write(html); w.document.close(); }
+    else alert("Please allow pop-ups to generate the report.");
+  };
+
+  const chip = (active, label, onClick) => (
+    <button onClick={onClick} style={{ padding: "5px 12px", borderRadius: 6, border: `1px solid ${active ? T.red : T.border}`, background: active ? "rgba(220,38,38,0.08)" : "transparent", color: active ? T.red : T.muted, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>{label}</button>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", marginBottom: 12 }}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {chip(view === "expired", "Expired only", () => setView("expired"))}
+          {chip(view === "due", "Expired + soon", () => setView("due"))}
+          {chip(view === "all", "All", () => setView("all"))}
+        </div>
+        {view === "due" && <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ fontSize: 10, color: T.muted, textTransform: "uppercase" }}>Window</span>
+          {[30, 60, 90].map(d => chip(windowDays === d, `${d}d`, () => setWindowDays(d)))}
+        </div>}
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ fontSize: 10, color: T.muted, textTransform: "uppercase" }}>Show</span>
+          {chip(grp === "people", "People", () => setGrp("people"))}
+          {chip(grp === "equipment", "Equipment", () => setGrp("equipment"))}
+          {chip(grp === "all", "All", () => setGrp("all"))}
+        </div>
+        <div style={{ flex: 1 }} />
+        <button onClick={printReport} style={{ padding: "6px 14px", borderRadius: 6, border: "none", background: T.red, color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>Generate PDF Report</button>
+      </div>
+
+      <div style={{ fontSize: 12, color: T.muted, marginBottom: 12 }}>
+        <span style={{ color: "#ef4444", fontWeight: 700 }}>{expiredCount} expired</span>
+        {" · "}
+        <span style={{ color: "#eab308", fontWeight: 700 }}>{soonCount} expiring soon</span>
+      </div>
+
+      {byGroup.length === 0 && <div style={{ padding: 24, textAlign: "center", color: T.muted, fontSize: 13 }}>Nothing to show in this window.</div>}
+
+      {byGroup.map(([g, rs]) => {
+        const arrow = key => sortKey === key ? (sortDir === "asc" ? " ↑" : " ↓") : " ↕";
+        const hCell = (label, key, extra, defaultDir) => (
+          <div onClick={() => toggleSort(key, defaultDir)} style={{ ...extra, cursor: "pointer", color: sortKey === key ? T.text : T.muted, fontWeight: 700, fontSize: 10, textTransform: "uppercase", userSelect: "none" }}>{label}{arrow(key)}</div>
+        );
+        return (
+          <div key={g} style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: T.text, marginBottom: 6 }}>{g} <span style={{ color: T.muted, fontWeight: 400 }}>({rs.length})</span></div>
+            <div style={{ border: `1px solid ${T.border}`, borderRadius: 8, overflow: "hidden" }}>
+              {/* sortable header row */}
+              <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 12px", borderBottom: `1px solid ${T.border}`, background: T.hover }}>
+                {hCell("Name", "unit", { minWidth: 120 })}
+                {hCell("Item", "item", { flex: 1 })}
+                {hCell("Expires", "days", { minWidth: 110 }, "asc")}
+                {hCell("Status", "overdue", { minWidth: 120, textAlign: "right" }, "asc")}
+              </div>
+              {rs.map((r, i) => (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", borderTop: i ? `1px solid ${T.border}` : "none", fontSize: 12 }}>
+                  <div style={{ fontWeight: 700, minWidth: 120, color: T.text }}>{r.unit}</div>
+                  <div style={{ flex: 1, color: T.muted }}>{r.item}</div>
+                  <div style={{ color: T.muted, minWidth: 110 }}>{r.expStr}</div>
+                  <div style={{ color: stColor(r.status), fontWeight: 700, minWidth: 120, textAlign: "right" }}>{stLabel(r)}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function EquipPage({db, saveColl}) {
   const [tab, setTab] = useState("trucks");
   return <div style={{padding:20}}>
     <h1 style={{fontSize:18,fontWeight:700,margin:0,marginBottom:12}}>Equipment</h1>
-    <div style={{display:"flex",gap:6,marginBottom:12}}>{["trucks","trailers","history"].map(t=><button key={t} onClick={()=>setTab(t)} style={{padding:"6px 12px",borderRadius:6,background:tab===t?T.border:"transparent",border:`1px solid ${tab===t?"#334155":T.border}`,color:tab===t?T.text:T.muted,fontSize:12,cursor:"pointer",textTransform:"capitalize",fontFamily:"inherit"}}>{t==="history"?"Vehicle History":t}</button>)}</div>
+    <div style={{display:"flex",gap:6,marginBottom:12}}>{["trucks","trailers","maintenance","history"].map(t=><button key={t} onClick={()=>setTab(t)} style={{padding:"6px 12px",borderRadius:6,background:tab===t?T.border:"transparent",border:`1px solid ${tab===t?"#334155":T.border}`,color:tab===t?T.text:T.muted,fontSize:12,cursor:"pointer",textTransform:"capitalize",fontFamily:"inherit"}}>{t==="history"?"Vehicle History":t==="maintenance"?"Maintenance & Repairs":t}</button>)}</div>
     {tab==="trucks" && <EquipList title="Trucks" items={db.trucks} col="trucks" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"year",l:"Year",tp:"number"},{k:"make",l:"Make"},{k:"model",l:"Model"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
     {tab==="trailers" && <EquipList title="Trailers" items={db.trailers} col="trailers" fields={[{k:"unit",l:"Unit #"},{k:"plate",l:"Plate #"},{k:"year",l:"Year",tp:"number"},{k:"make",l:"Make"},{k:"model",l:"Model"},{k:"type",l:"Type"},{k:"vin",l:"VIN"},{k:"safetyExp",l:"Safety Expiration",tp:"date"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} saveColl={saveColl}/>}
+    {tab==="maintenance" && <MaintenancePage db={db}/>}
     {tab==="history" && <VehicleHistory/>}
   </div>;
 }
@@ -4590,9 +6288,41 @@ function EquipList({title, items, col, fields, saveColl}) {
   const [saving,setSaving] = useState(false);
   const [uploading,setUploading] = useState(false);
   const [srch, setSrch] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
   const { confirm: cfm, modal: cfmModal } = useConfirm();
   const fileRef = useRef();
   const formRef = useRef(null);
+  const customDefs = useCustomFields();
+  // col is "trucks" or "trailers" — the custom-field target key matches.
+  const cfGroup = cfForTarget(customDefs, col);
+  const layout = useFieldLayout();
+  const sections = useSections();
+  const [equipCertsOpen, setEquipCertsOpen] = useState(false);
+  // Dynamic refs for custom-field doc uploads, same Proxy trick as DriversPage.
+  const cfRefStore = useRef({});
+  const cfFileRefs = useMemo(() => new Proxy({}, { get(_t, k) {
+    if (typeof k === "string" && k.endsWith("Docs")) {
+      if (!cfRefStore.current[k]) cfRefStore.current[k] = { current: null };
+      return cfRefStore.current[k];
+    }
+    return undefined;
+  }}), []);
+
+  // Upload/remove for a custom-field doc key on the equipment form.
+  const addCfFile = async (files, docKey) => {
+    setUploading(true);
+    try {
+      const nd = [...(fmData[docKey] || [])];
+      for (const file of Array.from(files)) nd.push(await uploadFile(file, `equipment/${col}`));
+      setFmData(p => ({ ...p, [docKey]: nd }));
+    } catch (e) { console.error(e); alert("Upload failed"); }
+    setUploading(false);
+  };
+  const removeCfFile = async (docKey, idx) => {
+    const d = fmData[docKey]?.[idx];
+    if (d?.path) { try { await deleteObject(storageRef(storage, d.path)); } catch {} }
+    setFmData(p => ({ ...p, [docKey]: (p[docKey] || []).filter((_, j) => j !== idx) }));
+  };
 
   const startNew = () => { const f={}; fields.forEach(x=>f[x.k]=""); f.docs=[]; setFmData(f); setEd("new"); setTimeout(() => { const el = formRef.current; if(el) { el.scrollIntoView({ behavior:"smooth", block:"start" }); const main = el.closest("main"); if(main) main.scrollTop = 0; } }, 100); };
   const startEdit = item => { setFmData({...item,docs:item.docs||[]}); setEd(item.id); setTimeout(() => { const el = formRef.current; if(el) { el.scrollIntoView({ behavior:"smooth", block:"start" }); const main = el.closest("main"); if(main) main.scrollTop = 0; } }, 100); };
@@ -4658,6 +6388,9 @@ function EquipList({title, items, col, fields, saveColl}) {
       <Ic n="search" s={13}/><input value={srch} onChange={e=>setSrch(e.target.value)} placeholder={`Search ${title.toLowerCase()}...`} style={{background:"transparent",border:"none",color:T.text,fontSize:12,outline:"none",width:"100%",fontFamily:"inherit"}}/>
       {srch && <button onClick={()=>setSrch("")} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:14}}>×</button>}
     </div>
+    <div style={{display:"flex",gap:6,marginBottom:10}}>
+      {[{k:false,l:"Active"},{k:true,l:"Archived"}].map(f=><button key={String(f.k)} onClick={()=>setShowArchived(f.k)} style={{padding:"4px 12px",borderRadius:5,border:`1px solid ${showArchived===f.k?T.red:T.border}`,background:showArchived===f.k?"rgba(220,38,38,0.08)":"transparent",color:showArchived===f.k?T.red:T.muted,fontSize:10,cursor:"pointer",fontWeight:500,fontFamily:"inherit"}}>{f.l}</button>)}
+    </div>
     {/* Safety alerts */}
     {safetyAlerts.length > 0 && <div style={{...sCrd, borderColor:"#eab308", marginBottom:12}}>
       <div style={{fontSize:11,fontWeight:700,color:"#eab308",textTransform:"uppercase",marginBottom:6}}>Safety Expiration Alerts</div>
@@ -4669,22 +6402,56 @@ function EquipList({title, items, col, fields, saveColl}) {
       })}
     </div>}
     {ed && <div ref={formRef} style={sCrd}>
-      {fields.map(f=><Field key={f.k} l={f.l}>{
+      <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 10 }}>General Profile</div>
+      {fields.filter(f => !fieldHidden(layout, f.k)).map(f=><Field key={f.k} l={fieldLabel(layout, f.k) !== f.k ? fieldLabel(layout, f.k) : f.l}>{
         f.tp==="textarea"
           ? <textarea style={{...sIn,minHeight:60,resize:"vertical"}} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
           : f.tp==="date"
             ? <DatePicker value={fmData[f.k]||""} onChange={v=>setFmData(p=>({...p,[f.k]:v}))} placeholder="Select date..."/>
             : <input style={sIn} type={f.tp||"text"} value={fmData[f.k]||""} onChange={e=>setFmData(p=>({...p,[f.k]:e.target.value}))}/>
       }</Field>)}
+      {cfGroup.general.length > 0 && groupBySection(cfGroup.general, sections, col).map(g => {
+        const loose = g.id === "__loose";
+        const inputs = <CustomFieldInputs fieldDefs={g.fields} fm={fmData} setFm={setFmData} uploading={uploading}
+          onFiles={addCfFile} removeFile={removeCfFile} fileRefs={cfFileRefs} editing={ed} plain />;
+        if (loose) return <div key={g.id}>{inputs}</div>;
+        return (
+          <div key={g.id} style={{ borderTop:`1px solid ${T.border}`, marginTop:8, paddingTop:10, marginBottom:4 }}>
+            <div style={{ fontSize:11, fontWeight:700, color:T.muted, textTransform:"uppercase", marginBottom:8 }}>{g.label}</div>
+            {inputs}
+          </div>
+        );
+      })}
+      {/* Empty-for-now Certifications & Checks section — same collapsible look
+          as people; custom equipment certs will render here in a later step. */}
+      <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
+        <div onClick={() => setEquipCertsOpen(o => !o)} style={{ display: "flex", alignItems: "center",
+          gap: 8, cursor: "pointer", userSelect: "none", marginBottom: equipCertsOpen ? 8 : 0,
+          padding: "6px 8px", borderRadius: 6, background: equipCertsOpen ? "transparent" : T["bg"],
+          border: `1px solid ${equipCertsOpen ? "transparent" : T.border}` }}>
+          <span style={{ fontSize: 11, color: T.muted, transform: equipCertsOpen ? "rotate(90deg)" : "none",
+            transition: "transform .15s", display: "inline-block" }}>▶</span>
+          <span style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase" }}>Certifications & Checks</span>
+        </div>
+        {equipCertsOpen && (() => {
+          const certFields = cfGroup.certs;
+          if (!certFields.length) return <div style={{ fontSize: 11, color: T.dim, padding: "8px 8px 4px" }}>
+            No certifications set up for equipment yet. Add one from Admin → Add a Field.
+          </div>;
+          return <CustomFieldInputs fieldDefs={certFields} fm={fmData} setFm={setFmData} uploading={uploading}
+            onFiles={addCfFile} removeFile={removeCfFile} fileRefs={cfFileRefs} editing={ed} />;
+        })()}
+      </div>
       <div style={{marginTop:8}}>
         <DropZone label="Documents" uploading={uploading} docKey="docs" fileRef={fileRef} onFiles={addFiles} />
         {(fmData.docs||[]).length>0 &&
-          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>{fmData.docs.map((a,i)=><div key={i} style={{padding:"3px 8px",background:T["bg"],borderRadius:4,fontSize:10,display:"flex",alignItems:"center",gap:3}}><Ic n="file" s={10}/>{a.name}<button onClick={()=>removeDoc(i)} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:11}}>×</button></div>)}</div>}
+          <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:6}}>{fmData.docs.map((a,i)=><div key={i} style={{padding:"3px 8px",background:T["bg"],borderRadius:4,fontSize:10,display:"flex",alignItems:"center",gap:3}}><a href={a.url||a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{color:T.text,textDecoration:"none",display:"flex",alignItems:"center",gap:3}}><Ic n="dl" s={10}/>{a.name}</a><button onClick={()=>removeDoc(i)} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:11}}>×</button></div>)}</div>}
       </div>
       <div style={{display:"flex",gap:8,marginTop:10}}><button style={bP} disabled={saving} onClick={doSave}>{saving?"Saving...":"Save"}</button><button style={bS} onClick={()=>setEd(null)}>Cancel</button></div>
     </div>}
     <div style={{display:"grid",gridTemplateColumns:"1fr",gap:10,maxWidth:600}}>
       {items.filter(item => {
+        if ((item.archived===true) !== showArchived) return false;
         if (!srch) return true;
         const s = srch.toLowerCase();
         return fields.some(f => String(item[f.k]??"").toLowerCase().includes(s));
@@ -4702,8 +6469,22 @@ function EquipList({title, items, col, fields, saveColl}) {
             <div style={{fontSize:9,color:T.muted,marginBottom:2}}>Docs ({item.docs.length}):</div>
             <div style={{display:"flex",flexWrap:"wrap",gap:3}}>{item.docs.map((a,i)=><a key={i} href={a.url||a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{padding:"2px 6px",background:T["bg"],borderRadius:3,fontSize:9,display:"flex",alignItems:"center",gap:2,color:T.text,textDecoration:"none"}}><Ic n="dl" s={9}/>{a.name}</a>)}</div>
           </div>}
+          {/* Custom-field documents (e.g. a custom "Safety certificate" cert field) */}
+          {cfGroup.all.filter(f=>f.docs&&(item[`${f.id}Docs`]||[]).length>0).map(f=>(
+            <div key={f.id} style={{marginTop:4}}>
+              <div style={{fontSize:9,color:T.muted,marginBottom:2}}>{f.label} ({(item[`${f.id}Docs`]||[]).length}):</div>
+              <div style={{display:"flex",flexWrap:"wrap",gap:3}}>{(item[`${f.id}Docs`]||[]).map((a,i)=><a key={i} href={a.url||a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{padding:"2px 6px",background:T["bg"],borderRadius:3,fontSize:9,display:"flex",alignItems:"center",gap:2,color:T.text,textDecoration:"none"}}><Ic n="dl" s={9}/>{a.name}</a>)}</div>
+            </div>
+          ))}
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:12,paddingTop:8,borderTop:`1px solid ${T.border}`}}>
-            <button style={{...bS,padding:"6px 14px",fontSize:11}} onClick={()=>startEdit(item)}>Edit</button>
+            <div style={{display:"flex",gap:8,alignItems:"center"}}>
+              <button style={{...bS,padding:"6px 14px",fontSize:11}} onClick={()=>startEdit(item)}>Edit</button>
+              {item.archived===true ? (
+                <button style={{...bS,padding:"6px 14px",fontSize:11}} onClick={async()=>{setSaving(true);try{await saveColl(col,items.map(x=>x.id===item.id?{...x,archived:false}:x))}catch{}setSaving(false)}}>♻️ Restore</button>
+              ) : (
+                <button style={{...bS,padding:"6px 14px",fontSize:11}} onClick={async()=>{const ok=await cfm("Archive",`Archive unit ${item.unit||"this unit"}?\n\nIt'll be hidden from the active list, equipment reports, and assignment dropdowns, but all its info and history is kept. You can restore it anytime from the Archived tab.`,{confirmLabel:"Archive",confirmColor:"#f59e0b"});if(ok){setSaving(true);try{await saveColl(col,items.map(x=>x.id===item.id?{...x,archived:true}:x))}catch{}setSaving(false)}}}>📦 Archive</button>
+              )}
+            </div>
             <button style={{...bD,padding:"6px 14px",fontSize:11}} onClick={async()=>{const ok=await cfm("Delete Equipment","Are you sure you want to delete this unit? All attached documents will also be removed. This cannot be undone.");if(ok){setSaving(true);try{await saveColl(col,items.filter(x=>x.id!==item.id))}catch{}setSaving(false)}}}>Delete</button>
           </div>
         </div>;
@@ -4880,14 +6661,30 @@ function CrewPage({fireDb}) {
 // PDF via print-window (same approach as BOL), Excel via SheetJS (xlsx).
 // ═══════════════════════════════════════════════════════════════════════════
 
-const RPT_CERTS = [
-  { k: "acrDate", l: "ACR Training", months: 12 },
-  { k: "hazmatDate", l: "HazMat Training", months: 36 },
-  { k: "crimDate", l: "Criminal Record Check", months: 60 },
-  { k: "bgDate", l: "Background Verification", months: 0 },
-  { k: "conductDate", l: "Code of Conduct", months: 0 },
-  { k: "licenseExpiry", l: "Driver's Licence", direct: true },
-];
+// RPT_CERTS mirrors CERT_DEFAULTS but without docKey (reports don't need it).
+// It is kept live by a module-level subscription to settings/certConfig, so
+// renames and mode/window changes flow into every report the moment they save.
+// Report functions read this at call time (reports run on a button click, well
+// after the first snapshot), so a plain mutable module variable is correct here.
+let RPT_CERTS = mergeCerts(null).map(c => ({ k: c.k, l: c.l, months: c.months, direct: c.direct }));
+try {
+  onSnapshot(doc(db, "settings", "certConfig"),
+    snap => { RPT_CERTS = mergeCerts(snap.exists() ? snap.data() : { certs: {} })
+                .map(c => ({ k: c.k, l: c.l, months: c.months, direct: c.direct })); },
+    err => { console.warn("certConfig (reports) load failed:", err); });
+} catch (e) { console.warn("certConfig subscription skipped:", e); }
+
+// Live default Terms & Conditions — authored in AdminPage (settings/orderTerms),
+// falls back to the built-in DEFAULT_TERMS until an admin saves a custom value.
+// Forms and PDFs read termsOrDefault(o.terms) so what admins set here is used.
+let ORDER_TERMS_LIVE = DEFAULT_TERMS;
+try {
+  onSnapshot(doc(db, "settings", "orderTerms"),
+    snap => { const t = snap.exists() ? snap.data().text : undefined; ORDER_TERMS_LIVE = (t!==undefined && t!==null) ? t : DEFAULT_TERMS; },
+    err => { console.warn("orderTerms load failed:", err); });
+} catch (e) { console.warn("orderTerms subscription skipped:", e); }
+// Use the record's own saved terms if present, else the live admin default.
+function termsOrDefault(t) { return (t !== undefined && t !== null) ? t : ORDER_TERMS_LIVE; }
 
 // Resolve a cert's effective expiry date (YYYY-MM-DD) or "" when N/A.
 function rptExpDate(dateStr, months, direct) {
@@ -4920,6 +6717,7 @@ const rptFmtPay = (cfg) => {
   if (cfg.hourly) parts.push(`Hourly: $${cfg.hourly}/hr`);
   if (cfg.workDay) parts.push(`Work Day: $${cfg.workDay}`);
   if (cfg.nonWorkDay) parts.push(`Non-Work Day: $${cfg.nonWorkDay}`);
+  if (cfg.travelDay) parts.push(`Traveling Day: $${cfg.travelDay}`);
   if (cfg.perDiem) parts.push(`Per Diem: $${cfg.perDiem}`);
   if (cfg.tripRate) parts.push(`Trip Rate: $${cfg.tripRate}`);
   return parts.join(" | ");
@@ -4938,20 +6736,20 @@ const rptAddr = (p) => [p.street, p.city, p.provState, p.postalZip, p.country].f
 // ─── Field maps: every stored field, in report order ───
 function rptPersonRows(p) {
   const rows = [
-    ["Name", p.name || ""],
+    [rptFieldLabel("name"), p.name || ""],
     ["Role", rptRole(p)],
-    ["Phone", p.phone || ""],
-    ["Email", p.email || ""],
+    [rptFieldLabel("phone"), p.phone || ""],
+    [rptFieldLabel("email"), p.email || ""],
   ];
   if (p.isSupplier) {
-    rows.push(["Contact Person", p.contactPerson || ""]);
-    rows.push(["Service Type", p.serviceType || ""]);
+    if (!rptFieldHidden("contactPerson")) rows.push([rptFieldLabel("contactPerson"), p.contactPerson || ""]);
+    if (!rptFieldHidden("serviceType")) rows.push([rptFieldLabel("serviceType"), p.serviceType || ""]);
   } else {
-    rows.push(["Licence Class", p.license || ""]);
+    if (!rptFieldHidden("license")) rows.push([rptFieldLabel("license"), p.license || ""]);
     rows.push(["Employee ID", p.employeeId || ""]);
     rows.push(["PIN", p.pin || ""]);
   }
-  rows.push(["Address", rptAddr(p)]);
+  if (!rptFieldHidden("address")) rows.push([rptFieldLabel("address"), rptAddr(p)]);
   if (!p.isSupplier) {
     rows.push(["Pay Configuration", rptFmtPay(p.payCfg)]);
     RPT_CERTS.forEach(c => {
@@ -4975,61 +6773,74 @@ function rptPersonRows(p) {
 
 function rptUnitRows(u) {
   const st = u.safetyExp ? rptStatus(u.safetyExp, 0, true) : null;
-  return [
-    ["Unit #", u.unit || ""],
-    ["Plate #", u.plate || ""],
-    ["Year", u.year != null ? String(u.year) : ""],
-    ["Make", u.make || ""],
-    ["Model", u.model || ""],
-    ["Type", u.type || ""],
-    ["VIN", u.vin || ""],
-    ["Safety Expiration", u.safetyExp ? `${fd(u.safetyExp)} — ${st.txt}` : ""],
-    ["Internal Notes", u.notes || ""],
-    ["Documents on File", String((u.docs || []).length)],
-  ];
+  const rows = [];
+  const add = (key, defLabel, val) => { if (!rptFieldHidden(key)) rows.push([rptFieldLabel(key) || defLabel, val]); };
+  add("unit", "Unit #", u.unit || "");
+  add("plate", "Plate #", u.plate || "");
+  add("year", "Year", u.year != null ? String(u.year) : "");
+  add("make", "Make", u.make || "");
+  add("model", "Model", u.model || "");
+  add("type", "Type", u.type || "");
+  add("vin", "VIN", u.vin || "");
+  add("safetyExp", "Safety Expiration", u.safetyExp ? `${fd(u.safetyExp)} — ${st.txt}` : "");
+  add("notes", "Internal Notes", u.notes || "");
+  rows.push(["Documents on File", String((u.docs || []).length)]);
+  return rows;
 }
 
 // ─── Flat columns for multi-record (summary) reports ───
-const RPT_UNIT_COLS = [
-  ["Unit #", u => u.unit || ""],
-  ["Plate #", u => u.plate || ""],
-  ["Year", u => u.year != null ? String(u.year) : ""],
-  ["Make", u => u.make || ""],
-  ["Model", u => u.model || ""],
-  ["Type", u => u.type || ""],
-  ["VIN", u => u.vin || ""],
-  ["Safety Exp", u => u.safetyExp ? fd(u.safetyExp) : ""],
-  ["Safety Status", u => u.safetyExp ? rptStatus(u.safetyExp, 0, true).txt : "Not set"],
-  ["Notes", u => u.notes || ""],
-];
+// Built live so equipment field renames/hides from Admin are reflected. Called
+// at report time. Safety Status is derived (not a stored field) so it follows
+// the Safety Expiration label/hide. Unit # is protected (never hidden).
+function rptUnitCols() {
+  const all = [
+    ["unit",      rptFieldLabel("unit"),      u => u.unit || ""],
+    ["plate",     rptFieldLabel("plate"),     u => u.plate || ""],
+    ["year",      rptFieldLabel("year"),      u => u.year != null ? String(u.year) : ""],
+    ["make",      rptFieldLabel("make"),      u => u.make || ""],
+    ["model",     rptFieldLabel("model"),     u => u.model || ""],
+    ["type",      rptFieldLabel("type"),      u => u.type || ""],
+    ["vin",       rptFieldLabel("vin"),       u => u.vin || ""],
+    ["safetyExp", rptFieldLabel("safetyExp") === "Safety Expiration" ? "Safety Exp" : rptFieldLabel("safetyExp"), u => u.safetyExp ? fd(u.safetyExp) : ""],
+    ["safetyExp", `${rptFieldLabel("safetyExp") === "Safety Expiration" ? "Safety" : rptFieldLabel("safetyExp")} Status`, u => u.safetyExp ? rptStatus(u.safetyExp, 0, true).txt : "Not set"],
+    ["notes",     rptFieldLabel("notes"),     u => u.notes || ""],
+  ];
+  return all.filter(c => !rptFieldHidden(c[0])).map(c => [c[1], c[2]]);
+}
 
-// Column pieces, assembled per category by rptPersonCols() below.
-const RPT_COL_NAME    = ["Name", p => p.name || ""];
-const RPT_COL_ROLE    = ["Role", p => rptRole(p)];
-const RPT_COL_PHONE   = ["Phone", p => p.phone || ""];
-const RPT_COL_EMAIL   = ["Email", p => p.email || ""];
-const RPT_COL_ADDRESS = ["Address", p => rptAddr(p)];
-const RPT_COL_DOCS    = ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))];
+// Column pieces, assembled per category by rptPersonCols() below. Labels are
+// live-resolved so Admin renames flow into reports; Name/Phone/Email are
+// protected (never hidden). Each is a getter returning a [label, fn] tuple.
+const RPT_COL_NAME    = () => [rptFieldLabel("name"), p => p.name || ""];
+const RPT_COL_ROLE    = () => ["Role", p => rptRole(p)];
+const RPT_COL_PHONE   = () => [rptFieldLabel("phone"), p => p.phone || ""];
+const RPT_COL_EMAIL   = () => [rptFieldLabel("email"), p => p.email || ""];
+const RPT_COL_ADDRESS = () => [rptFieldLabel("address"), p => rptAddr(p)];
+const RPT_COL_DOCS    = () => ["Docs", p => String(["acrDocs","hazmatDocs","crimDocs","bgDocs","conductDocs","licenseDocs","docs"].reduce((s,k)=>s+(p[k]||[]).length,0))];
 
-// Supplier-only fields
-const RPT_SUPPLIER_COLS = [
-  ["Contact Person", p => p.contactPerson || ""],
-  ["Service Type", p => p.serviceType || ""],
+// Supplier-only fields (hideable via layout).
+const RPT_SUPPLIER_COLS = () => [
+  ...(!rptFieldHidden("contactPerson") ? [[rptFieldLabel("contactPerson"), p => p.contactPerson || ""]] : []),
+  ...(!rptFieldHidden("serviceType") ? [[rptFieldLabel("serviceType"), p => p.serviceType || ""]] : []),
 ];
 
 // Driver/employee-only fields
 // Employee ID and PIN deliberately excluded — Manuel looks those up in dispatch,
 // and they consumed width the phone/email columns needed.
-const RPT_STAFF_COLS = [
-  ["Licence Class", p => p.license || ""],
+const RPT_STAFF_COLS = () => [
+  ...(!rptFieldHidden("license") ? [[rptFieldLabel("license"), p => p.license || ""]] : []),
   ["Pay Configuration", p => rptFmtPay(p.payCfg)],
 ];
 
-const RPT_CERT_COLS = RPT_CERTS.map(c => [c.l, p => {
-  const exp = rptExpDate(p[c.k], c.months, c.direct);
-  const st = rptStatus(p[c.k], c.months, c.direct);
-  return exp ? `${fd(exp)} (${st.txt})` : st.txt;
-}]);
+// Built live from the current RPT_CERTS so renames/mode changes are reflected.
+// Called at report time, not captured at module load.
+function rptCertCols() {
+  return RPT_CERTS.map(c => [c.l, p => {
+    const exp = rptExpDate(p[c.k], c.months, c.direct);
+    const st = rptStatus(p[c.k], c.months, c.direct);
+    return exp ? `${fd(exp)} (${st.txt})` : st.txt;
+  }]);
+}
 
 // Portal/alert status — shown only in the per-record detail layout, not in the
 // wide table reports (dropped there to keep the printed table within the page).
@@ -5050,30 +6861,31 @@ function rptPersonCols(cat, records) {
   // Role is omitted — the report title already says Drivers / Employees /
   // Suppliers. It is kept for the "all" category, where the mix matters.
   if (cat === "suppliers") {
-    cols = [RPT_COL_NAME, RPT_COL_PHONE, RPT_COL_EMAIL,
-            ...RPT_SUPPLIER_COLS, RPT_COL_ADDRESS];
+    cols = [RPT_COL_NAME(), RPT_COL_PHONE(), RPT_COL_EMAIL(),
+            ...RPT_SUPPLIER_COLS(), RPT_COL_ADDRESS()];
   } else if (cat === "all") {
-    cols = [RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
-            ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
+    cols = [RPT_COL_NAME(), RPT_COL_ROLE(), RPT_COL_PHONE(), RPT_COL_EMAIL(),
+            ...RPT_STAFF_COLS(), RPT_COL_ADDRESS(), ...rptCertCols()];
     if ((records || []).some(p => p.isSupplier)) {
-      cols.splice(4, 0, ...RPT_SUPPLIER_COLS);
+      cols.splice(4, 0, ...RPT_SUPPLIER_COLS());
     }
   } else {
-    cols = [RPT_COL_NAME, RPT_COL_PHONE, RPT_COL_EMAIL,
-            ...RPT_STAFF_COLS, RPT_COL_ADDRESS, ...RPT_CERT_COLS];
+    cols = [RPT_COL_NAME(), RPT_COL_PHONE(), RPT_COL_EMAIL(),
+            ...RPT_STAFF_COLS(), RPT_COL_ADDRESS(), ...rptCertCols()];
   }
   return rptDropEmptyCols(cols, records);
 }
 
 // Remove columns that are blank for every record in the report. Empty columns
 // still consume width under table-layout:fixed, which is what forced phone
-// numbers and emails to wrap. Name and Role are always kept.
-const RPT_ALWAYS_KEEP = new Set(["Name", "Role"]);
+// numbers and emails to wrap. Name and Role are always kept — matched by the
+// current (possibly renamed) Name label plus "Role".
 function rptDropEmptyCols(cols, records) {
+  const keepLabels = new Set([rptFieldLabel("name"), "Role"]);
   const list = records || [];
   if (!list.length) return cols;
   return cols.filter(c => {
-    if (RPT_ALWAYS_KEEP.has(c[0])) return true;
+    if (keepLabels.has(c[0])) return true;
     return list.some(r => {
       const v = c[1](r);
       // Cert columns render "Not set" when absent — treat that as empty too.
@@ -5083,11 +6895,15 @@ function rptDropEmptyCols(cols, records) {
 }
 
 // Kept for the per-record detail layout, which lists every field vertically.
-const RPT_PERSON_COLS = [
-  RPT_COL_NAME, RPT_COL_ROLE, RPT_COL_PHONE, RPT_COL_EMAIL,
-  ...RPT_STAFF_COLS, ...RPT_SUPPLIER_COLS, RPT_COL_ADDRESS,
-  ...RPT_CERT_COLS, ...RPT_PORTAL_COLS, RPT_COL_DOCS,
-];
+// (Currently unused — the detail layout builds from rptPersonRows — but kept
+// valid so it doesn't reference the removed RPT_CERT_COLS constant.)
+function rptPersonCols_detail() {
+  return [
+    RPT_COL_NAME(), RPT_COL_ROLE(), RPT_COL_PHONE(), RPT_COL_EMAIL(),
+    ...RPT_STAFF_COLS(), ...RPT_SUPPLIER_COLS(), RPT_COL_ADDRESS(),
+    ...rptCertCols(), ...RPT_PORTAL_COLS, RPT_COL_DOCS(),
+  ];
+}
 
 // ─── PDF (print window) ───
 const rptEsc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -5300,6 +7116,32 @@ const rptAoaDetail = (records, titleFn, rowsFn) => {
   return out;
 };
 
+// Reads Admin → Report Columns. Returns { scopeId: [labels] } or {}.
+async function loadReportColumns() {
+  try {
+    const snap = await getDoc(doc(db, "settings", "reportColumns"));
+    return snap.exists() ? (snap.data().scopes || {}) : {};
+  } catch (e) { console.warn("reportColumns load failed:", e); return {}; }
+}
+
+// Apply a saved column selection to a built column list. `chosenLabels` is the
+// array the admin ticked for this scope; when absent, all columns show (current
+// behaviour). Order follows the built list, not the saved order, so new custom
+// fields still appear in a sensible place.
+function applyColumnPicks(cols, chosenLabels) {
+  if (!chosenLabels || !chosenLabels.length) return cols;
+  const keep = new Set(chosenLabels);
+  // Migration safety: older saved selections used "Name" for the name column,
+  // which the report now labels via rptFieldLabel("name") (default "Full Name").
+  // Treat the two as equivalent so a previously-saved pick still matches.
+  if (keep.has("Name")) keep.add("Full Name");
+  if (keep.has("Full Name")) keep.add("Name");
+  if (keep.has("Licence Class")) keep.add("License Class"); // old British spelling
+  const filtered = cols.filter(c => keep.has(c[0]));
+  // Never let a pick leave zero columns — fall back to the full set.
+  return filtered.length ? filtered : cols;
+}
+
 function RosterEquipReports({ db }) {
   const [scope, setScope] = useState("equipment"); // equipment | people
   const [cat, setCat] = useState("trucks");        // trucks|trailers|all  /  drivers|employees|suppliers|all
@@ -5307,6 +7149,16 @@ function RosterEquipReports({ db }) {
   const [sel, setSel] = useState([]);
   const [detail, setDetail] = useState(true);
   const [busy, setBusy] = useState(false);
+  const customDefs = useCustomFields();
+  // Report-column selections authored in Admin → Report Columns.
+  // NB: the `db` prop here is the dispatch data object, which shadows the
+  // Firestore instance. loadReportColumns() closes over the real Firestore db.
+  const [colSel, setColSel] = useState({});
+  useEffect(() => {
+    let live = true;
+    loadReportColumns().then(s => { if (live) setColSel(s); });
+    return () => { live = false; };
+  }, []);
 
   const trucks = (db.trucks || []).map(t => ({ ...t, _kind: "Truck" }));
   const trailers = (db.trailers || []).map(t => ({ ...t, _kind: "Trailer" }));
@@ -5314,10 +7166,12 @@ function RosterEquipReports({ db }) {
 
   const pool = useMemo(() => {
     if (scope === "equipment") {
-      const arr = cat === "trucks" ? trucks : cat === "trailers" ? trailers : [...trucks, ...trailers];
+      const base = cat === "trucks" ? trucks : cat === "trailers" ? trailers : [...trucks, ...trailers];
+      const arr = base.filter(u => u.archived !== true); // archived units excluded from equipment reports
       return [...arr].sort((a, b) => String(a.unit || "").localeCompare(String(b.unit || ""), undefined, { numeric: true }));
     }
     const arr = people.filter(p => {
+      if (p.archived === true) return false; // archived people excluded from roster reports
       if (cat === "drivers") return p.isDriver !== false && !p.isSupplier;
       if (cat === "employees") return p.isEmployee === true && !p.isSupplier;
       if (cat === "suppliers") return p.isSupplier === true;
@@ -5334,9 +7188,54 @@ function RosterEquipReports({ db }) {
   const catLabel = { trucks:"Trucks", trailers:"Trailers", all: isEquip ? "All Units" : "All People",
                      drivers:"Drivers", employees:"Employees", suppliers:"Suppliers" }[cat] || "";
   const title = `${isEquip ? "Equipment" : "Roster"} Report — ${catLabel}${mode === "selected" ? ` (${chosen.length} selected)` : ""}`;
-  // Columns adapt to the category so inapplicable fields are dropped.
-  const cols = isEquip ? RPT_UNIT_COLS : rptPersonCols(cat, chosen);
-  const rowsFn = isEquip ? rptUnitRows : rptPersonRows;
+  // Custom-field columns for this category. For the person "all" view, gather
+  // fields across every person target; otherwise use the single category key.
+  const cfTargetsForCat = isEquip
+    ? (cat === "all" ? ["trucks", "trailers"] : [cat])
+    : (cat === "all" ? ["drivers", "employees", "suppliers"] : [cat]);
+  const cfCols = (() => {
+    const seen = new Set(); const out = [];
+    cfTargetsForCat.forEach(t => cfColsFor(customDefs, t).forEach(c => {
+      if (seen.has(c[0])) return; seen.add(c[0]); out.push(c);
+    }));
+    return out;
+  })();
+  const cfDefsForCat = cfForTarget(customDefs, cfTargetsForCat).all;
+
+  // Columns adapt to the category so inapplicable fields are dropped, then the
+  // Admin → Report Columns picker (if any) is applied for this scope.
+  // Admin configures per specific scope (trucks/trailers/drivers/employees/
+  // suppliers) — there's no "all" scope. So for an "All" report, combine the
+  // member scopes' picks (union: a column shows if ANY member scope keeps it),
+  // which is why "All Units"/"All People" previously ignored the picker.
+  const memberScopes = isEquip
+    ? (cat === "all" ? ["trucks", "trailers"] : [cat])
+    : (cat === "all" ? ["drivers", "employees", "suppliers"] : [cat]);
+  const effectivePicks = (() => {
+    const picks = memberScopes.map(s => colSel[s]).filter(p => p && p.length);
+    if (!picks.length) return colSel[cat]; // no member picks → undefined = show all
+    return [...new Set(picks.flat())]; // union of all member scopes' chosen labels
+  })();
+  const builtCols = isEquip ? rptUnitCols() : rptPersonCols(cat, chosen);
+  const cols = applyColumnPicks([...builtCols, ...cfCols], effectivePicks);
+  // Detail (per-record) layout: append custom-field rows after built-in ones.
+  // Same column picks apply — a row (label/value pair) is dropped if its label
+  // isn't in the effective picks, so hiding a column hides it in detail too.
+  const rowKeep = (() => {
+    if (!effectivePicks || !effectivePicks.length) return null; // null = keep all
+    const keep = new Set(effectivePicks);
+    if (keep.has("Name")) keep.add("Full Name");
+    if (keep.has("Full Name")) keep.add("Name");
+    if (keep.has("Licence Class")) keep.add("License Class");
+    return keep;
+  })();
+  const filterRows = rows => rowKeep ? rows.filter(r => rowKeep.has(r[0])) : rows;
+  const rowsFn = isEquip
+    ? (u => filterRows([...rptUnitRows(u), ...cfDefsForCat.map(f => [f.label, cfReportValue(f, u)])]))
+    : (p => {
+        const applicable = cfForTarget(customDefs, cfPersonTargets(p)).all;
+        return filterRows([...rptPersonRows(p), ...applicable.map(f => [f.label, cfReportValue(f, p)])]);
+      });
   const stamp = new Date().toISOString().slice(0, 10);
 
   // Total shown in the report header, e.g. "46 Trailers" / "31 Drivers".
@@ -5446,6 +7345,122 @@ function RosterEquipReports({ db }) {
         </div>)}
       </div>
     </div>
+  </div>;
+}
+
+// ═══ MAINTENANCE & REPAIRS REPORT ═══
+// All maintenance records filtered by date range + unit, printable to PDF.
+// Columns honour the "maintenance" scope saved in Admin → Report Columns.
+function MaintenanceReport({ db: data }) {
+  const [records, setRecords] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [period, setPeriod] = useState("year");   // month | lastmonth | year | last12 | custom | all
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
+  const [unitFilter, setUnitFilter] = useState("ALL");
+  const [colPicks, setColPicks] = useState(null);  // saved column selection for "maintenance"
+
+  useEffect(() => {
+    getDocs(collection(db, "maintenance"))
+      .then(s => setRecords(s.docs.map(d => ({ id: d.id, ...d.data() }))))
+      .catch(e => console.error("maintenance report load:", e))
+      .finally(() => setLoading(false));
+    loadReportColumns().then(scopes => setColPicks((scopes || {}).maintenance || null));
+  }, []);
+
+  const now = new Date();
+  let rangeFrom, rangeTo;
+  if (period === "month") { rangeFrom = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,"0")}-01`; rangeTo = td(); }
+  else if (period === "lastmonth") { const lm = new Date(now.getFullYear(), now.getMonth()-1, 1); const lme = new Date(now.getFullYear(), now.getMonth(), 0); rangeFrom = lm.toISOString().slice(0,10); rangeTo = lme.toISOString().slice(0,10); }
+  else if (period === "year") { rangeFrom = `${now.getFullYear()}-01-01`; rangeTo = td(); }
+  else if (period === "last12") { const d = new Date(now); d.setFullYear(d.getFullYear()-1); rangeFrom = d.toISOString().slice(0,10); rangeTo = td(); }
+  else if (period === "custom") { rangeFrom = customFrom || "2000-01-01"; rangeTo = customTo || td(); }
+  else { rangeFrom = "2000-01-01"; rangeTo = "2099-12-31"; }
+
+  const inRange = (r) => r.date && r.date >= rangeFrom && r.date <= rangeTo;
+  const filtered = records.filter(r => inRange(r) && (unitFilter === "ALL" || r.unitId === unitFilter))
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const totalSpend = filtered.reduce((s, r) => s + (parseFloat(r.cost) || 0), 0);
+
+  // Unit options for the filter (from records + current fleet).
+  const unitMap = {};
+  records.forEach(r => { if (r.unitId) unitMap[r.unitId] = r.unitLabel || r.unitId; });
+  (data.trucks || []).concat(data.trailers || []).forEach(u => { unitMap[u.id] = u.unit || u.plate || unitMap[u.id] || u.id; });
+  const unitOpts = Object.entries(unitMap).sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+
+  const fdr = (d) => d ? new Date(d + "T12:00:00").toLocaleDateString("en-CA", { month: "short", day: "numeric", year: "numeric" }) : "";
+
+  // Column definitions: [label, valueFn, relWidth]
+  const allCols = [
+    ["Date", r => fdr(r.date)],
+    ["Unit", r => r.unitLabel || ""],
+    ["Type", r => r.unitType || ""],
+    ["Description", r => r.description || ""],
+    ["Vendor", r => r.vendor || ""],
+    ["Invoice #", r => r.invoiceNum || ""],
+    ["Cost", r => `$${(parseFloat(r.cost) || 0).toFixed(2)}`],
+  ];
+  const cols = applyColumnPicks(allCols, colPicks);
+
+  const periodLabel = { month: "This Month", lastmonth: "Last Month", year: "This Year", last12: "Last 12 Months", custom: `${fdr(rangeFrom)} – ${fdr(rangeTo)}`, all: "All Time" }[period];
+  const countLabel = `${filtered.length} record${filtered.length !== 1 ? "s" : ""} · Total $${totalSpend.toFixed(2)}`;
+
+  const printPdf = () => {
+    // rptTableHtml expects columns as [label, valueFn] and calls valueFn(row)
+    // itself, with rows being the raw records. Append a synthetic total record
+    // and give it its own value functions via a wrapper column set.
+    const dataRows = [...filtered, { __total: true }];
+    const pdfCols = cols.map(c => [c[0], (r) => r.__total ? (c[0] === "Cost" ? `$${totalSpend.toFixed(2)}` : (c === cols[0] ? "TOTAL" : "")) : c[1](r)]);
+    const title = `Maintenance & Repairs — ${periodLabel}`;
+    rptOpenPdf(title, rptTableHtml(pdfCols, dataRows, rptHeaderBand(title, countLabel)), false, countLabel);
+  };
+
+  const selStyle = { ...sIn, width: "auto", minWidth: 150 };
+  return <div>
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 14 }}>
+      <div><label style={{ ...sLbl, marginBottom: 2 }}>Period</label>
+        <select style={selStyle} value={period} onChange={e => setPeriod(e.target.value)}>
+          <option value="month">This Month</option>
+          <option value="lastmonth">Last Month</option>
+          <option value="year">This Year</option>
+          <option value="last12">Last 12 Months</option>
+          <option value="custom">Custom Range</option>
+          <option value="all">All Time</option>
+        </select>
+      </div>
+      {period === "custom" && <>
+        <div><label style={{ ...sLbl, marginBottom: 2 }}>From</label><input type="date" style={selStyle} value={customFrom} onChange={e => setCustomFrom(e.target.value)} /></div>
+        <div><label style={{ ...sLbl, marginBottom: 2 }}>To</label><input type="date" style={selStyle} value={customTo} onChange={e => setCustomTo(e.target.value)} /></div>
+      </>}
+      <div style={{ minWidth: 240 }}><label style={{ ...sLbl, marginBottom: 2 }}>Unit</label>
+        <SearchSelect
+          options={[{ value: "ALL", label: "All Units" }, ...unitOpts.map(([id, label]) => ({ value: id, label: String(label) }))]}
+          value={unitFilter}
+          emptyLabel="All Units"
+          placeholder="Type unit # to filter..."
+          onChange={id => setUnitFilter(id || "ALL")}
+        />
+      </div>
+      <button style={{ ...sBtn, background: T.red }} onClick={printPdf} disabled={filtered.length === 0}><Ic n="file" s={14} /> Print PDF</button>
+    </div>
+
+    <div style={{ background: "rgba(220,38,38,0.06)", border: `1px solid ${T.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
+      <div style={{ fontSize: 11, color: T.muted, textTransform: "uppercase" }}>{periodLabel} — Total Maintenance Spend</div>
+      <div style={{ fontSize: 24, fontWeight: 800, color: T.red }}>${totalSpend.toFixed(2)}</div>
+      <div style={{ fontSize: 12, color: T.muted }}>{filtered.length} record{filtered.length !== 1 ? "s" : ""}</div>
+    </div>
+
+    {loading ? <div style={{ padding: 20, color: T.muted, fontSize: 13 }}>Loading…</div>
+      : filtered.length === 0 ? <div style={{ padding: 24, textAlign: "center", color: T.muted, fontSize: 13 }}>No maintenance records in this range.</div>
+        : <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead><tr>{cols.map(c => <th key={c[0]} style={{ textAlign: c[0] === "Cost" ? "right" : "left", padding: "8px 10px", borderBottom: `2px solid ${T.border}`, color: T.muted, fontSize: 10, textTransform: "uppercase" }}>{c[0]}</th>)}</tr></thead>
+            <tbody>
+              {filtered.map(r => <tr key={r.id}>{cols.map(c => <td key={c[0]} style={{ textAlign: c[0] === "Cost" ? "right" : "left", padding: "7px 10px", borderBottom: `1px solid ${T.border}` }}>{c[1](r)}</td>)}</tr>)}
+              <tr style={{ fontWeight: 700 }}>{cols.map((c, i) => <td key={c[0]} style={{ textAlign: c[0] === "Cost" ? "right" : "left", padding: "8px 10px", borderTop: `2px solid ${T.border}`, color: T.red }}>{i === 0 ? "TOTAL" : c[0] === "Cost" ? `$${totalSpend.toFixed(2)}` : ""}</td>)}</tr>
+            </tbody>
+          </table>
+        </div>}
   </div>;
 }
 
@@ -5734,7 +7749,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
     </PageHdr>
 
     <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
-      {[["orders","Orders & Revenue"],["roster","Equipment & Roster"]].map(([k,l])=>
+      {[["orders","Orders & Revenue"],["roster","Equipment & Roster"],["maintenance","Maintenance & Repairs"]].map(([k,l])=>
         <button key={k} onClick={()=>setRptView(k)} style={{padding:"6px 14px",borderRadius:6,
           background:rptView===k?T.border:"transparent",border:`1px solid ${rptView===k?"#334155":T.border}`,
           color:rptView===k?T.text:T.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",
@@ -5742,6 +7757,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
     </div>
 
     {rptView==="roster" && <RosterEquipReports db={db}/>}
+    {rptView==="maintenance" && <MaintenanceReport db={db}/>}
     {rptView==="orders" && <>
 
     {/* Filters row 1 — Period */}

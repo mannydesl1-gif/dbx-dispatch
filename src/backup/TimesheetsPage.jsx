@@ -825,6 +825,11 @@ function EmpDocUpload({ empId, empEmail, event, onSaved }) {
 export default function TimesheetsPage() {
   const [selectedEvent, setSelectedEvent] = useState("__all__");
   const [events, setEvents] = useState([]);
+  const [eventDocs, setEventDocs] = useState([]); // full event records (for subEvents)
+  const [selectedSubs, setSelectedSubs] = useState([]); // [] = all sub-events; otherwise the chosen ones
+  const [subMenuOpen, setSubMenuOpen] = useState(false); // dropdown panel open (used when many sub-events)
+  // Helper: is a sub-event in scope? Empty selection = everything.
+  const subInScope = (sub) => selectedSubs.length === 0 || selectedSubs.includes(sub || "");
   const [entries, setEntries] = useState([]);
   const [expenses, setExpenses] = useState([]);
   const [empRecords, setEmpRecords] = useState({}); // email → {id, hourlyRate}
@@ -981,6 +986,50 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     try {
       await updateDoc(doc(db,"expenses",id), { status });
       setExpenses(prev => prev.map(e => e.id===id ? {...e,status} : e));
+
+      // On APPROVE: create a dedicated expense-only timesheet entry for this
+      // expense, so it shows inline in the By Employee view (like the per-diem
+      // line) and flows to the CSV. Each expense gets its OWN entry, so an
+      // employee submitting several expenses on the same day is handled cleanly
+      // (one line each) — an entry only holds a single embedded expense.
+      // The source expense is marked `merged:true`; the CSV's standalone-expense
+      // loop skips merged ones to avoid double-counting.
+      if (status === "approved" && !ex.merged) {
+        try {
+          const evName = ex.event || selectedEvent;
+          const expFields = {
+            expenseDesc: ex.description || ex.type || "Expense",
+            expenseAmt: parseFloat(ex.amount) || 0,
+            expenseTax: "Tax Exempt",
+            expenseCurrency: ex.currency || "CAD",
+            expenseFromApproval: id,            // trace back to source expense
+            expenseReceiptUrl: ex.receiptUrl || null,
+          };
+          const newEntry = {
+            employeeName: ex.employeeName, employeeEmail: ex.employeeEmail||null,
+            employeePhone: ex.employeePhone||null, event: evName, subEvent: ex.subEvent||null, date: ex.date,
+            startTime: null, endTime: null, hours: 0, dayType: "expense-only",
+            notes: "", ...expFields, submittedAt: new Date().toISOString(),
+          };
+          const ref = await addDoc(collection(db,"timesheets"), newEntry);
+          setEntries(prev => [{id:ref.id,...newEntry}, ...prev]);
+          // Mark the standalone expense as merged so the CSV counts it once.
+          await updateDoc(doc(db,"expenses",id), { merged: true, mergedEntryId: ref.id });
+          setExpenses(prev => prev.map(e => e.id===id ? {...e,merged:true,mergedEntryId:ref.id} : e));
+        } catch(mergeErr) { console.error("expense merge failed:", mergeErr); }
+      }
+
+      // On UN-APPROVE (status changed away from approved): remove the merged
+      // expense-only entry that approval created, and clear the merged flag, so
+      // the expense isn't double-represented or stranded.
+      if (status !== "approved" && ex.merged && ex.mergedEntryId) {
+        try {
+          await deleteDoc(doc(db,"timesheets",ex.mergedEntryId));
+          setEntries(prev => prev.filter(en => en.id !== ex.mergedEntryId));
+          await updateDoc(doc(db,"expenses",id), { merged: false, mergedEntryId: null });
+          setExpenses(prev => prev.map(e => e.id===id ? {...e,merged:false,mergedEntryId:null} : e));
+        } catch(unmergeErr) { console.error("expense un-merge failed:", unmergeErr); }
+      }
       // Send email notification to employee
       if(status==="approved"||status==="rejected") {
         try {
@@ -1028,7 +1077,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
   // Load active events from Firestore
   useEffect(()=>{
     getDocs(query(collection(db,"events"), where("active","==",true)))
-      .then(snap=>{ const evs=["Daily Operations",...snap.docs.map(d=>d.data().name).filter(e=>e!=="Daily Operations")]; setEvents(evs); setSelectedEvent("__all__"); })
+      .then(snap=>{ const docs=snap.docs.map(d=>({id:d.id,...d.data()})); setEventDocs(docs); const evs=["Daily Operations",...docs.map(d=>d.name).filter(e=>e!=="Daily Operations")]; setEvents(evs); setSelectedEvent("__all__"); })
       .catch(e=>console.error(e));
   },[]);
 
@@ -1076,16 +1125,35 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
 
   // Group entries by employee
   // Smart grouping — match by email OR phone OR name (any one match = same employee)
+  // Sub-event filter: when a specific sub-event is chosen, only its entries are
+  // in scope for the whole view and exports. Pay math is unchanged — it simply
+  // runs on this narrowed set. "__all__" = every entry (unfiltered, as before).
+  const scopedEntries = selectedSubs.length === 0
+    ? entries
+    : entries.filter(e => subInScope(e.subEvent));
+  // Expenses now carry sub-events too. When filtering, show expenses in scope.
+  // (Legacy expenses saved before sub-events existed have none and won't appear
+  // in a specific sub-event selection — expected.)
+  const scopedExpenses = selectedSubs.length === 0
+    ? expenses
+    : expenses.filter(x => subInScope(x.subEvent));
   const empGroups = [];
-  entries.forEach(e => {
+  scopedEntries.forEach(e => {
     const eEmail = e.employeeEmail?.trim().toLowerCase();
     const ePhone = e.employeePhone?.trim().replace(/\D/g,"");
     const eName  = e.employeeName?.trim().toLowerCase();
-    // Find existing group that matches on any identifier
+    // Split cards by sub-event: an entry with a sub-event groups into that
+    // employee's card FOR that sub-event, so an employee with entries in two
+    // sub-events shows as two cards. Entries with no sub-event group by employee
+    // exactly as before (sub key ""), so existing behaviour is unchanged.
+    const eSub = e.subEvent || "";
+    // Find existing group that matches on identifier AND the same sub-event.
     const match = empGroups.find(g =>
-      (eEmail && g.email && eEmail === g.email) ||
-      (ePhone && ePhone.length>=7 && g.phone && ePhone === g.phone) ||
-      (eName  && g.name  && eName  === g.name)
+      (g.subEvent||"") === eSub && (
+        (eEmail && g.email && eEmail === g.email) ||
+        (ePhone && ePhone.length>=7 && g.phone && ePhone === g.phone) ||
+        (eName  && g.name  && eName  === g.name)
+      )
     );
     if(match) {
       match.entries.push(e);
@@ -1098,6 +1166,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
         name: e.employeeName||"Unknown",
         email: eEmail||"",
         phone: ePhone||"",
+        subEvent: eSub,
         entries:[e]
       });
     }
@@ -1112,7 +1181,8 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
       perDiem: parseFloat(cfg.perDiem)||0,
     };
   };
-  const byEmp = empGroups.reduce((acc,g)=>{ acc[g.email||g.phone||g.name]=g; return acc; },{});
+  // Key includes sub-event so per-sub-event cards stay distinct.
+  const byEmp = empGroups.reduce((acc,g)=>{ acc[(g.email||g.phone||g.name)+"||"+(g.subEvent||"")]=g; return acc; },{});
   const employees = Object.values(byEmp).map(emp=>{
     const empRec = empRecords[emp.email?.toLowerCase?.().trim()] || empRecords[(emp.phone||"").replace(/\D/g,"")] || empRecords[emp.name] || null;
     return {
@@ -1161,9 +1231,10 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
       },0);
       return { pay, perDiem:0, tripPay, dayExtraPay, nwDayPay, perDiemPay, inlineExpPay, vendorPay, total:pay+tripPay+dayExtraPay+nwDayPay+perDiemPay+inlineExpPay+vendorPay, type:"hourly", totalMins };
     }
-    const workDays = emp.entries.filter(e=>e.dayType!=="non-working").length;
-    const nonWorkDays = emp.entries.filter(e=>e.dayType==="non-working").length;
-    const totalDays = emp.entries.length;
+    const dayEntries = emp.entries.filter(e=>e.dayType!=="expense-only" && e.entryType!=="vendor-charge");
+    const workDays = dayEntries.filter(e=>e.dayType!=="non-working").length;
+    const nonWorkDays = dayEntries.filter(e=>e.dayType==="non-working").length;
+    const totalDays = dayEntries.length;
     const pay = workDays*(cfg.workDay||0) + nonWorkDays*(cfg.nonWorkDay||0);
     const perDiem = totalDays*(cfg.perDiem||0);
     return { pay, perDiem, tripPay, dayExtraPay, nwDayPay, perDiemPay, inlineExpPay, vendorPay, total:pay+perDiem+tripPay+dayExtraPay+nwDayPay+perDiemPay+inlineExpPay+vendorPay, workDays, nonWorkDays, totalDays, type:"daily" };
@@ -1200,19 +1271,41 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
   const pendingExp = expenses.filter(e=>e.status==="pending").length;
   const totalHours = entries.reduce((a,e)=>["non-working","per-diem","working-day"].includes(e.dayType)?a:a+calcHours(e.startTime,e.endTime),0);
 
-  // Derive xeroSent from entries — an employee is "sent" if ALL their entries have xeroSent flag
+  // Split each employee's entries by the per-entry xeroSent flag so that SENT
+  // entries and NEW (unsent) entries live independently. An employee can appear
+  // in BOTH the active list (with only their unsent entries) AND the Sent tab
+  // (with only their sent entries) — so billing a sub-event never drags the
+  // whole person, and new entries for the same event show up as fresh work.
+  const empWithEntries = (emp, subset) => {
+    if (subset.length === emp.entries.length) return emp;
+    // Recompute the entry-derived header fields for just this subset so the
+    // card's hours/days/pay reflect exactly the entries shown. calcPay(emp)
+    // reads emp.entries, so swapping entries is enough for the pay figures.
+    return {
+      ...emp,
+      entries: subset,
+      totalHours: subset.reduce((a,e)=>["non-working","per-diem","working-day"].includes(e.dayType)?a:a+calcHours(e.startTime,e.endTime),0),
+      days: new Set(subset.map(e=>e.date)).size,
+      events: [...new Set(subset.map(e=>e.event).filter(Boolean))],
+    };
+  };
+  const activeEmployees = employees
+    .map(emp => empWithEntries(emp, emp.entries.filter(e => !e.xeroSent)))
+    .filter(emp => emp.entries.length > 0);
+  const sentEmployees = employees
+    .map(emp => empWithEntries(emp, emp.entries.filter(e => e.xeroSent)))
+    .filter(emp => emp.entries.length > 0);
+  // Kept for the "Sent to Xero (N)" counter — number of employees with any sent entry.
   const xeroSent = {};
-  employees.forEach(emp => {
-    if(emp.entries.length > 0 && emp.entries.every(e => e.xeroSent)) xeroSent[emp.email] = true;
-  });
+  sentEmployees.forEach(emp => { xeroSent[emp.email] = true; });
 
   const bS = {padding:"8px 14px",borderRadius:7,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",display:"flex",alignItems:"center",gap:6};
   const bP = {...bS,background:T.redDim,border:`1px solid ${T.red}`,color:T.red};
   const bG = {...bS,background:T.greenDim,border:`1px solid ${T.green}`,color:T.green};
 
   const exportCSV = () => {
-    const rows=[["Employee","Email","Phone","Event","Date","Start","End","Hours","Notes"],
-      ...entries.map(e=>[e.employeeName,e.employeeEmail,e.employeePhone,e.event,e.date,e.startTime,e.endTime,calcHours(e.startTime,e.endTime).toFixed(2),`"${(e.notes||"").replace(/"/g,'""')}"` ])];
+    const rows=[["Employee","Email","Phone","Event","Sub-event","Date","Start","End","Hours","Notes"],
+      ...scopedEntries.map(e=>[e.employeeName,e.employeeEmail,e.employeePhone,e.event,e.subEvent||"",e.date,e.startTime,e.endTime,calcHours(e.startTime,e.endTime).toFixed(2),`"${(e.notes||"").replace(/"/g,'""')}"` ])];
     const csv=rows.map(r=>r.join(",")).join("\n");
     const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
     a.download=`DBX_Timesheets_${selectedEvent.replace(/\s+/g,"_")}.csv`; a.click();
@@ -1271,9 +1364,10 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     const inlineByType = {};
     empEntries.forEach(e=>{ if((parseFloat(e.expenseAmt)||0)>0&&e.expenseDesc){ const t=e.expenseDesc; if(!inlineByType[t]) inlineByType[t]={total:0,tax:e.expenseTax||"Tax Exempt"}; inlineByType[t].total+=parseFloat(e.expenseAmt)||0; } });
     Object.entries(inlineByType).forEach(([t,v])=>rows.push(makeRow(emp.name,invNum,invDate,dueDate,t,"1",v.total.toFixed(2),acct,v.tax)));
-    // Employee-submitted expenses grouped by type (approved)
+    // Employee-submitted expenses grouped by type (approved AND not yet merged
+    // into an entry — merged ones are counted via their entry's embedded expense).
     const appByType = {};
-    empExpenses.filter(e=>e.status==="approved").forEach(e=>{ const t=e.type||"Miscellaneous"; if(!appByType[t]) appByType[t]=0; appByType[t]+=parseFloat(e.amount)||0; });
+    empExpenses.filter(e=>e.status==="approved" && !e.merged).forEach(e=>{ const t=e.type||"Miscellaneous"; if(!appByType[t]) appByType[t]=0; appByType[t]+=parseFloat(e.amount)||0; });
     Object.entries(appByType).forEach(([t,total])=>rows.push(makeRow(emp.name,invNum,invDate,dueDate,t,"1",total.toFixed(2),acct,"Tax Exempt")));
     return rows;
   };
@@ -1325,27 +1419,40 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     a.click();
   };
 
-  const exportXeroBillSingle = (empKey) => {
-    const emp = (() => { const byEmp = {}; entries.forEach(e=>{ const k=e.employeeEmail||e.employeeName; if(!byEmp[k]) byEmp[k]={name:e.employeeName,email:e.employeeEmail,entries:[]}; byEmp[k].entries.push(e); }); return byEmp[empKey]; })();
+  const exportXeroBillSingle = (empArg) => {
+    // Accept either the card object (already scoped to its sub-event) or an email
+    // key (legacy). Using the card's own entries keeps the export scoped to that
+    // sub-event card, so exporting Lasso doesn't pull in Ile Soniq.
+    const emp = (typeof empArg === "object" && empArg)
+      ? empArg
+      : (() => { const byEmp = {}; entries.forEach(e=>{ const k=e.employeeEmail||e.employeeName; if(!byEmp[k]) byEmp[k]={name:e.employeeName,email:e.employeeEmail,entries:[]}; byEmp[k].entries.push(e); }); return byEmp[empArg]; })();
     if(!emp) { alert("No entries found."); return; }
-    const empExp = expenses.filter(e=>(e.employeeEmail||e.employeeName)===empKey);
-    const cfg = empRecords[emp.email]?.payCfg || emp.entries[0]?.payCfg;
-    const rows = buildEmpXeroRows(emp, emp.entries, empExp, cfg);
-    if(!rows.length) { alert("No billable data found for this employee.\n\nThis usually means pay rates are not configured, or no hours/days/expenses have been entered."); return; }
+    const empKey = emp.email || emp.name;
+    // Only export entries NOT yet sent to Xero, so exporting new sub-event work
+    // never re-includes already-billed entries for the same employee/event.
+    const unsent = emp.entries.filter(e=>!e.xeroSent);
+    if(!unsent.length) { alert("All entries for this card are already marked sent to Xero.\n\nMove an entry back to active if you need to re-export it."); return; }
+    // Scope expenses to this card's sub-event (untagged expenses only join the
+    // no-sub-event card, matching how entries are grouped).
+    const empExp = expenses.filter(e=>(e.employeeEmail||e.employeeName)===empKey && (e.subEvent||"")===(emp.subEvent||""));
+    const cfg = empRecords[emp.email]?.payCfg || unsent[0]?.payCfg;
+    const rows = buildEmpXeroRows(emp, unsent, empExp, cfg);
+    if(!rows.length) { alert("No billable data found for this card.\n\nThis usually means pay rates are not configured, or no hours/days/expenses have been entered."); return; }
     const csv = toCSV([header, ...rows]);
     const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-    a.download = "Xero_"+selectedEvent.replace(/\s+/g,"_")+"_"+emp.name.replace(/\s+/g,"_")+".csv"; a.click();
+    a.download = "Xero_"+selectedEvent.replace(/\s+/g,"_")+(emp.subEvent?"_"+emp.subEvent.replace(/\s+/g,"_"):"")+"_"+emp.name.replace(/\s+/g,"_")+".csv"; a.click();
   };
 
   const exportXeroBills = () => {
     const allRows = [header];
     const byEmp = {};
-    entries.forEach(e=>{ const k=e.employeeEmail||e.employeeName; if(!byEmp[k]) byEmp[k]={name:e.employeeName,email:e.employeeEmail,entries:[]}; byEmp[k].entries.push(e); });
+    // Only unsent entries — exporting the batch never re-includes already-billed work.
+    entries.filter(e=>!e.xeroSent).forEach(e=>{ const k=e.employeeEmail||e.employeeName; if(!byEmp[k]) byEmp[k]={name:e.employeeName,email:e.employeeEmail,entries:[]}; byEmp[k].entries.push(e); });
     const expByEmp = {};
     expenses.forEach(e=>{ const k=e.employeeEmail||e.employeeName; if(!expByEmp[k]) expByEmp[k]=[]; expByEmp[k].push(e); });
     const allKeys = new Set([...Object.keys(byEmp),...Object.keys(expByEmp)]);
     allKeys.forEach(k=>{ const emp=byEmp[k]||{name:(expByEmp[k]||[])[0]?.employeeName||k,email:k,entries:[]}; const cfg=empRecords[emp.email]?.payCfg||emp.entries[0]?.payCfg; buildEmpXeroRows(emp,emp.entries,expByEmp[k]||[],cfg).forEach(r=>allRows.push(r)); });
-    if(allRows.length<=1){alert("No pay data found.");return;}
+    if(allRows.length<=1){alert("No unsent pay data found.\n\nEverything may already be marked sent to Xero.");return;}
     const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([toCSV(allRows)],{type:"text/csv"}));
     a.download="Xero_Bills_"+selectedEvent.replace(/\s+/g,"_")+".csv"; a.click();
   };
@@ -1372,8 +1479,8 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
   };
 
   const exportExpCSV = () => {
-    const rows=[["Employee","Email","Date","Type","Amount","Currency","Description","Status","Receipt"],
-      ...expenses.map(e=>[e.employeeName,e.employeeEmail,e.date,e.type,(e.amount||0).toFixed(2),e.currency,`"${(e.description||"").replace(/"/g,'""')}"`,e.status||"pending",e.receiptUrl||""])];
+    const rows=[["Employee","Email","Date","Type","Sub-event","Amount","Currency","Description","Status","Receipt"],
+      ...scopedExpenses.map(e=>[e.employeeName,e.employeeEmail,e.date,e.type,e.subEvent||"",(e.amount||0).toFixed(2),e.currency,`"${(e.description||"").replace(/"/g,'""')}"`,e.status||"pending",e.receiptUrl||""])];
     const csv=rows.map(r=>r.join(",")).join("\n");
     const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
     a.download=`DBX_Expenses_${selectedEvent.replace(/\s+/g,"_")}.csv`; a.click();
@@ -1395,7 +1502,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
   };
 
   const printEmployeeReport = (emp) => {
-    const empExpenses = expenses.filter(e=>e.employeeEmail===emp.email);
+    const empExpenses = expenses.filter(e=>e.employeeEmail===emp.email && (e.subEvent||"")===(emp.subEvent||""));
     const sorted = [...emp.entries].sort((a,b)=>a.date.localeCompare(b.date));
     const fmtH = (h) => { const hrs=Math.floor(h),mins=Math.round((h-hrs)*60); return `${hrs}h${mins>0?` ${mins}m`:""}`; };
     const fmtDate = (d) => new Date(d+"T12:00:00").toLocaleDateString("en-CA",{weekday:"short",month:"short",day:"numeric",year:"numeric"});
@@ -1408,9 +1515,9 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     const totalH = totalMins/60;
     const hourlyPay = sorted.reduce((a,e)=>{ if(!e.startTime||!e.endTime||["non-working","per-diem","working-day"].includes(e.dayType)) return a; const m=calcMins(e.startTime,e.endTime); const r=Number(e.hourlyOverride)||parseFloat(e.hourlyOverride)||(cfg?.hourly||0); return a+(m/60)*r; },0);
     const tripPay = sorted.reduce((a,e)=>{const t=parseFloat(e.numTrips)||0;const r=parseFloat(e.tripRateOverride)||(cfg?.tripRate||0);return a+t*r;},0);
-    const wdPay = sorted.reduce((a,e)=>{const d=parseFloat(e.numDays)||0;const r=parseFloat(e.dayRateOverride)||(cfg?.workDay||0);return a+d*r;},0);
-    const nwPay = sorted.reduce((a,e)=>{const d=parseFloat(e.numNwDays)||0;const r=parseFloat(e.nwDayRateOverride)||(cfg?.nonWorkDay||0);return a+d*r;},0)+sorted.filter(e=>e.dayType==="non-working").length*(cfg?.nonWorkDay||0);
-    const pdPay = sorted.reduce((a,e)=>{const d=parseFloat(e.numPerDiem)||0;const r=parseFloat(e.perDiemRateOverride)||(cfg?.perDiem||0);return a+d*r;},0)+sorted.filter(e=>e.dayType==="per-diem").length*(cfg?.perDiem||0);
+    const wdPay = sorted.reduce((a,e)=>{if(e.dayType==="expense-only")return a;const d=parseFloat(e.numDays)||0;const r=parseFloat(e.dayRateOverride)||(cfg?.workDay||0);return a+d*r;},0);
+    const nwPay = sorted.reduce((a,e)=>{if(e.dayType==="expense-only")return a;const d=parseFloat(e.numNwDays)||0;const r=parseFloat(e.nwDayRateOverride)||(cfg?.nonWorkDay||0);return a+d*r;},0)+sorted.filter(e=>e.dayType==="non-working").length*(cfg?.nonWorkDay||0);
+    const pdPay = sorted.reduce((a,e)=>{if(e.dayType==="expense-only")return a;const d=parseFloat(e.numPerDiem)||0;const r=parseFloat(e.perDiemRateOverride)||(cfg?.perDiem||0);return a+d*r;},0)+sorted.filter(e=>e.dayType==="per-diem"&&!(parseFloat(e.numPerDiem)>0)).length*(cfg?.perDiem||0);
     const expPay = sorted.reduce((a,e)=>a+(parseFloat(e.expenseAmt)||0),0);
     const empTotal = hourlyPay + tripPay + wdPay + nwPay + pdPay + expPay;
 
@@ -1432,7 +1539,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
       if((parseFloat(e.expenseAmt)||0)>0) pp.push(`<span style="color:#8b5cf6;font-weight:600">🧾 ${e.expenseDesc||"Expense"} ${e.expenseCurrency||"CAD"} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}${inclTaxLabel(e.expenseAmt, e.expenseTax)}</span>`);
       const payStr = pp.length ? pp.join("<br>") : "—";
       return `<tr>
-        <td style="padding:8px 10px;border-bottom:1px solid #eee;white-space:nowrap">${fmtDate(e.date)}${dayTag}</td>
+        <td style="padding:8px 10px;border-bottom:1px solid #eee;white-space:nowrap">${fmtDate(e.date)}${dayTag}${e.subEvent?`<span style="margin-left:5px;padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700;background:#e0f2fe;color:#0ea5e9">${e.subEvent}</span>`:""}</td>
         <td style="padding:8px 10px;border-bottom:1px solid #eee;white-space:nowrap">${isDayType?"—":(e.startTime||"—")+" → "+(e.endTime||"—")}${!isDayType&&overnight?" <em style='color:#b45309;font-size:10px'>(overnight)</em>":""}</td>
         <td style="padding:8px 10px;border-bottom:1px solid #eee;font-weight:700;color:#d42b2b;white-space:nowrap">${isDayType?"—":fmtH(h)}</td>
         <td style="padding:8px 10px;border-bottom:1px solid #eee;white-space:nowrap">${payStr}</td>
@@ -1453,7 +1560,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
     if(tripPay>0) { const tt=sorted.reduce((a,e)=>a+(parseFloat(e.numTrips)||0),0); sr.push(`<tr><td style="padding:4px 0;color:#555">Trips / Trajets (${tt}):</td><td style="text-align:right;font-weight:600;color:#f59e0b">${sym}${tripPay.toFixed(2)}</td></tr>`); }
     if(wdPay>0) { const td2=sorted.reduce((a,e)=>a+(parseFloat(e.numDays)||0),0); sr.push(`<tr><td style="padding:4px 0;color:#555">Working days / Jours travaillés (${td2}):</td><td style="text-align:right;font-weight:600">${sym}${wdPay.toFixed(2)}</td></tr>`); }
     if(nwPay>0) { const tn=sorted.reduce((a,e)=>a+(parseFloat(e.numNwDays)||0),0)+sorted.filter(e=>e.dayType==="non-working").length; sr.push(`<tr><td style="padding:4px 0;color:#555">Non-working days / Jours non-travaillés (${tn}):</td><td style="text-align:right;font-weight:600;color:#f97316">${sym}${nwPay.toFixed(2)}</td></tr>`); }
-    if(pdPay>0) { const tp=sorted.reduce((a,e)=>a+(parseFloat(e.numPerDiem)||0),0)+sorted.filter(e=>e.dayType==="per-diem").length; sr.push(`<tr><td style="padding:4px 0;color:#555">Per diem (${tp}):</td><td style="text-align:right;font-weight:600;color:#0ea5e9">${sym}${pdPay.toFixed(2)}</td></tr>`); }
+    if(pdPay>0) { const tp=sorted.reduce((a,e)=>e.dayType==="expense-only"?a:a+(parseFloat(e.numPerDiem)||0),0)+sorted.filter(e=>e.dayType==="per-diem"&&!(parseFloat(e.numPerDiem)>0)).length; sr.push(`<tr><td style="padding:4px 0;color:#555">Per diem (${tp}):</td><td style="text-align:right;font-weight:600;color:#0ea5e9">${sym}${pdPay.toFixed(2)}</td></tr>`); }
     if(expPay>0) sr.push(`<tr><td style="padding:4px 0;color:#555">Expenses / Dépenses:</td><td style="text-align:right;font-weight:600;color:#8b5cf6">${expPay.toFixed(2)}</td></tr>`);
     const paySummary = sr.length ? `
       <div style="margin-top:24px;padding:14px 16px;background:#f0fff4;border:1px solid #86efac;border-radius:6px">
@@ -1493,7 +1600,10 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
 
   const printSummary = () => {
     const w=window.open("","_blank");
-    w.document.write(buildPrintHtml(selectedEvent,employees,entries,expenses,totalHours));
+    // Expenses aren't sub-event tagged yet, so they aren't narrowed by the filter
+    // (that would hide all of them). Entries are scoped to the chosen sub-event.
+    const titleEvent = selectedSubs.length===0 ? selectedEvent : `${selectedEvent} — ${selectedSubs.join(", ")}`;
+    w.document.write(buildPrintHtml(titleEvent,employees,scopedEntries,scopedExpenses,totalHours));
     w.document.close();
   };
 
@@ -1559,7 +1669,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
           <button style={bS} onClick={loadData} disabled={loading}><Ic n="refresh" s={13}/> Refresh</button>
           <button style={bS} onClick={exportCSV} disabled={!entries.length}><Ic n="download" s={13}/> Hours CSV</button>
           <button style={bS} onClick={exportExpCSV} disabled={!expenses.length}><Ic n="download" s={13}/> Expenses CSV</button>
-          <button style={bP} onClick={printSummary} disabled={!entries.length}><Ic n="download" s={13}/> Print PDF</button>
+          <button style={bP} onClick={printSummary} disabled={!entries.length} title={selectedSubs.length?`Report scoped to: ${selectedSubs.join(", ")}`:"Whole event report"}><Ic n="download" s={13}/> Print PDF{selectedSubs.length>0?` · ${selectedSubs.length===1?selectedSubs[0]:selectedSubs.length+" sub-events"}`:""}</button>
         </div>
       </div>
 
@@ -1570,11 +1680,61 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
           {events.length===0
             ? <div style={{fontSize:13,color:T.muted}}>No active events. Add one in the Events page.</div>
             : [
-            <button key="__all__" onClick={()=>setSelectedEvent("__all__")} style={{padding:"8px 14px",borderRadius:7,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${selectedEvent==="__all__"?T.red:T.border}`,background:selectedEvent==="__all__"?T.redDim:"transparent",color:selectedEvent==="__all__"?T.red:T.muted}}>All Events</button>,
+            <button key="__all__" onClick={()=>{setSelectedEvent("__all__");setSelectedSubs([]);}} style={{padding:"8px 14px",borderRadius:7,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${selectedEvent==="__all__"?T.red:T.border}`,background:selectedEvent==="__all__"?T.redDim:"transparent",color:selectedEvent==="__all__"?T.red:T.muted}}>All Events</button>,
             ...events.map(ev=>(
-            <button key={ev} onClick={()=>setSelectedEvent(ev)} style={{padding:"8px 14px",borderRadius:7,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${selectedEvent===ev?T.red:T.border}`,background:selectedEvent===ev?T.redDim:"transparent",color:selectedEvent===ev?T.red:T.muted}}>{ev}</button>
+            <button key={ev} onClick={()=>{setSelectedEvent(ev);setSelectedSubs([]);}} style={{padding:"8px 14px",borderRadius:7,fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${selectedEvent===ev?T.red:T.border}`,background:selectedEvent===ev?T.redDim:"transparent",color:selectedEvent===ev?T.red:T.muted}}>{ev}</button>
           ))]}
         </div>
+        {(()=>{
+          // Sub-event filter. Chips when there are a few; a compact multi-select
+          // dropdown when there are many (e.g. 52 weeks) so it stays clean.
+          // Archived sub-events still appear here (you can still report on past
+          // weeks) but are marked; they're only hidden from the EMPLOYEE app.
+          const curDoc = eventDocs.find(d=>d.name===selectedEvent);
+          const allSubs = Array.isArray(curDoc?.subEvents) ? curDoc.subEvents : [];
+          const archived = curDoc?.archivedSubEvents || [];
+          if (selectedEvent==="__all__" || allSubs.length===0) return null;
+          const allActive = selectedSubs.length===0;
+          const toggle = (s) => setSelectedSubs(prev => prev.includes(s) ? prev.filter(x=>x!==s) : [...prev, s]);
+          const chip = (active,color) => ({padding:"5px 12px",borderRadius:14,fontSize:11,fontWeight:700,cursor:"pointer",fontFamily:"inherit",border:`1px solid ${active?color:T.border}`,background:active?(color==="#0ea5e9"?"rgba(14,165,233,0.15)":T.redDim):"transparent",color:active?color:T.muted});
+          const MANY = 6;
+          if (allSubs.length > MANY) {
+            // Dropdown multi-select
+            const label = allActive ? "All sub-events" : selectedSubs.length===1 ? selectedSubs[0] : `${selectedSubs.length} sub-events`;
+            return (
+              <div style={{marginTop:12,position:"relative",maxWidth:420}}>
+                <div style={{fontSize:11,color:T.muted,fontWeight:600,marginBottom:6}}>Sub-events <span style={{fontWeight:400}}>— pick one, several, or all for the report</span></div>
+                <button onClick={()=>setSubMenuOpen(o=>!o)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,width:"100%",padding:"8px 12px",borderRadius:8,fontSize:12,fontFamily:"inherit",fontWeight:600,cursor:"pointer",background:T.card,color:allActive?T.text:"#0ea5e9",border:`1px solid ${allActive?T.border:"#0ea5e9"}`}}>
+                  <span>{label}</span><span style={{color:T.muted}}>{subMenuOpen?"▲":"▼"}</span>
+                </button>
+                {subMenuOpen && (
+                  <div style={{position:"absolute",zIndex:50,marginTop:4,width:"100%",maxHeight:320,overflowY:"auto",background:T.card,border:`1px solid ${T.border}`,borderRadius:8,boxShadow:"0 10px 30px rgba(0,0,0,0.4)",padding:6}}>
+                    <div onClick={()=>{setSelectedSubs([]);}} style={{padding:"7px 10px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:700,color:allActive?T.red:T.muted,background:allActive?T.redDim:"transparent"}}>{allActive?"✓ ":""}All sub-events (whole event)</div>
+                    <div style={{height:1,background:T.border,margin:"4px 0"}}/>
+                    {allSubs.map(s=>{
+                      const on=selectedSubs.includes(s); const isArch=archived.includes(s);
+                      return <div key={s} onClick={()=>toggle(s)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"7px 10px",borderRadius:6,cursor:"pointer",fontSize:12,fontWeight:on?700:500,color:on?"#0ea5e9":T.text,background:on?"rgba(14,165,233,0.12)":"transparent"}}>
+                        <span>{on?"✓ ":""}{s}</span>{isArch&&<span style={{fontSize:9,color:T.dim}}>📦 archived</span>}
+                      </div>;
+                    })}
+                  </div>
+                )}
+                {!allActive && <div style={{fontSize:11,color:"#0ea5e9",fontWeight:600,marginTop:6}}>Showing {selectedSubs.length} sub-event{selectedSubs.length===1?"":"s"} (screen + exports)</div>}
+              </div>
+            );
+          }
+          // Chips (few sub-events)
+          return (
+            <div style={{marginTop:12}}>
+              <div style={{fontSize:11,color:T.muted,fontWeight:600,marginBottom:6}}>Sub-events <span style={{fontWeight:400}}>— pick one, several, or all for the report</span></div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                <button onClick={()=>setSelectedSubs([])} style={chip(allActive,T.red)}>All sub-events</button>
+                {allSubs.map(s=><button key={s} onClick={()=>toggle(s)} style={chip(selectedSubs.includes(s),"#0ea5e9")}>{selectedSubs.includes(s)?"✓ ":""}{s}{archived.includes(s)?" 📦":""}</button>)}
+                {!allActive && <span style={{fontSize:11,color:"#0ea5e9",fontWeight:600,marginLeft:4}}>Showing {selectedSubs.length} sub-event{selectedSubs.length===1?"":"s"} (screen + exports)</span>}
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       {/* Stats */}
@@ -1601,15 +1761,17 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
           <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input value={empSearch} onChange={e=>setEmpSearch(e.target.value)} placeholder="Search employee..." style={{background:"transparent",border:"none",color:T.text,fontSize:12,outline:"none",width:"100%",fontFamily:"inherit"}}/>
         </div>
-        {employees.filter(emp=>!xeroSent[emp.email]).filter(emp=>!empSearch||emp.name.toLowerCase().includes(empSearch.toLowerCase())||emp.email.toLowerCase().includes(empSearch.toLowerCase())).map(emp=>{
-          const expanded=expandedEmp===emp.email;
-          return <div key={emp.email} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:10,marginBottom:10,overflow:"hidden"}}>
-            <div onClick={()=>setExpandedEmp(expanded?null:emp.email)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 16px",cursor:"pointer"}}>
+        {activeEmployees.filter(emp=>!empSearch||emp.name.toLowerCase().includes(empSearch.toLowerCase())||emp.email.toLowerCase().includes(empSearch.toLowerCase())).map(emp=>{
+          const cardId = (emp.email||emp.name)+"||"+(emp.subEvent||"");
+          const expanded=expandedEmp===cardId;
+          return <div key={cardId} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:10,marginBottom:10,overflow:"hidden"}}>
+            <div onClick={()=>setExpandedEmp(expanded?null:cardId)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 16px",cursor:"pointer"}}>
               <div style={{display:"flex",alignItems:"center",gap:12}}>
                 <div style={{width:34,height:34,borderRadius:"50%",background:T.surface,display:"flex",alignItems:"center",justifyContent:"center",color:T.muted,flexShrink:0}}><Ic n="user" s={16}/></div>
                 <div>
                   <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                     <div style={{fontSize:14,fontWeight:600,color:T.text}}>{emp.name}</div>
+                    {emp.subEvent&&<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,background:"rgba(14,165,233,0.15)",color:"#0ea5e9",border:"1px solid rgba(14,165,233,0.4)",whiteSpace:"nowrap"}}>◆ {emp.subEvent}</span>}
                     {selectedEvent==="__all__" && emp.events && emp.events.map(ev=><span key={ev} style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,background:"rgba(220,38,38,0.1)",color:T.red,whiteSpace:"nowrap"}}>{ev==="__all__"?"No Event":ev}</span>)}
                     {/* Event-level document links */}
                     {(empRecords[emp.email?.toLowerCase?.().trim()]?.eventDocs||empRecords[emp.email]?.eventDocs||[]).filter(d=>selectedEvent==="__all__"||d.event===selectedEvent||!d.event).map((d,i)=>(
@@ -1669,13 +1831,26 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
                   <button onClick={()=>{setRecapEmp(emp);setRecapMsg(defaultRecapMsg(selectedEvent));setRecapExtraEmails("");setShowRecapModal(true);}} disabled={sendingRecap===emp.email} style={{background:"rgba(34,197,94,0.15)",border:`1px solid ${T.green}`,color:T.green,cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                     📧 {sendingRecap===emp.email?"Sending...":"Send Recap"}
                   </button>
+                  {/* View Invoice — vendor charges only */}
+                  {emp.entries[0]?.entryType==="vendor-charge" && (() => {
+                    const invEntry = emp.entries.find(e=>e.attachmentUrl);
+                    return invEntry ? (
+                      <a href={invEntry.attachmentUrl} target="_blank" rel="noreferrer" style={{background:"rgba(34,197,94,0.15)",border:"1px solid #22c55e",color:"#22c55e",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600,textDecoration:"none"}}>
+                        📄 View Invoice
+                      </a>
+                    ) : (
+                      <span style={{background:"rgba(100,116,139,0.1)",border:"1px solid #334155",color:"#64748b",borderRadius:6,padding:"5px 10px",fontSize:11,display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                        📄 No Invoice
+                      </span>
+                    );
+                  })()}
                   <button onClick={(e)=>{e.stopPropagation();printEmployeeReport(emp);}} style={{background:"rgba(220,38,38,0.15)",border:`1px solid ${T.red}`,color:T.red,cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                     <Ic n="pdf" s={12}/> PDF
                   </button>
-                  <button onClick={(e)=>{e.stopPropagation();if(selectedEvent==="__all__"){alert("Please select a specific event first.");return;}if(emp.entries[0]?.entryType==="vendor-charge"){exportVendorCsv(emp.email);}else{exportXeroBillSingle(emp.email);}}} style={{background:"rgba(0,168,132,0.15)",border:"1px solid #00a884",color:"#00a884",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                  <button onClick={(e)=>{e.stopPropagation();if(selectedEvent==="__all__"){alert("Please select a specific event first.");return;}if(emp.entries[0]?.entryType==="vendor-charge"){exportVendorCsv(emp.email);}else{exportXeroBillSingle(emp);}}} style={{background:"rgba(0,168,132,0.15)",border:"1px solid #00a884",color:"#00a884",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                     <Ic n="download" s={12}/> Xero CSV
                   </button>
-                  <button onClick={async(e)=>{e.stopPropagation();if(!window.confirm("Mark all entries for "+emp.name+" as sent to Xero?"))return;try{for(const entry of emp.entries){await updateDoc(doc(db,"timesheets",entry.id),{xeroSent:true});}setEntries(prev=>prev.map(en=>en.employeeEmail===emp.email?{...en,xeroSent:true}:en));}catch(err){console.error(err);alert("Error marking entries");}}} style={{background:"rgba(139,92,246,0.15)",border:"1px solid #8b5cf6",color:"#8b5cf6",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                  <button onClick={async(e)=>{e.stopPropagation();if(!window.confirm("Mark "+emp.entries.length+" entr"+(emp.entries.length===1?"y":"ies")+" for "+emp.name+" as sent to Xero?"))return;try{const ids=new Set(emp.entries.map(en=>en.id));for(const entry of emp.entries){await updateDoc(doc(db,"timesheets",entry.id),{xeroSent:true});}setEntries(prev=>prev.map(en=>ids.has(en.id)?{...en,xeroSent:true}:en));}catch(err){console.error(err);alert("Error marking entries");}}} style={{background:"rgba(139,92,246,0.15)",border:"1px solid #8b5cf6",color:"#8b5cf6",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                     <Ic n="check" s={12}/> Sent to Xero ✓
                   </button>
                   <button onClick={()=>moveEmployee(emp)} style={{background:"rgba(59,130,246,0.15)",border:"1px solid #3b82f6",color:"#60a5fa",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
@@ -1706,6 +1881,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
                   <div>
                     <div style={{fontSize:12,fontWeight:600,color:T.text}}>{fd(entry.date)}</div>
                     <div style={{fontSize:11,color:T.muted,marginTop:2}}>{["non-working","per-diem","working-day"].includes(entry.dayType)?<span style={{fontStyle:"italic"}}>{entry.dayType==="per-diem"?"Per diem":entry.dayType==="non-working"?"Non-working day":"Working day"}</span>:<>{entry.startTime} → {entry.endTime}{overnight&&<span style={{color:T.amber}}> ☽</span>}</>}</div>
+                    {entry.subEvent&&<div style={{marginTop:3}}><span style={{display:"inline-block",fontSize:9,fontWeight:700,padding:"1px 6px",borderRadius:4,background:"rgba(14,165,233,0.12)",color:"#0ea5e9",border:"1px solid rgba(14,165,233,0.35)"}}>{entry.subEvent}</span></div>}
                     {entry.manuallyEdited&&<div style={{fontSize:9,color:T.dim,marginTop:1}}>✎ edited</div>}
                     {/* Working / Non-working toggle — only shown for daily pay */}
                     {emp.payCfg==="daily" && <button onClick={toggleDayType} style={{marginTop:4,fontSize:10,padding:"2px 7px",borderRadius:4,border:`1px solid ${isNonWorking?"#f97316":T.green}`,background:isNonWorking?"rgba(249,115,22,0.12)":"rgba(34,197,94,0.12)",color:isNonWorking?"#f97316":T.green,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}>
@@ -1725,9 +1901,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
                         {(parseFloat(entry.numPerDiem)||0)>0&&<span style={{fontSize:11,color:"#0ea5e9",fontWeight:600}}>{"🍽️ "+parseFloat(entry.numPerDiem)+" per diem × $"+(parseFloat(entry.perDiemRateOverride)||(parseFloat(emp.payCfg?.perDiem)||0)).toFixed(0)+" = $"+((parseFloat(entry.numPerDiem)||0)*(parseFloat(entry.perDiemRateOverride)||(parseFloat(emp.payCfg?.perDiem)||0))).toFixed(2)}</span>}
                         {entry.dayType==="per-diem"&&!(parseFloat(entry.numPerDiem)>0)&&<span style={{fontSize:11,color:"#0ea5e9",fontWeight:600}}>🍽️ Per diem (employee)</span>}
                         {(parseFloat(entry.expenseAmt)||0)>0&&<span style={{fontSize:11,color:"#8b5cf6",fontWeight:600}}>{"🧾 "+(entry.expenseDesc||"Expense")+" — $"+(parseFloat(entry.expenseAmt)||0).toFixed(2)+inclTaxLabel(entry.expenseAmt, entry.expenseTax)}</span>}
-                        {expenses.filter(ex=>ex.employeeEmail===emp.email&&ex.date===entry.date).map((ex,i)=>(
-                          <span key={i} style={{fontSize:11,color:"#8b5cf6",fontWeight:600}}>{"🧾 "+ex.type+" — $"+parseFloat(ex.amount||0).toFixed(2)+" ("+ex.currency+")"+(ex.description?" · "+ex.description:"")}</span>
-                        ))}
+                        {entry.expenseReceiptUrl&&<a href={entry.expenseReceiptUrl} target="_blank" rel="noreferrer" style={{fontSize:10,color:"#0ea5e9",fontWeight:600,textDecoration:"underline"}}>🧾 View receipt</a>}
                       </div>
                     )}
                     {(entry.truckUnit||entry.trailerUnit||entry.kmStart!=null||entry.unitLog?.length>0) && (
@@ -1824,15 +1998,17 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
           <button onClick={()=>setShowXeroDone(!showXeroDone)} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 14px",borderRadius:8,border:"1px solid #8b5cf6",background:"rgba(139,92,246,0.08)",color:"#8b5cf6",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"inherit",marginBottom:12}}>
             Sent to Xero ({Object.keys(xeroSent).length}) {showXeroDone ? "▲" : "▼"}
           </button>
-          {showXeroDone && employees.filter(emp=>xeroSent[emp.email]).filter(emp=>!empSearch||emp.name.toLowerCase().includes(empSearch.toLowerCase())||emp.email.toLowerCase().includes(empSearch.toLowerCase())).map(emp=>{
-            const expanded = expandedEmp===emp.email+"_xero";
-            return <div key={emp.email} style={{background:T.card,border:"1px solid #8b5cf6",borderRadius:10,marginBottom:8,opacity:0.85}}>
-              <div onClick={()=>setExpandedEmp(expanded?null:emp.email+"_xero")} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 16px",cursor:"pointer"}}>
+          {showXeroDone && sentEmployees.filter(emp=>!empSearch||emp.name.toLowerCase().includes(empSearch.toLowerCase())||emp.email.toLowerCase().includes(empSearch.toLowerCase())).map(emp=>{
+            const cardId = (emp.email||emp.name)+"||"+(emp.subEvent||"")+"_xero";
+            const expanded = expandedEmp===cardId;
+            return <div key={cardId} style={{background:T.card,border:"1px solid #8b5cf6",borderRadius:10,marginBottom:8,opacity:0.85}}>
+              <div onClick={()=>setExpandedEmp(expanded?null:cardId)} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 16px",cursor:"pointer"}}>
                 <div style={{display:"flex",alignItems:"center",gap:12}}>
                   <div style={{width:34,height:34,borderRadius:"50%",background:T.surface,display:"flex",alignItems:"center",justifyContent:"center",color:T.muted,flexShrink:0}}><Ic n="user" s={16}/></div>
                   <div>
                     <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
                       <div style={{fontSize:14,fontWeight:600,color:T.text}}>{emp.name}</div>
+                      {emp.subEvent&&<span style={{fontSize:10,fontWeight:700,padding:"2px 8px",borderRadius:10,background:"rgba(14,165,233,0.15)",color:"#0ea5e9",border:"1px solid rgba(14,165,233,0.4)"}}>◆ {emp.subEvent}</span>}
                       <span style={{fontSize:10,padding:"2px 8px",borderRadius:12,background:"rgba(139,92,246,0.15)",color:"#8b5cf6",fontWeight:700}}>✓ Sent to Xero</span>
                     </div>
                     <div style={{fontSize:11,color:T.muted,marginTop:1}}>{emp.email} · {emp.phone}</div>
@@ -1851,13 +2027,26 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
                     <button onClick={()=>{setRecapEmp(emp);setRecapMsg(defaultRecapMsg(selectedEvent));setRecapExtraEmails("");setShowRecapModal(true);}} disabled={sendingRecap===emp.email} style={{background:"rgba(34,197,94,0.15)",border:`1px solid ${T.green}`,color:T.green,cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                       📧 {sendingRecap===emp.email?"Sending...":"Send Recap"}
                     </button>
+                    {/* View Invoice for vendor charges */}
+                    {emp.entries[0]?.entryType==="vendor-charge" && (() => {
+                      const invEntry = emp.entries.find(e=>e.attachmentUrl);
+                      return invEntry ? (
+                        <a href={invEntry.attachmentUrl} target="_blank" rel="noreferrer" style={{background:"rgba(34,197,94,0.15)",border:"1px solid #22c55e",color:"#22c55e",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600,textDecoration:"none"}}>
+                          📄 View Invoice
+                        </a>
+                      ) : (
+                        <span style={{background:"rgba(100,116,139,0.1)",border:"1px solid #334155",color:"#64748b",borderRadius:6,padding:"5px 10px",fontSize:11,display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                          📄 No Invoice
+                        </span>
+                      );
+                    })()}
                     <button onClick={(e)=>{e.stopPropagation();printEmployeeReport(emp);}} style={{background:"rgba(220,38,38,0.15)",border:`1px solid ${T.red}`,color:T.red,cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                       <Ic n="pdf" s={12}/> PDF
                     </button>
-                    <button onClick={(e)=>{e.stopPropagation();if(selectedEvent==="__all__"){alert("Please select a specific event first.");return;}if(emp.entries[0]?.entryType==="vendor-charge"){exportVendorCsv(emp.email);}else{exportXeroBillSingle(emp.email);}}} style={{background:"rgba(0,168,132,0.15)",border:"1px solid #00a884",color:"#00a884",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                    <button onClick={(e)=>{e.stopPropagation();if(selectedEvent==="__all__"){alert("Please select a specific event first.");return;}if(emp.entries[0]?.entryType==="vendor-charge"){exportVendorCsv(emp.email);}else{exportXeroBillSingle(emp);}}} style={{background:"rgba(0,168,132,0.15)",border:"1px solid #00a884",color:"#00a884",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                       <Ic n="download" s={12}/> Xero CSV
                     </button>
-                    <button onClick={async(e)=>{e.stopPropagation();if(!window.confirm("Move "+emp.name+" back to active?"))return;try{for(const entry of emp.entries){await updateDoc(doc(db,"timesheets",entry.id),{xeroSent:false});}setEntries(prev=>prev.map(en=>en.employeeEmail===emp.email?{...en,xeroSent:false}:en));}catch(err){console.error(err);alert("Error");}}} style={{background:"rgba(245,158,11,0.15)",border:"1px solid #f59e0b",color:"#f59e0b",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
+                    <button onClick={async(e)=>{e.stopPropagation();if(!window.confirm("Move "+emp.entries.length+" entr"+(emp.entries.length===1?"y":"ies")+" for "+emp.name+" back to active?"))return;try{const ids=new Set(emp.entries.map(en=>en.id));for(const entry of emp.entries){await updateDoc(doc(db,"timesheets",entry.id),{xeroSent:false});}setEntries(prev=>prev.map(en=>ids.has(en.id)?{...en,xeroSent:false}:en));}catch(err){console.error(err);alert("Error");}}} style={{background:"rgba(245,158,11,0.15)",border:"1px solid #f59e0b",color:"#f59e0b",cursor:"pointer",borderRadius:6,padding:"5px 10px",fontSize:11,fontFamily:"inherit",display:"flex",alignItems:"center",gap:5,whiteSpace:"nowrap",fontWeight:600}}>
                       ↩ Move Back
                     </button>
                   </div>
@@ -1877,21 +2066,30 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
                   const pPay=(parseFloat(entry.numPerDiem)||0)*(parseFloat(entry.perDiemRateOverride)||(parseFloat(emp.payCfg?.perDiem)||0));
                   const ePay=parseFloat(entry.expenseAmt)||0;
                   const total=hPay+tPay+dPay+nPay+pPay+ePay;
-                  return <div key={entry.id} style={{padding:"12px 16px",borderBottom:`1px solid ${T.hover}`,display:"grid",gridTemplateColumns:"110px 50px 200px 1fr",gap:8,alignItems:"start"}}>
+                  return <div key={entry.id} style={{padding:"12px 16px",borderBottom:`1px solid ${T.hover}`,display:"grid",gridTemplateColumns:"110px 50px 1fr auto",gap:8,alignItems:"start"}}>
                     <div>
                       <div style={{fontSize:12,fontWeight:600,color:T.text}}>{fd(entry.date)}</div>
                       {!isDT&&<div style={{fontSize:11,color:T.muted,fontFamily:"'IBM Plex Mono',monospace"}}>{entry.startTime} → {entry.endTime}</div>}
                     </div>
                     <div style={{fontSize:13,fontWeight:700,color:isDT?T.muted:T.red,fontFamily:"'IBM Plex Mono',monospace"}}>{isDT?"—":h.toFixed(1)+"h"}</div>
-                    <div style={{fontSize:11,color:T.muted}}>{entry.notes||entry.description||"—"}</div>
-                    <div style={{fontSize:11,textAlign:"right"}}>
-                      {hPay>0&&<div style={{color:"#22c55e",fontWeight:600}}>{h.toFixed(1)}h × {sym+hr.toFixed(2)} = <strong>{sym+hPay.toFixed(2)}</strong></div>}
-                      {tPay>0&&<div style={{color:"#f59e0b"}}>{parseFloat(entry.numTrips)} trip{parseFloat(entry.numTrips)>1?"s":""} = {sym+tPay.toFixed(2)}</div>}
-                      {dPay>0&&<div style={{color:"#f59e0b"}}>{parseFloat(entry.numDays)} day = {sym+dPay.toFixed(2)}</div>}
-                      {nPay>0&&<div style={{color:"#f97316"}}>{parseFloat(entry.numNwDays)} NW = {sym+nPay.toFixed(2)}</div>}
-                      {pPay>0&&<div style={{color:"#0ea5e9"}}>Diem = {sym+pPay.toFixed(2)}</div>}
-                      {ePay>0&&<div style={{color:"#8b5cf6"}}>Exp = {(entry.expenseCurrency||"CAD")} {ePay.toFixed(2)}</div>}
-                      {total>0&&<div style={{fontWeight:700,color:"#22c55e",borderTop:"1px solid "+T.border,marginTop:2,paddingTop:2}}>{sym+total.toFixed(2)} {emp.payCfg?.currency||"CAD"}</div>}
+                    <div>
+                      {entry.entryType==="vendor-charge"
+                        ? <div><strong style={{color:"#8b5cf6"}}>{entry.company||entry.employeeName}</strong>{entry.description&&<span style={{color:T.muted}}> — {entry.description}</span>}{entry.invoiceNum&&<span style={{color:T.dim}}> (#{entry.invoiceNum})</span>}<div style={{marginTop:4,fontSize:13,fontWeight:600,color:"#94a3b8"}}>{entry.currency||"CAD"} {(parseFloat(entry.amount)||0).toFixed(2)}{entry.taxType&&entry.taxType!=="Tax Exempt"&&<span style={{fontSize:11,color:T.dim,marginLeft:6}}>{entry.taxType}</span>}</div>{entry.taxType&&entry.taxType!=="Tax Exempt"&&<><div style={{fontSize:11,color:T.muted}}>Tax: {entry.currency||"CAD"} {vendorTaxAmt(entry).toFixed(2)}</div><div style={{fontSize:13,fontWeight:700,color:"#22c55e"}}>Total: {entry.currency||"CAD"} {vendorTotal(entry).toFixed(2)}</div></>}{(!entry.taxType||entry.taxType==="Tax Exempt")&&<div style={{fontSize:13,fontWeight:700,color:"#22c55e"}}>{entry.currency||"CAD"} {(parseFloat(entry.amount)||0).toFixed(2)}</div>}</div>
+                        : <div style={{fontSize:11,color:T.muted}}>{entry.notes||entry.description||"—"}</div>}
+                      <div style={{fontSize:11,textAlign:"left",marginTop:4}}>
+                        {hPay>0&&<div style={{color:"#22c55e",fontWeight:600}}>{h.toFixed(1)}h × {sym+hr.toFixed(2)} = <strong>{sym+hPay.toFixed(2)}</strong></div>}
+                        {tPay>0&&<div style={{color:"#f59e0b"}}>{parseFloat(entry.numTrips)} trip{parseFloat(entry.numTrips)>1?"s":""} = {sym+tPay.toFixed(2)}</div>}
+                        {dPay>0&&<div style={{color:"#f59e0b"}}>{parseFloat(entry.numDays)} day = {sym+dPay.toFixed(2)}</div>}
+                        {nPay>0&&<div style={{color:"#f97316"}}>{parseFloat(entry.numNwDays)} NW = {sym+nPay.toFixed(2)}</div>}
+                        {pPay>0&&<div style={{color:"#0ea5e9"}}>Diem = {sym+pPay.toFixed(2)}</div>}
+                        {ePay>0&&<div style={{color:"#8b5cf6"}}>Exp = {(entry.expenseCurrency||"CAD")} {ePay.toFixed(2)}</div>}
+                        {total>0&&<div style={{fontWeight:700,color:"#22c55e",borderTop:"1px solid "+T.border,marginTop:2,paddingTop:2}}>{sym+total.toFixed(2)} {emp.payCfg?.currency||"CAD"}</div>}
+                      </div>
+                    </div>
+                    {/* Read-only actions — no Edit/Delete, only view Doc */}
+                    <div style={{display:"flex",flexDirection:"column",gap:4,alignItems:"flex-end"}}>
+                      {entry.attachmentUrl&&<a href={entry.attachmentUrl} target="_blank" rel="noreferrer" style={{display:"inline-flex",alignItems:"center",gap:4,padding:"4px 10px",borderRadius:6,background:"rgba(34,197,94,0.1)",border:"1px solid rgba(34,197,94,0.3)",color:"#22c55e",fontSize:11,fontWeight:600,textDecoration:"none",whiteSpace:"nowrap"}}>📄 Doc</a>}
+                      <span style={{fontSize:10,color:T.dim,fontStyle:"italic",whiteSpace:"nowrap"}}>Move Back to edit</span>
                     </div>
                   </div>;
                 })}
@@ -1954,9 +2152,14 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
       </div>}
 
       {/* ── Expenses ── */}
-      {!loading&&view==="expenses"&&<div>
-        {!expenses.length&&<div style={{color:T.muted,fontSize:14,padding:"20px 0"}}>No expenses submitted for this event yet.</div>}
-        {expenses.map(ex=>{
+      {!loading&&view==="expenses"&&(()=>{
+        // Approved expenses become timesheet entries (via merge), so they leave
+        // this list — the Expenses tab shows only what still needs action
+        // (pending / rejected). Approved ones live in the By Employee timesheet.
+        const shownExpenses = (selectedSubs.length===0 ? expenses : expenses.filter(x=>subInScope(x.subEvent))).filter(ex => ex.status !== "approved");
+        return <div>
+        {!shownExpenses.length&&<div style={{color:T.muted,fontSize:14,padding:"20px 0"}}>No expenses awaiting review. Approved expenses appear in the By Employee timesheet.</div>}
+        {shownExpenses.map(ex=>{
           const st=STATUS_STYLE[ex.status||"pending"];
           return <div key={ex.id} style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:10,padding:"14px 16px",marginBottom:10}}>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
@@ -1972,6 +2175,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
             <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8,flexWrap:"wrap"}}>
               <span style={{fontSize:11,color:T.muted,background:T.surface,padding:"2px 10px",borderRadius:10}}>{ex.type}</span>
               {ex.event&&selectedEvent==="__all__"&&<span style={{fontSize:11,fontWeight:600,padding:"2px 10px",borderRadius:10,background:"rgba(96,165,250,0.15)",color:"#60a5fa"}}>{ex.event}</span>}
+              {ex.subEvent&&<span style={{fontSize:11,fontWeight:600,padding:"2px 10px",borderRadius:10,background:"rgba(14,165,233,0.15)",color:"#0ea5e9"}}>{ex.subEvent}</span>}
               <span style={{fontSize:11,fontWeight:600,padding:"2px 10px",borderRadius:10,background:st.bg,color:st.color}}>{st.label}</span>
             </div>
             <div style={{fontSize:13,color:T.muted,lineHeight:1.5,marginBottom:12}}>{ex.description}</div>
@@ -1986,7 +2190,8 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
             </div>
           </div>;
         })}
-      </div>}
+      </div>;
+      })()}
     </div>
   );
 }
@@ -2023,35 +2228,36 @@ function buildPrintHtml(event, employees, entries, expenses, totalHours) {
     const totalEmpMins2 = sorted.reduce((a,e)=>{ if(!e.startTime||!e.endTime||skip3.includes(e.dayType)) return a; const [sh,sm]=e.startTime.split(":").map(Number); const [eh,em]=e.endTime.split(":").map(Number); let mins=(eh*60+em)-(sh*60+sm); if(mins<=0) mins+=24*60; return a+mins; },0);
     const empHourlyPay2 = sorted.reduce((a,e)=>{ if(!e.startTime||!e.endTime||skip3.includes(e.dayType)) return a; const [sh,sm]=e.startTime.split(":").map(Number); const [eh,em]=e.endTime.split(":").map(Number); let mins=(eh*60+em)-(sh*60+sm); if(mins<=0) mins+=24*60; return a+(mins/60)*(Number(e.hourlyOverride)||parseFloat(cfg?.hourly)||0); },0);
     const empTripPay = sorted.reduce((a,e)=>a+(parseFloat(e.numTrips)||0)*(parseFloat(e.tripRateOverride)||(parseFloat(cfg?.tripRate)||0)),0);
-    const empDayPay2 = sorted.reduce((a,e)=>a+(parseFloat(e.numDays)||0)*(parseFloat(e.dayRateOverride)||parseFloat(cfg?.dayRate)||parseFloat(cfg?.workDay)||0),0);
-    const empNwPay2 = sorted.reduce((a,e)=>a+(parseFloat(e.numNwDays)||0)*(parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0)),0)+sorted.filter(e=>e.dayType==="non-working").length*(parseFloat(cfg?.nonWorkDay)||0);
-    const empPdPay2 = sorted.reduce((a,e)=>a+(parseFloat(e.numPerDiem)||0)*(parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0)),0)+sorted.filter(e=>e.dayType==="per-diem").length*(parseFloat(cfg?.perDiem)||0);
+    const empDayPay2 = sorted.reduce((a,e)=>e.dayType==="expense-only"?a:a+(parseFloat(e.numDays)||0)*(parseFloat(e.dayRateOverride)||parseFloat(cfg?.dayRate)||parseFloat(cfg?.workDay)||0),0);
+    const empNwPay2 = sorted.reduce((a,e)=>e.dayType==="expense-only"?a:a+(parseFloat(e.numNwDays)||0)*(parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0)),0)+sorted.filter(e=>e.dayType==="non-working").length*(parseFloat(cfg?.nonWorkDay)||0);
+    const empPdPay2 = sorted.reduce((a,e)=>e.dayType==="expense-only"?a:a+(parseFloat(e.numPerDiem)||0)*(parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0)),0)+sorted.filter(e=>e.dayType==="per-diem"&&!(parseFloat(e.numPerDiem)>0)).length*(parseFloat(cfg?.perDiem)||0);
     const empExpPay2 = sorted.reduce((a,e)=>a+(parseFloat(e.expenseAmt)||0),0);
     const empVendorPay2 = sorted.reduce((a,e)=>e.entryType==="vendor-charge"?a+vendorTotal(e):a,0);
     const empTotal = empHourlyPay2 + empTripPay + empDayPay2 + empNwPay2 + empPdPay2 + empExpPay2 + empVendorPay2;
     const dayRows=sorted.map(e=>{
       const h=calcH(e.startTime,e.endTime);
-      const mins = (() => { if(!e.startTime||!e.endTime) return 0; const [sh,sm]=e.startTime.split(":").map(Number); const [eh,em]=e.endTime.split(":").map(Number); let m=(eh*60+em)-(sh*60+sm); if(m<=0) m+=24*60; return m; })();
+      const mins = (() => { if(!e.startTime||!e.endTime) return 0; const [sh,sm]=e.startTime.split(":").map(Number); const [eh,em]=e.endTime.split(":").map(Number); let m=(eh*60+em)-(sh*60+sm); if(m<0) m+=24*60; return m; })();
       const overnight=e.endTime&&e.startTime&&(parseInt(e.endTime.split(":")[0])*60+parseInt(e.endTime.split(":")[1]))<(parseInt(e.startTime.split(":")[0])*60+parseInt(e.startTime.split(":")[1]));
+      const isDayType = ["non-working","per-diem","working-day"].includes(e.dayType);
+      const isExpenseOnly = e.dayType==="expense-only";
       const isNW = e.dayType==="non-working";
-      const dayTag = cfg?.type==="daily" ? `<span style="margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;background:${isNW?"#fff3e0":"#e8f5e9"};color:${isNW?"#b45309":"#16a34a"}">${isNW?"NW":"W"}</span>` : "";
-      // Pay per day calculation
-      let dayPay = null;
-      let dayPayStr = "—";
-      if(cfg) {
-        if(cfg.type==="hourly") {
-          dayPay = (mins/60)*(cfg.hourly||0);
-          dayPayStr = `<span style="color:#16a34a;font-weight:700">${sym}${dayPay.toFixed(2)}</span><span style="font-size:9px;color:#888"> (${mins}min)</span>`;
-        } else {
-          const baseDay = isNW ? (cfg.nonWorkDay||0) : (cfg.workDay||0);
-          const diem = cfg.perDiem||0;
-          dayPay = baseDay + diem;
-          dayPayStr = `<span style="color:#16a34a;font-weight:700">${sym}${dayPay.toFixed(2)}</span>${diem>0?`<span style="font-size:9px;color:#888"> (+${sym}${diem} diem)</span>`:""}`;
-        }
-      }
-      const tripExtra = (parseFloat(e.numTrips)||0)>0 ? `<div style="font-size:9px;color:#f59e0b;font-weight:700">${parseFloat(e.numTrips)} trips × ${(parseFloat(e.tripRateOverride)||(cfg?.tripRate||0)).toFixed(0)} = ${((parseFloat(e.numTrips)||0)*(parseFloat(e.tripRateOverride)||(cfg?.tripRate||0))).toFixed(2)}</div>` : "";
-      const dayExtra = (parseFloat(e.numDays)||0)>0 ? `<div style="font-size:9px;color:#f59e0b;font-weight:700">${parseFloat(e.numDays)} days × ${(parseFloat(e.dayRateOverride)||(cfg?.dayRate||0)).toFixed(0)} = ${((parseFloat(e.numDays)||0)*(parseFloat(e.dayRateOverride)||(cfg?.dayRate||0))).toFixed(2)}</div>` : "";
-      return `<tr><td style="white-space:nowrap;font-weight:600">${fmtDate(e.date)}${dayTag}</td><td style="white-space:nowrap;color:#555">${e.startTime||"—"} → ${e.endTime||"—"}${overnight?" <em style='color:#b45309;font-size:9px'>(overnight)</em>":""}</td><td style="text-align:right;font-weight:700;color:#d42b2b;white-space:nowrap">${fmtH(h)}</td><td style="text-align:right;white-space:nowrap">${dayPayStr}${tripExtra}${dayExtra}</td><td style="color:#444;font-size:11px">${e.notes||""}</td></tr>`;
+      const dayTag = isDayType ? `<span style="margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;font-weight:700;background:${isNW?"#fff3e0":e.dayType==="per-diem"?"#e0f2fe":"#e8f5e9"};color:${isNW?"#b45309":e.dayType==="per-diem"?"#0ea5e9":"#16a34a"}">${isNW?"NW":e.dayType==="per-diem"?"PD":"W"}</span>` : "";
+      // Pay parts — built from what the entry actually contains, so hourly rows
+      // show hours×rate, day/NW/per-diem rows show their own line, and
+      // expense-only rows show just the expense (never day-rate or diem).
+      const pp = [];
+      if(e.entryType==="vendor-charge") { pp.push(`<strong style="color:#8b5cf6">${e.company||e.employeeName} — ${e.description||"Vendor"}: ${e.currency||"CAD"} ${vendorTotal(e).toFixed(2)}</strong>`); }
+      else if(!isDayType && !isExpenseOnly && mins>0) { const hr=parseFloat(e.hourlyOverride)||(cfg?.hourly||0); if(hr>0) pp.push(`<span style="color:#16a34a;font-weight:700">${sym}${((mins/60)*hr).toFixed(2)}</span> <span style="font-size:9px;color:#888">(${mins}min × ${hr.toFixed(2)}/h)</span>`); }
+      if((parseFloat(e.numTrips)||0)>0) { const r=parseFloat(e.tripRateOverride)||(cfg?.tripRate||0); pp.push(`<span style="color:#f59e0b;font-weight:700">${parseFloat(e.numTrips)} trip${parseFloat(e.numTrips)>1?"s":""} × ${sym}${r.toFixed(0)} = ${sym}${(parseFloat(e.numTrips)*r).toFixed(2)}</span>`); }
+      if((parseFloat(e.numDays)||0)>0) { const r=parseFloat(e.dayRateOverride)||(cfg?.workDay||cfg?.dayRate||0); pp.push(`<span style="color:#16a34a;font-weight:700">${parseFloat(e.numDays)} day × ${sym}${r.toFixed(0)} = ${sym}${(parseFloat(e.numDays)*r).toFixed(2)}</span>`); }
+      else if(e.dayType==="working-day"&&!(parseFloat(e.numDays)>0)) { const r=cfg?.workDay||0; if(r>0) pp.push(`<span style="color:#16a34a;font-weight:700">Work day ${sym}${r.toFixed(0)}</span>`); }
+      if((parseFloat(e.numNwDays)||0)>0) { const r=parseFloat(e.nwDayRateOverride)||(cfg?.nonWorkDay||0); pp.push(`<span style="color:#f97316;font-weight:700">${parseFloat(e.numNwDays)} NW × ${sym}${r.toFixed(0)} = ${sym}${(parseFloat(e.numNwDays)*r).toFixed(2)}</span>`); }
+      else if(isNW&&!(parseFloat(e.numNwDays)>0)) { const r=cfg?.nonWorkDay||0; if(r>0) pp.push(`<span style="color:#f97316;font-weight:700">NW day ${sym}${r.toFixed(0)}</span>`); }
+      if((parseFloat(e.numPerDiem)||0)>0) { const r=parseFloat(e.perDiemRateOverride)||(cfg?.perDiem||0); pp.push(`<span style="color:#0ea5e9;font-weight:700">${parseFloat(e.numPerDiem)} per diem × ${sym}${r.toFixed(0)} = ${sym}${(parseFloat(e.numPerDiem)*r).toFixed(2)}</span>`); }
+      else if(e.dayType==="per-diem"&&!(parseFloat(e.numPerDiem)>0)) { const r=cfg?.perDiem||0; if(r>0) pp.push(`<span style="color:#0ea5e9;font-weight:700">Per diem ${sym}${r.toFixed(0)}</span>`); }
+      if((parseFloat(e.expenseAmt)||0)>0) pp.push(`<span style="color:#8b5cf6;font-weight:700">🧾 ${e.expenseDesc||"Expense"} ${e.expenseCurrency||"CAD"} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}</span>`);
+      const dayPayStr = pp.length ? pp.join("<br>") : "—";
+      return `<tr><td style="white-space:nowrap;font-weight:600">${fmtDate(e.date)}${dayTag}${e.subEvent?`<span style="margin-left:5px;padding:1px 5px;border-radius:3px;font-size:8px;font-weight:700;background:#e0f2fe;color:#0ea5e9">${e.subEvent}</span>`:""}</td><td style="white-space:nowrap;color:#555">${isDayType||isExpenseOnly?"—":(e.startTime||"—")+" → "+(e.endTime||"—")}${overnight&&!isDayType&&!isExpenseOnly?" <em style='color:#b45309;font-size:9px'>(overnight)</em>":""}</td><td style="text-align:right;font-weight:700;color:#d42b2b;white-space:nowrap">${isDayType||isExpenseOnly?"—":fmtH(h)}</td><td style="text-align:right;white-space:nowrap">${dayPayStr}</td><td style="color:#444;font-size:11px">${e.notes||""}</td></tr>`;
     }).join("");
     const expRows=empExpenses.length?empExpenses.map(ex=>`<tr><td>${fmtDate(ex.date)}</td><td>${ex.type}</td><td style="text-align:right">${ex.currency} ${parseFloat(ex.amount||0).toFixed(2)}</td><td style="color:${ex.status==="approved"?"#16a34a":ex.status==="rejected"?"#dc2626":"#b45309"};font-weight:600">${ex.status||"pending"}</td><td style="font-size:11px;color:#555">${ex.description||""}</td></tr>`).join(""):"";
     return `<div style="page-break-after:always;padding:20px">

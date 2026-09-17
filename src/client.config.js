@@ -39,3 +39,8 @@ export const CLOUD_FUNCTIONS = {
 };
 
 export const BOL_COMPANY_LABEL = "Diamond Back Express Inc.";
+
+// Default "Terms & Conditions" text pre-filled on new quotes and orders.
+// Edit this to change your standard boilerplate; existing records keep whatever
+// text they were saved with (you can still edit per record).
+export const DEFAULT_TERMS = "Please note that the fuel listed above will be charged based on actual fuel prices on date of completion. Prices reflect rental quotes (where applicable) at time of quote and may vary. Prices quoted on date given, subject to change - please allow for up to a 10% variance if applicable.\n\nExclude: Demurrage, detention, custom inspection, excessive waiting time";

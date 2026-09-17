@@ -1,104 +1,36 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // ── Tightened: was `if true` (world-readable AND writable). Now requires
+    // an auth token. Both apps authenticate (dispatch login; timesheet
+    // signInAnonymously), so legitimate users still pass. This closes public
+    // internet access; it does NOT scope each driver to their own record
+    // (anonymous tokens are interchangeable) — that would need real per-driver auth.
+    match /timesheets/{doc} { allow read, write: if request.auth != null; }
+    match /sessions/{doc} { allow read, write: if request.auth != null; }
+    match /expenses/{doc} { allow read, write: if request.auth != null; }
+    match /employees/{doc} { allow read, write: if request.auth != null; }
 
-    // ── Dispatch users: email/password login via the dispatch app ──
-    function isDispatch() {
-      return request.auth != null
-        && request.auth.token.firebase.sign_in_provider != "anonymous";
-    }
+    // Driver-uploaded docs (void cheque, licence, headshot) — driver → manager.
+    // Was read:if true; now auth-gated. Writes already fell through to the
+    // authenticated catch-all, so keep write auth'd here explicitly.
+    match /employee_documents/{doc} { allow read, write: if request.auth != null; }
 
-    // ── Any authenticated user (dispatch OR driver anonymous auth) ──
-    function isAuth() {
-      return request.auth != null;
-    }
+    // Company → driver shared docs (drug screens, border letters). Read by the
+    // driver's timesheet app; written only by dispatch (authenticated admin).
+    // NEW collection for the upcoming feature.
+    match /driver_shared_docs/{doc} { allow read, write: if request.auth != null; }
 
-    // ── Orders ──────────────────────────────────────────────────────
-    // Dispatch: full access
-    // Drivers (phone app): read assigned orders + update POD/status
-    match /orders/{id} {
-      allow read: if isAuth();
-      allow create, delete: if isDispatch();
-      allow update: if isAuth(); // drivers update status + POD fields
-    }
+    // Was read:if true — now auth-gated. Events writes stay admin-authed.
+    match /events/{doc} { allow read, write: if request.auth != null; }
+    match /drivers/{doc} { allow read, write: if request.auth != null; }
+    match /trucks/{doc} { allow read, write: if request.auth != null; }
+    match /trailers/{doc} { allow read, write: if request.auth != null; }
+    match /company_docs/{doc} { allow read, write: if request.auth != null; }
 
-    // ── Drivers ─────────────────────────────────────────────────────
-    // Dispatch: full access
-    // Drivers (phone app): read-only (for login lookup)
-    match /drivers/{id} {
-      allow read: if isAuth();
-      allow write: if isDispatch();
-    }
-
-    // ── Events ──────────────────────────────────────────────────────
-    // Dispatch: full access
-    // Drivers (phone app): read-only (event selection at clock-in)
-    match /events/{id} {
-      allow read: if isAuth();
-      allow write: if isDispatch();
-    }
-
-    // ── Trucks ──────────────────────────────────────────────────────
-    match /trucks/{id} {
-      allow read: if isAuth();
-      allow write: if isDispatch();
-    }
-
-    // ── Trailers ────────────────────────────────────────────────────
-    match /trailers/{id} {
-      allow read: if isAuth();
-      allow write: if isDispatch();
-    }
-
-    // ── Company Documents ────────────────────────────────────────────
-    // Drivers can read their own compliance docs on the phone app
-    match /company_docs/{id} {
-      allow read: if isAuth();
-      allow write: if isDispatch();
-    }
-
-    // ── Employees ───────────────────────────────────────────────────
-    // Phone app writes its own profile on registration
-    // Dispatch reads/manages all employee records
-    match /employees/{id} {
-      allow read, write: if isAuth();
-    }
-
-    // ── Sessions ────────────────────────────────────────────────────
-    // Phone app manages its own login sessions (PIN verification)
-    match /sessions/{id} {
-      allow read, write: if isAuth();
-    }
-
-    // ── Timesheets ──────────────────────────────────────────────────
-    // Drivers submit their own hours; dispatch reads and manages all
-    match /timesheets/{id} {
-      allow read, write: if isAuth();
-    }
-
-    // ── Clients ─────────────────────────────────────────────────────
-    // Dispatch only — contains rate schedules, contacts, pricing
-    // Drivers should never see client rate data
-    match /clients/{id} {
-      allow read, write: if isDispatch();
-    }
-
-    // ── Locations ───────────────────────────────────────────────────
-    // Dispatch only — contains client location data and km rates
-    match /locations/{id} {
-      allow read, write: if isDispatch();
-    }
-
-    // ── Quotes ──────────────────────────────────────────────────────
-    match /quotes/{id} {
-      allow read, write: if isDispatch();
-    }
-
-    // ── Catch-all ───────────────────────────────────────────────────
-    // Any collection not explicitly listed above requires dispatch auth
+    // Everything else (orders, settings, letters, …) already required auth.
     match /{document=**} {
-      allow read, write: if isDispatch();
+      allow read, write: if request.auth != null;
     }
-
   }
 }

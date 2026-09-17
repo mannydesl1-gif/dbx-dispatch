@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { db, storage } from "./firebase.js";
 import { ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
-import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, orderBy, query } from "firebase/firestore";
+import { collection, getDocs, addDoc, updateDoc, deleteDoc, doc, orderBy, query, onSnapshot } from "firebase/firestore";
 
 // ── Theme (matches App.jsx dark theme) ──
 const T = {
@@ -23,7 +23,18 @@ const DIVISIONS = [
   { id:"us", name:"Diamond Back Express LLC", short:"DBX USA", addr:"Suite 400-K-175\n1110 Brickell Ave\nMiami, FL 33131\nUSA", phone:"" },
 ];
 
-const DISCLAIMER = "Please note that the fuel listed above will be charged based on actual fuel prices on date of completion. Prices reflect rental quotes (where applicable) at time of quote and may vary. Prices quoted on date given, subject to change - please allow for up to a 10% variance if applicable.";
+const DISCLAIMER = "Please note that the fuel listed above will be charged based on actual fuel prices on date of completion. Prices reflect rental quotes (where applicable) at time of quote and may vary. Prices quoted on date given, subject to change - please allow for up to a 10% variance if applicable.\n\nExclude: Demurrage, detention, custom inspection, excessive waiting time";
+
+// Live default Terms & Conditions, authored in AdminPage (settings/orderTerms).
+// Falls back to DISCLAIMER until an admin saves a custom value. Shared with the
+// order side so quotes and orders use the same admin-managed default text.
+let QUOTE_TERMS_LIVE = DISCLAIMER;
+try {
+  onSnapshot(doc(db, "settings", "orderTerms"),
+    snap => { const t = snap.exists() ? snap.data().text : undefined; QUOTE_TERMS_LIVE = (t!==undefined && t!==null) ? t : DISCLAIMER; },
+    err => { console.warn("orderTerms (quotes) load failed:", err); });
+} catch (e) { console.warn("orderTerms subscription skipped:", e); }
+function quoteTermsOrDefault(t) { return (t !== undefined && t !== null) ? t : QUOTE_TERMS_LIVE; }
 
 const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; };
 const fd = d => d ? new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—";
@@ -32,12 +43,13 @@ const uid = () => Math.random().toString(36).slice(2,8).toUpperCase();
 const emptyLine = () => ({ id:uid(), qty:"1", desc:"", unitPrice:"", equipment:"", currency:"" });
 const emptyFreight = () => ({ id:uid(), pieces:"", desc:"", weight:"", weightUnit:"kg", length:"", width:"", height:"", dimUnit:"cm", commodity:"", unNumber:"", hazClass:"" });
 
-export default function QuotesPage({ clients: clientsProp }) {
+export default function QuotesPage({ clients: clientsProp, onConvertToOrder }) {
   const [quotes, setQuotes] = useState([]);
   const [clients, setClients] = useState(clientsProp||[]);
   const [loading, setLoading] = useState(true);
   const [view, setView] = useState("list"); // "list" | "form" | "preview"
   const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [convertModal, setConvertModal] = useState(null); // quote being converted (order-type chooser)
   const toggleGroup = (s) => setCollapsedGroups(p=>({...p,[s]:!p[s]}));
   const [editId, setEditId] = useState(null);
   const [form, setForm] = useState(null);
@@ -160,7 +172,8 @@ export default function QuotesPage({ clients: clientsProp }) {
     taxRate: "",
     other: "",
     otherLabel: "Other",
-    notes: DISCLAIMER,
+    notes: "",
+    terms: quoteTermsOrDefault(undefined),
     scopeOfWork: "",
     internalNotes: "",
     attachments: [],
@@ -406,6 +419,9 @@ export default function QuotesPage({ clients: clientsProp }) {
       .notes-section{margin-bottom:10px;padding:8px 12px;background:#f8fafc;border-left:4px solid #dc2626;border-radius:0 4px 4px 0}
       .notes-section .notes-label{font-size:8px;font-weight:700;color:#dc2626;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px}
       .notes-section .notes-text{font-size:10px;color:#333;line-height:1.4;white-space:pre-wrap}
+      .terms-section{margin-top:auto;padding-top:8px;border-top:1px solid #e2e8f0}
+      .terms-section .terms-label{font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px}
+      .terms-section .terms-text{font-size:7.5px;color:#94a3b8;line-height:1.35;white-space:pre-wrap}
       .equipment-badges{margin-bottom:6px;display:flex;flex-wrap:wrap;gap:3px}
       .eq-badge{background:#1e293b;color:#fff;padding:1px 6px;border-radius:10px;font-size:9px;font-weight:600}
       @media print{
@@ -429,7 +445,7 @@ export default function QuotesPage({ clients: clientsProp }) {
         /* Repeat line-item column headers if the table spans pages. */
         thead{display:table-header-group}
         tbody tr{page-break-inside:avoid}
-        .notes-section,.totals{page-break-inside:avoid}
+        .notes-section,.totals,.terms-section{page-break-inside:avoid}
         /* tfoot left as a normal row group so it does NOT repeat per page. */
         .page-wrap tfoot{display:table-row-group}
         /* NOTE: position:fixed was tried here and is WRONG — a fixed element
@@ -602,6 +618,8 @@ export default function QuotesPage({ clients: clientsProp }) {
 
 
     <div class="flex-spacer"></div>
+
+    ${(()=>{const t=quoteTermsOrDefault(f.terms);return t&&t.trim()?`<div class="terms-section"><div class="terms-label">Terms &amp; Conditions</div><div class="terms-text">${t.replace(/</g,"&lt;")}</div></div>`:"";})()}
     </div>
 
     </td></tr></tbody>
@@ -793,6 +811,9 @@ export default function QuotesPage({ clients: clientsProp }) {
                           <option value="declined">Declined</option>
                         </select>
                         <button onClick={()=>startEdit(q)} style={{...sBtn,fontSize:10,padding:"4px 10px"}}>Edit</button>
+                        {q.status==="accepted" && onConvertToOrder && (
+                          <button onClick={()=>setConvertModal(q)} style={{...sBtn,fontSize:10,padding:"4px 10px",background:"rgba(34,197,94,0.12)",color:"#16a34a",border:"1px solid #16a34a",fontWeight:700}}>→ Order</button>
+                        )}
                         <button onClick={()=>generatePDF(q)} style={{...sBtn,fontSize:10,padding:"4px 10px",background:"rgba(220,38,38,0.1)",color:T.red,border:`1px solid ${T.red}`}}>PDF</button>
                         <button onClick={()=>deleteQuote(q.id)} style={{...sBtn,fontSize:10,padding:"4px 8px",color:"#ef4444",border:"1px solid #ef4444"}}>✕</button>
                       </div>
@@ -802,6 +823,29 @@ export default function QuotesPage({ clients: clientsProp }) {
               </div>
             );
           })}
+        </div>
+      )}
+      {convertModal && (
+        <div onClick={()=>setConvertModal(null)} style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:1000,padding:20}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:T.card||T.surface||"#0f172a",border:`1px solid ${T.border}`,borderRadius:14,padding:24,maxWidth:440,width:"100%",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+            <div style={{fontSize:16,fontWeight:700,color:T.text||"#f1f5f9",marginBottom:6}}>Convert Quote {convertModal.quoteNum}</div>
+            <div style={{fontSize:13,color:T.muted,marginBottom:20}}>What type of order should this become? The quote's pricing carries into whichever you choose.</div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>{const q=convertModal;setConvertModal(null);onConvertToOrder(q,"event");}}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"14px 16px",borderRadius:10,border:`1.5px solid ${T.border}`,background:"rgba(14,165,233,0.08)",cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+                <span style={{fontSize:22}}>📋</span>
+                <div><div style={{fontSize:14,fontWeight:700,color:T.text||"#f1f5f9"}}>Project / Event Order</div>
+                <div style={{fontSize:11,color:T.muted}}>Line-item pricing — each quote line stays its own priced line</div></div>
+              </button>
+              <button onClick={()=>{const q=convertModal;setConvertModal(null);onConvertToOrder(q,"transport");}}
+                style={{display:"flex",alignItems:"center",gap:12,padding:"14px 16px",borderRadius:10,border:`1.5px solid ${T.border}`,background:"rgba(34,197,94,0.08)",cursor:"pointer",fontFamily:"inherit",textAlign:"left"}}>
+                <span style={{fontSize:22}}>🚚</span>
+                <div><div style={{fontSize:14,fontWeight:700,color:T.text||"#f1f5f9"}}>Transport Order</div>
+                <div style={{fontSize:11,color:T.muted}}>Pickup / delivery — quote lines become accessorial charges</div></div>
+              </button>
+            </div>
+            <button onClick={()=>setConvertModal(null)} style={{marginTop:16,width:"100%",padding:"9px",borderRadius:8,border:`1px solid ${T.border}`,background:"none",color:T.muted,fontFamily:"inherit",fontSize:13,cursor:"pointer"}}>Cancel</button>
+          </div>
         </div>
       )}
     </div>
@@ -1000,8 +1044,10 @@ export default function QuotesPage({ clients: clientsProp }) {
       <div style={{display:"grid",gridTemplateColumns:"1fr auto",gap:16,marginBottom:16}}>
         {/* Notes */}
         <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:8,padding:14}}>
-          <label style={sLbl}>Notes / Disclaimer</label>
-          <textarea style={{...sIn,minHeight:100,resize:"vertical"}} value={form.notes} onChange={e=>setF("notes",e.target.value)}/>
+          <label style={sLbl}>Notes <span style={{fontWeight:400,color:T.muted,fontSize:10}}>(your notes for this quote)</span></label>
+          <textarea style={{...sIn,minHeight:100,resize:"vertical"}} value={form.notes} onChange={e=>setF("notes",e.target.value)} placeholder="Notes specific to this quote..."/>
+          <label style={{...sLbl,marginTop:12}}>Terms &amp; Conditions <span style={{fontWeight:400,color:T.muted,fontSize:10}}>(shown at bottom of PDF)</span></label>
+          <textarea style={{...sIn,minHeight:90,resize:"vertical",fontSize:11}} value={form.terms||""} onChange={e=>setF("terms",e.target.value)} placeholder="Standard terms & conditions..."/>
         </div>
 
         {/* Summary */}

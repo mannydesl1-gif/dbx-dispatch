@@ -249,6 +249,7 @@ async function generateBolPdf(order, client = null, includePricing = false) {
         y -= 18;
       };
       drawColHeaders();
+      const fxSym = (c) => c === "EUR" ? "€" : c === "GBP" ? "£" : c === "ZAR" ? "R" : c === "SGD" ? "S$" : c === "AED" ? "AED " : "$";
       let eventTotal = 0;
       for (const line of eventLines) {
         // Wrap description to fit available width (DESCRIPTION column ends at QTY = M+310)
@@ -261,26 +262,63 @@ async function generateBolPdf(order, client = null, includePricing = false) {
         const qty = parseFloat(line.qty) || 0;
         const up = parseFloat(line.unitPrice) || 0;
         const amt = qty * up; eventTotal += amt;
+        const lineCur = line.currency || cur;
+        const lsym = fxSym(lineCur);
         // Description (potentially multi-line)
         for (let i = 0; i < descLines.length; i++) {
           page.drawText(descLines[i], { x: M + 6, y: y - 10 - (i * 12), size: 9, font: helvetica, color: black });
         }
         // Other columns on first line only
         page.drawText(String(qty), { x: M + 310, y: y - 10, size: 9, font: helvetica, color: black });
-        page.drawText(`${sym}${up.toFixed(2)}`, { x: M + 375, y: y - 10, size: 9, font: helvetica, color: black });
-        const amtStr = `${sym}${amt.toFixed(2)}`;
+        page.drawText(`${lsym}${up.toFixed(2)} ${lineCur}`, { x: M + 375, y: y - 10, size: 8, font: helvetica, color: black });
+        const amtStr = `${lsym}${amt.toFixed(2)}`;
         page.drawText(amtStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(amtStr, 9), y: y - 10, size: 9, font: helveticaBold, color: black });
         page.drawLine({ start: { x: M, y: y - rowHeight + 4 }, end: { x: W - M, y: y - rowHeight + 4 }, thickness: 0.5, color: rgb(0.9, 0.9, 0.9) });
         y -= rowHeight;
       }
-      await ensureSpace(30);
-      y -= 4;
-      page.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
-      const totalLabel = `TOTAL ${cur}`;
-      page.drawText(totalLabel, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
-      const totalStr = `${sym}${eventTotal.toFixed(2)} ${cur}`;
-      page.drawText(totalStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(totalStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
-      y -= 28;
+      // Total block — multi-currency snapshot when present, else single total.
+      const snap = order.price && order.price.fxSnapshot;
+      if (snap && (snap.applies || snap.multi) && snap.grand != null) {
+        const tSym = fxSym(snap.target);
+        await ensureSpace(30 + Object.keys(snap.byCur || {}).length * 12 + (snap.adjVal ? 24 : 0));
+        y -= 6;
+        page.drawText("SUBTOTALS BY CURRENCY", { x: M + 6, y: y - 8, size: 7, font: helveticaBold, color: gray });
+        y -= 18;
+        for (const [c, a] of Object.entries(snap.byCur || {})) {
+          page.drawText(c, { x: M + 10, y: y, size: 9, font: helvetica, color: rgb(0.33, 0.36, 0.4) });
+          const s = `${fxSym(c)}${a.toFixed(2)} ${c}`;
+          page.drawText(s, { x: W - M - 6 - helvetica.widthOfTextAtSize(s, 9), y, size: 9, font: helvetica, color: black });
+          y -= 13;
+        }
+        y -= 4;
+        page.drawLine({ start: { x: M, y: y + 2 }, end: { x: W - M, y: y + 2 }, thickness: 0.5, color: rgb(0.85, 0.87, 0.9) });
+        if (snap.adjVal) {
+          page.drawText(`Subtotal (${snap.target})`, { x: M + 10, y: y - 8, size: 9, font: helvetica, color: gray });
+          const ss = `${tSym}${snap.convertedBase.toFixed(2)}`;
+          page.drawText(ss, { x: W - M - 6 - helvetica.widthOfTextAtSize(ss, 9), y: y - 8, size: 9, font: helvetica, color: gray });
+          y -= 13;
+          const adjLbl = `${snap.adjLabel} (${snap.adjMode === "pct" ? snap.adjVal + "%" : "flat"})`;
+          page.drawText(adjLbl, { x: M + 10, y: y - 8, size: 9, font: helvetica, color: snap.adjAmount < 0 ? rgb(0.71, 0.33, 0.04) : gray });
+          const as = `${snap.adjAmount < 0 ? "−" : ""}${tSym}${Math.abs(snap.adjAmount).toFixed(2)}`;
+          page.drawText(as, { x: W - M - 6 - helvetica.widthOfTextAtSize(as, 9), y: y - 8, size: 9, font: helvetica, color: snap.adjAmount < 0 ? rgb(0.71, 0.33, 0.04) : gray });
+          y -= 15;
+        }
+        page.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
+        page.drawText(`GRAND TOTAL ${snap.target}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
+        const gs = `${tSym}${snap.grand.toFixed(2)} ${snap.target}`;
+        page.drawText(gs, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(gs, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
+        y -= 26;
+        if (snap.fxDate) { page.drawText(`Converted using exchange rates as of ${snap.fxDate} UTC.`, { x: M, y: y, size: 7, font: helvetica, color: rgb(0.6, 0.6, 0.6) }); y -= 12; }
+      } else {
+        await ensureSpace(30);
+        y -= 4;
+        page.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
+        const totalLabel = `TOTAL ${cur}`;
+        page.drawText(totalLabel, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
+        const totalStr = `${sym}${eventTotal.toFixed(2)} ${cur}`;
+        page.drawText(totalStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(totalStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
+        y -= 28;
+      }
     }
     if (order.notes) {
       await ensureSpace(30);
@@ -371,128 +409,122 @@ async function generateBolPdf(order, client = null, includePricing = false) {
       }
       y -= 6;
     };
-    if (!isMultiStop) {
-      // ── Single pickup + single delivery: side-by-side, dynamic height ──
-      const ps = pickStops[0], ds = delStops[0];
+    // ── Grid layout matching the dispatch download: pickup/delivery cards side
+    //    by side per row, each card holding its own items; totals after the grid.
+    const cardGap = 12;
+    const cardW = (W - 2 * M - cardGap) / 2;
+    const gridDx = M + cardW + cardGap;
 
-      // Measure content height for each box so both can share the taller height
-      const measureBox = (s) => {
-        let lines = 0;
-        if (s.co) lines += 1;                                  // company name
-        const addrLines = wrapLines(s.addr || "—", boxW - 12, helvetica, 8);
-        lines += addrLines.length;                             // address lines
-        if (s.contact || s.phone) lines += 1;                  // contact/phone line
-        let noteLines = [];
-        if (s.notes && String(s.notes).trim()) {
-          noteLines = wrapLines(String(s.notes), boxW - 16, helvetica, 8);
-          lines += 1 + noteLines.length;                       // "Notes:" label + note lines
-        }
-        return { addrLines, noteLines };
-      };
-      const pm = measureBox(ps), dm = measureBox(ds);
-      // Height = header(26) + content lines*11 + padding(14)
-      const linesFor = (s, m) => (s.co?1:0) + m.addrLines.length + ((s.contact||s.phone)?1:0) + (m.noteLines.length? 1 + m.noteLines.length : 0);
-      const contentLines = Math.max(linesFor(ps, pm), linesFor(ds, dm));
-      const boxH = Math.max(100, 34 + contentLines * 11 + 10);
+    // Per-stop items: prefer stop.items; fall back to order.items on first pickup.
+    const stopItemsList = (stop, isFirstPick) => {
+      let list = (stop && stop.items) ? stop.items : [];
+      list = list.filter(i => i && (i.desc || i.pcs || i.wt || i.l || i.w || i.h));
+      if (!list.length && isFirstPick) list = (order.items || []).filter(i => i.desc || i.pcs || i.wt || i.l || i.w || i.h);
+      return list;
+    };
 
-      // Draw one box
-      const drawBox = (bx, label, s, m) => {
-        page.drawRectangle({ x: bx, y: y - boxH, width: boxW, height: boxH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
-        page.drawText(label, { x: bx + 6, y: y - 12, size: 8, font: helveticaBold, color: gray });
-        if (s.date) { const dd = fd(s.date); page.drawText(dd, { x: bx + boxW - 6 - helveticaBold.widthOfTextAtSize(dd, 9), y: y - 12, size: 9, font: helveticaBold, color: black }); }
-        let ly = y - 28;
-        if (s.co) { page.drawText(s.co, { x: bx + 6, y: ly, size: 9, font: helveticaBold, color: black }); ly -= 12; }
-        for (const ln of m.addrLines) { page.drawText(ln, { x: bx + 6, y: ly, size: 8, font: helvetica, color: black }); ly -= 11; }
-        if (s.contact || s.phone) {
-          const cs = [s.contact, s.phone].filter(Boolean).join("  ·  ");
-          ly -= 2;
-          page.drawText(cs, { x: bx + 6, y: ly, size: 8, font: helveticaBold, color: black }); ly -= 12;
-        }
-        if (m.noteLines.length) {
-          ly -= 2;
-          page.drawText("Notes:", { x: bx + 6, y: ly, size: 7, font: helveticaBold, color: rgb(0.71, 0.33, 0.0) }); ly -= 10;
-          for (const ln of m.noteLines) { page.drawText(ln, { x: bx + 6, y: ly, size: 8, font: helvetica, color: black }); ly -= 11; }
-        }
-      };
-      drawBox(M, "PICK UP", ps, pm);
-      drawBox(dx, "DELIVERY", ds, dm);
-      y = y - boxH - 12;
-      await drawItemsTable(delStops[0].items && delStops[0].items.length ? delStops[0].items : order.items);
-    } else {
-      // ── Multi-stop: stacked PICK UP block(s) then DELIVERY blocks, each with items + sign-off ──
-      const totalPcs = (stops) => stops.reduce((s, st) => s + (st.items || []).reduce((a, it) => a + (parseFloat(it.pcs) || 0), 0), 0);
-      const pickHoldsItems = pickStops.length > 1;   // multi-pickup -> items on pickups
-      const delTotalPcs = totalPcs(delStops);
-      const pickTotalPcs = totalPcs(pickStops);
+    // Measure a card's height so paired cards share the taller height and rows
+    // never split across a page.
+    const measureCard = (s, isFirstPick) => {
+      if (!s) return { h: 0, addrLines: [], noteLines: [], items: [] };
+      const addrLines = wrapLines((s.addr || "—").replace(/\n/g, " "), cardW - 16, helvetica, 9);
+      // address may contain real newlines — expand them
+      const addrExpanded = (s.addr || "—").split("\n").flatMap(seg => wrapLines(seg, cardW - 16, helvetica, 9));
+      const noteLines = (s.notes && String(s.notes).trim())
+        ? wrapLines(String(s.notes), cardW - 24, helvetica, 8) : [];
+      const items = stopItemsList(s, isFirstPick);
+      let h = 14 /*label*/ ;
+      if (s.co) h += 14;
+      h += addrExpanded.length * 12;
+      if (s.contact || s.phone) h += 13;
+      if (noteLines.length) h += 8 + noteLines.length * 11 + 6;
+      if (items.length) h += 4 /*gap*/ + 13 /*header bar*/ + 13 /*below-header*/ + items.length * 13 + 4;
+      h += 16; // padding
+      return { h, addrLines: addrExpanded, noteLines, items };
+    };
 
-      // Pickup block(s)
-      for (let pi = 0; pi < pickStops.length; pi++) {
-        const ps = pickStops[pi];
-        await ensureSpace(64);
-        page.drawRectangle({ x: M, y: y - 2, width: W - 2 * M, height: 2, color: rgb(0.85, 0.86, 0.88) });
-        y -= 12;
-        const lbl = pickStops.length > 1 ? `PICK UP — STOP ${pi + 1}` : "PICK UP";
-        page.drawText(lbl, { x: M, y: y - 8, size: 8, font: helveticaBold, color: gray });
-        if (ps.date) { const pd = fd(ps.date); page.drawText(pd, { x: W - M - helveticaBold.widthOfTextAtSize(pd, 9), y: y - 8, size: 9, font: helveticaBold, color: black }); }
-        y -= 22;
-        if (ps.co) { page.drawText(ps.co, { x: M, y: y, size: 9, font: helveticaBold, color: black }); y -= 12; }
-        const pBottom = drawWrapped(page, ps.addr || "—", M, y, (W - 2 * M) / 2, helvetica, 8, black);
-        y = pBottom - 4;
-        if (ps.contact || ps.phone) {
-          const contactStr = [ps.contact, ps.phone].filter(Boolean).join("  ·  ");
-          page.drawText(contactStr, { x: M, y: y, size: 8, font: helvetica, color: rgb(0.28, 0.35, 0.42) });
-          y -= 11;
-        }
-        if (!pickHoldsItems && pi === 0 && delTotalPcs > 0) {
-          page.drawText(`Total loaded: ${delTotalPcs} pcs`, { x: M, y: y, size: 8, font: helveticaBold, color: gray }); y -= 12;
-        }
-        if (pickHoldsItems) { await drawItemsTable(ps.items); }
-        await drawStopNotes(ps.notes);
+    // Draw one stop card at (bx, y-top). Returns nothing; caller manages y.
+    const drawCard = (bx, topY, label, s, meas, cardH, isFirstPick) => {
+      if (!s) return;
+      page.drawRectangle({ x: bx, y: topY - cardH, width: cardW, height: cardH,
+        borderColor: rgb(0.8, 0.82, 0.85), borderWidth: 1.2, color: rgb(0.973, 0.98, 0.988) });
+      let ly = topY - 14;
+      // label + date
+      page.drawText(label.toUpperCase(), { x: bx + 10, y: ly, size: 8, font: helveticaBold, color: rgb(0.58, 0.64, 0.72) });
+      if (s.date) { const dd = fd(s.date); page.drawText("— " + dd, { x: bx + 10 + helveticaBold.widthOfTextAtSize(label.toUpperCase() + " ", 8), y: ly, size: 9, font: helveticaBold, color: black }); }
+      ly -= 15;
+      if (s.co) { page.drawText(s.co, { x: bx + 10, y: ly, size: 11, font: helveticaBold, color: black }); ly -= 14; }
+      for (const ln of meas.addrLines) { page.drawText(ln, { x: bx + 10, y: ly, size: 9, font: helvetica, color: rgb(0.2, 0.25, 0.33) }); ly -= 12; }
+      if (s.contact || s.phone) {
+        const cs = [s.contact, s.phone].filter(Boolean).join("   ·   ");
+        page.drawText(cs, { x: bx + 10, y: ly, size: 9, font: helvetica, color: rgb(0.28, 0.35, 0.42) }); ly -= 13;
       }
-
-      // Delivery block(s)
-      for (let di = 0; di < delStops.length; di++) {
-        const ds = delStops[di];
-        // Estimate full block height so the stop + its sign-off never split across pages
-        const dItems = (ds.items || []).filter(i => i.desc || i.pcs || i.wt);
-        const addrLineCount = String(ds.addr || "—").split("\n").length;
-        const noteLineCount = ds.notes ? wrapLines(String(ds.notes), W - 2 * M, helvetica, 8).length + 1 : 0;
-        const estHeight = 14 /*divider*/ + 22 /*label*/ + 12 /*co*/ + (addrLineCount * 10) + 6
-          + (dItems.length ? (18 + dItems.length * 18 + 6) : 0)
-          + (noteLineCount * 10) + 8 /*notes gap*/
-          + 34 /*sign-off*/ + 10;
-        await ensureSpace(estHeight);
-        page.drawRectangle({ x: M, y: y - 2, width: W - 2 * M, height: 2, color: rgb(0.85, 0.86, 0.88) });
-        y -= 12;
-        const lbl = delStops.length > 1 ? `DELIVERY — STOP ${di + 1}` : "DELIVERY";
-        page.drawText(lbl, { x: M, y: y - 8, size: 8, font: helveticaBold, color: gray });
-        if (ds.date) { const dd = fd(ds.date); page.drawText(dd, { x: W - M - helveticaBold.widthOfTextAtSize(dd, 9), y: y - 8, size: 9, font: helveticaBold, color: black }); }
-        y -= 22;
-        if (ds.co) { page.drawText(ds.co, { x: M, y: y, size: 9, font: helveticaBold, color: black }); y -= 12; }
-        const dBottom = drawWrapped(page, ds.addr || "—", M, y, (W - 2 * M) / 2, helvetica, 8, black);
-        y = dBottom - 4;
-        if (ds.contact || ds.phone) {
-          const contactStr = [ds.contact, ds.phone].filter(Boolean).join("  ·  ");
-          page.drawText(contactStr, { x: M, y: y, size: 8, font: helvetica, color: rgb(0.28, 0.35, 0.42) });
-          y -= 11;
-        }
-        if (!pickHoldsItems) { await drawItemsTable(ds.items); }
-        else if (di === 0 && pickTotalPcs > 0) {
-          page.drawText(`Total received: ${pickTotalPcs} pcs`, { x: M, y: y, size: 8, font: helveticaBold, color: gray }); y -= 12;
-        }
-        await drawStopNotes(ds.notes);
-        // Per-stop sign-off: pre-fill from recorded POD if present, else blank lines for manual sign-off
-        y -= 8;
-        const halfW = (W - 2 * M - 20) / 2;
-        const pod = ds.pod || {};
-        if (pod.by) { page.drawText(pod.by, { x: M, y: y + 2, size: 9, font: helveticaBold, color: black }); }
-        if (pod.date || pod.time) { const dtStr = `${pod.date ? fd(pod.date) : ""}${pod.time ? "  " + pod.time : ""}`.trim(); page.drawText(dtStr, { x: M + halfW + 20, y: y + 2, size: 9, font: helveticaBold, color: black }); }
-        page.drawLine({ start: { x: M, y: y }, end: { x: M + halfW, y: y }, thickness: 0.5, color: rgb(0.6, 0.6, 0.6) });
-        page.drawLine({ start: { x: M + halfW + 20, y: y }, end: { x: W - M, y: y }, thickness: 0.5, color: rgb(0.6, 0.6, 0.6) });
-        page.drawText(pod.by ? "Received by (POD)" : "Signature & name in print", { x: M, y: y - 9, size: 7, font: helvetica, color: gray });
-        page.drawText("Date & Time", { x: M + halfW + 20, y: y - 9, size: 7, font: helvetica, color: gray });
-        y -= 20;
+      if (meas.noteLines.length) {
+        const nH = meas.noteLines.length * 11 + 8;
+        page.drawRectangle({ x: bx + 10, y: ly - nH + 6, width: cardW - 20, height: nH, color: rgb(1.0, 0.984, 0.922), borderColor: rgb(0.99, 0.9, 0.55), borderWidth: 0.8 });
+        page.drawText("Notes:", { x: bx + 14, y: ly - 3, size: 7, font: helveticaBold, color: rgb(0.71, 0.33, 0.0) }); ly -= 12;
+        for (const ln of meas.noteLines) { page.drawText(ln, { x: bx + 40, y: ly + 1, size: 8, font: helvetica, color: rgb(0.55, 0.33, 0.05) }); ly -= 11; }
+        ly -= 4;
       }
+      if (meas.items.length) {
+        ly -= 4; // gap between contact/notes and the items table
+        // Header bar
+        page.drawRectangle({ x: bx + 10, y: ly - 13, width: cardW - 20, height: 14, color: rgb(0.945, 0.957, 0.973) });
+        page.drawText("PCES", { x: bx + 15, y: ly - 10, size: 7, font: helveticaBold, color: gray });
+        page.drawText("DESCRIPTION", { x: bx + 50, y: ly - 10, size: 7, font: helveticaBold, color: gray });
+        page.drawText("WEIGHT", { x: bx + cardW - 72, y: ly - 10, size: 7, font: helveticaBold, color: gray });
+        ly -= 26; // move below the header bar before drawing the first row
+        for (const it of meas.items) {
+          page.drawText(String(it.pcs || "—"), { x: bx + 15, y: ly, size: 9, font: helvetica, color: black });
+          const desc = wrapLines(String(it.desc || "—"), cardW - 140, helvetica, 9)[0] || "—";
+          page.drawText(desc, { x: bx + 50, y: ly, size: 9, font: helvetica, color: black });
+          page.drawText(`${it.wt || "—"} ${it.wUnit || ""}`.trim(), { x: bx + cardW - 72, y: ly, size: 9, font: helvetica, color: black });
+          ly -= 13;
+        }
+      }
+    };
+
+    // Build rows of paired stops.
+    const nRows = Math.max(pickStops.length, delStops.length);
+    for (let i = 0; i < nRows; i++) {
+      const pk = pickStops[i], dl = delStops[i];
+      const pLabel = pickStops.length > 1 ? `Pick Up — Stop ${i + 1}` : "Pick Up";
+      const dLabel = delStops.length > 1 ? `Delivery — Stop ${i + 1}` : "Delivery";
+      const pm = measureCard(pk, i === 0);
+      const dm = measureCard(dl, false);
+      const rowH = Math.max(pm.h, dm.h, 70);
+      await ensureSpace(rowH + 12);
+      const topY = y;
+      if (pk) drawCard(M, topY, pLabel, pk, pm, rowH, i === 0);
+      if (dl) drawCard(gridDx, topY, dLabel, dl, dm, rowH, false);
+      y = topY - rowH - 12;
+    }
+
+    // Order totals — pieces + weight summed across every stop's items.
+    const allItems = [];
+    pickStops.forEach((s, i) => allItems.push(...stopItemsList(s, i === 0)));
+    delStops.forEach((s) => allItems.push(...stopItemsList(s, false)));
+    const grandPcs = allItems.reduce((s, i) => s + (parseFloat(i.pcs) || 0), 0);
+    const grandWt = allItems.reduce((s, i) => s + (parseFloat(i.wt) || 0), 0);
+    const grandUnit = (allItems.find(i => i.wUnit) || {}).wUnit || "";
+    if (allItems.length) {
+      await ensureSpace(28);
+      page.drawRectangle({ x: M, y: y - 22, width: W - 2 * M, height: 24, color: rgb(0.973, 0.98, 0.988), borderColor: rgb(0.88, 0.9, 0.93), borderWidth: 1 });
+      let tx = W - M - 12;
+      if (grandWt > 0) {
+        const wtStr = `${grandWt} ${grandUnit}`.trim();
+        tx -= helveticaBold.widthOfTextAtSize(wtStr, 12);
+        page.drawText(wtStr, { x: tx, y: y - 15, size: 12, font: helveticaBold, color: black });
+        tx -= 8 + helveticaBold.widthOfTextAtSize("TOTAL WEIGHT:", 8);
+        page.drawText("TOTAL WEIGHT:", { x: tx, y: y - 14, size: 8, font: helveticaBold, color: gray });
+        tx -= 28;
+      }
+      const pcsStr = String(grandPcs);
+      tx -= helveticaBold.widthOfTextAtSize(pcsStr, 12);
+      page.drawText(pcsStr, { x: tx, y: y - 15, size: 12, font: helveticaBold, color: black });
+      tx -= 8 + helveticaBold.widthOfTextAtSize("TOTAL PIECES:", 8);
+      page.drawText("TOTAL PIECES:", { x: tx, y: y - 14, size: 8, font: helveticaBold, color: gray });
+      y -= 32;
     }
 
     if (order.notes) {
@@ -576,9 +608,11 @@ async function generateBolPdf(order, client = null, includePricing = false) {
         page.drawImage(bcImg, { x: M + pad, y: y - lbH + pad, width: bcW, height: bcH });
         y -= lbH + 8;
       } else {
-        // PARS: 90mm x 30mm
-        const lbW = 90 * 2.835;   // 255pt
-        const lbH = 30 * 2.835;   // 85pt
+        // PARS: CBSA-approved 120mm x 35mm (matches the approved standalone sticker;
+        // within CBSA max label 12.7cm × 3.81cm). Barcode 12mm height is within the
+        // approved 0.95–1.60cm symbol-height range.
+        const lbW = 120 * 2.835;  // 340.2pt
+        const lbH = 35 * 2.835;   // 99.2pt
         const pad = 4 * 2.835;    // 11.3pt side padding (quiet zone)
         const topGap = 3 * 2.835; // 8.5pt top gap (CBSA: min 3mm)
         const bcH = bcHeightMm * 2.835; // barcode height in points
@@ -604,15 +638,17 @@ async function generateBolPdf(order, client = null, includePricing = false) {
     }
   }
 
-  // ── Signature lines at bottom (transport, single-stop only — multi-stop has per-stop sign-offs) ──
-  const _nP = (order.pickStops || []).length, _nD = (order.delStops || []).length;
-  const _isMulti = _nP > 1 || _nD > 1;
-  if (!isEvent && !_isMulti) {
-    y = 80;
-    page.drawLine({ start: { x: M, y }, end: { x: M + boxW, y }, thickness: 0.5, color: black });
-    page.drawText("Signature and name in print", { x: M, y: y - 10, size: 7, font: helvetica, color: gray });
-    page.drawLine({ start: { x: dx, y }, end: { x: dx + boxW, y }, thickness: 0.5, color: black });
-    page.drawText("Date and Time", { x: dx, y: y - 10, size: 7, font: helvetica, color: gray });
+  // Signature line at the end (transport only) — matches the dispatch grid,
+  // which flows the signature after content rather than pinning to page bottom.
+  if (!isEvent) {
+    await ensureSpace(50);
+    y -= 30;
+    const halfW = (W - 2 * M - 20) / 2;
+    page.drawLine({ start: { x: M, y }, end: { x: M + halfW, y }, thickness: 1, color: black });
+    page.drawLine({ start: { x: M + halfW + 20, y }, end: { x: W - M, y }, thickness: 1, color: black });
+    page.drawText("Signature and name in print", { x: M, y: y - 10, size: 8, font: helvetica, color: gray });
+    page.drawText("Date and Time", { x: M + halfW + 20, y: y - 10, size: 8, font: helvetica, color: gray });
+    y -= 20;
   }
 
   return await pdfDoc.save();
@@ -645,6 +681,48 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
   };
 
   const isEvent = order.orderType === "event";
+
+  // Shared total renderer: if the order carries an FX snapshot (multi-currency /
+  // conversion + admin fee), draw the SAME breakdown the BOL shows so the invoice
+  // matches to the cent. Returns true if it drew the snapshot; false if the caller
+  // should draw its own plain single-currency total. Used at the three total
+  // points below (event, multi-stop, single-stop transport).
+  const drawFxSnapshotTotal = async () => {
+    const snap = order.price && order.price.fxSnapshot;
+    if (!snap || !(snap.applies || snap.multi) || snap.grand == null) return false;
+    const fxS = (c) => c === "EUR" ? "€" : c === "GBP" ? "£" : c === "ZAR" ? "R" : c === "SGD" ? "S$" : c === "AED" ? "AED " : "$";
+    const tSym = fxS(snap.target);
+    await ensureSpace(30 + Object.keys(snap.byCur || {}).length * 12 + (snap.adjVal ? 24 : 0));
+    y -= 6;
+    p1.drawText("SUBTOTALS BY CURRENCY", { x: M + 6, y: y - 8, size: 7, font: helveticaBold, color: gray });
+    y -= 18;
+    for (const [c, a] of Object.entries(snap.byCur || {})) {
+      p1.drawText(c, { x: M + 10, y, size: 9, font: helvetica, color: rgb(0.33, 0.36, 0.4) });
+      const s = `${fxS(c)}${a.toFixed(2)} ${c}`;
+      p1.drawText(s, { x: W - M - 6 - helvetica.widthOfTextAtSize(s, 9), y, size: 9, font: helvetica, color: black });
+      y -= 13;
+    }
+    y -= 4;
+    p1.drawLine({ start: { x: M, y: y + 2 }, end: { x: W - M, y: y + 2 }, thickness: 0.5, color: rgb(0.85, 0.87, 0.9) });
+    if (snap.adjVal) {
+      p1.drawText(`Subtotal (${snap.target})`, { x: M + 10, y: y - 8, size: 9, font: helvetica, color: gray });
+      const ss = `${tSym}${snap.convertedBase.toFixed(2)}`;
+      p1.drawText(ss, { x: W - M - 6 - helvetica.widthOfTextAtSize(ss, 9), y: y - 8, size: 9, font: helvetica, color: gray });
+      y -= 13;
+      const adjLbl = `${snap.adjLabel} (${snap.adjMode === "pct" ? snap.adjVal + "%" : "flat"})`;
+      p1.drawText(adjLbl, { x: M + 10, y: y - 8, size: 9, font: helvetica, color: snap.adjAmount < 0 ? rgb(0.71, 0.33, 0.04) : gray });
+      const as = `${snap.adjAmount < 0 ? "−" : ""}${tSym}${Math.abs(snap.adjAmount).toFixed(2)}`;
+      p1.drawText(as, { x: W - M - 6 - helvetica.widthOfTextAtSize(as, 9), y: y - 8, size: 9, font: helvetica, color: snap.adjAmount < 0 ? rgb(0.71, 0.33, 0.04) : gray });
+      y -= 15;
+    }
+    p1.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
+    p1.drawText(`GRAND TOTAL ${snap.target}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
+    const gs = `${tSym}${snap.grand.toFixed(2)} ${snap.target}`;
+    p1.drawText(gs, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(gs, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
+    y -= 26;
+    if (snap.fxDate) { p1.drawText(`Converted using exchange rates as of ${snap.fxDate} UTC.`, { x: M, y, size: 7, font: helvetica, color: rgb(0.6, 0.6, 0.6) }); y -= 12; }
+    return true;
+  };
 
   if (isEvent) {
     // ── Event pricing: transport + additional charges with per-line taxes ──
@@ -745,14 +823,17 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
         y -= 4;
       }
 
-      // Grand Total
+      // Grand Total — FX snapshot breakdown if present, else plain total.
       await ensureSpace(30);
-      y -= 4;
-      p1.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
-      p1.drawText(`TOTAL ${cur}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
-      const totalStr = `${sym}${grandTotal.toFixed(2)} ${cur}`;
-      p1.drawText(totalStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(totalStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
-      y -= 28;
+      const drewFx = await drawFxSnapshotTotal();
+      if (!drewFx) {
+        y -= 4;
+        p1.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
+        p1.drawText(`TOTAL ${cur}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
+        const totalStr = `${sym}${grandTotal.toFixed(2)} ${cur}`;
+        p1.drawText(totalStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(totalStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
+        y -= 28;
+      }
 
       if (order.poNumber) {
         p1.drawText(`PO #: ${order.poNumber}`, { x: M, y, size: 9, font: helveticaBold, color: black });
@@ -785,61 +866,100 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
       p1.drawText("PRICING — PER STOP", { x: M, y, size: 12, font: helveticaBold, color: red }); y -= 18;
 
       let grandTotal = 0;
-      for (let i = 0; i < stops.length; i++) {
-        const st = stops[i];
-        const c = calcStop(st.price);
-        if (c.total <= 0 && !(st.price && (parseFloat(st.price.base) > 0))) continue;
-        grandTotal += c.total;
-        const _ai = (st.items || []).filter(it => it.desc || it.pcs || it.wt).length;
-        const _aa = String(st.addr || "").split("\n").length;
-        await ensureSpace(70 + _ai * 11 + _aa * 8);
-        // Stop header bar
-        p1.drawRectangle({ x: M, y: y - 14, width: W - 2 * M, height: 16, color: rgb(0.93, 0.94, 0.97) });
-        const stopTitle = `${sideLabel} ${i + 1}${st.co ? " — " + st.co : ""}`;
-        p1.drawText(stopTitle, { x: M + 6, y: y - 10, size: 8, font: helveticaBold, color: gray });
-        const stStr = `${sym}${c.total.toFixed(2)} ${cur}`;
-        p1.drawText(stStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(stStr, 8), y: y - 10, size: 8, font: helveticaBold, color: black });
-        y -= 22;
-        // Stop address + items detail (so accounting sees what each stop covers)
-        if (st.addr) { y = drawWrapped(p1, st.addr, M + 10, y, (W - 2 * M) / 2, helvetica, 8, gray); y -= 2; }
-        const stItems = (st.items || []).filter(it => it.desc || it.pcs || it.wt);
-        if (stItems.length > 0) {
-          for (const it of stItems) {
-            const parts = [];
-            if (it.pcs) parts.push(`${it.pcs} pcs`);
-            if (it.desc) parts.push(it.desc);
-            if (it.wt) parts.push(`${it.wt} ${it.wUnit || "lbs"}`);
-            if (it.l || it.w || it.h) parts.push(`${it.l || "?"}×${it.w || "?"}×${it.h || "?"} ${it.dUnit || "in"}`);
-            p1.drawText("• " + parts.join(" — "), { x: M + 12, y, size: 8, font: helvetica, color: gray }); y -= 11;
-          }
-          y -= 2;
-        }
-        const stopTransDesc = (st.price && st.price.transDesc) ? st.price.transDesc : "";
-        pl(stopTransDesc || "Base Price", c.b, M + 10, false);
-        if (c.f > 0) {
-          const fuelLabel = (st.price && st.price.fuelModel === "liter")
-            ? `Fuel (${st.price.liters || "?"}L)`
-            : `Fuel Surcharge (${parseFloat(st.price.fuelPct) || 0}%)`;
-          pl(fuelLabel, c.f, M + 10, false);
-        }
-        if (c.tx > 0) pl(`Tax on Base (${c.tp}% ${st.price.taxMode})`, c.tx, M + 10, false);
-        for (const oc of c.others) {
-          const cc = c.oc(oc);
-          const hasQty = (oc.qty !== undefined && oc.qty !== "") || (oc.unitPrice !== undefined && oc.unitPrice !== "");
-          const lbl = (oc.desc || "Charge") + (hasQty ? ` (${parseFloat(oc.qty) || 0} × ${sym}${(parseFloat(oc.unitPrice) || 0).toFixed(2)})` : "");
+
+      // Order-level price (whole-BOL) — the primary price on multi-stop orders.
+      // Per-stop entries below are optional surcharges added on top.
+      const olBase = parseFloat(pricing.base) || 0;
+      const olFuelPct = parseFloat(pricing.fuelPct) || 0;
+      const olFuel = pricing.fuelModel === "liter" ? (parseFloat(pricing.fuelAmt) || 0) : (olBase * (olFuelPct / 100));
+      const olOthers = (pricing.other || []).filter(c => c.desc || c.amt || c.unitPrice || c.qty);
+      const olOc = (c) => { const lt = c.taxMode === "HST" ? 13 : c.taxMode === "GST" ? 5 : c.taxMode === "CUSTOM" ? (parseFloat(c.taxCustom) || 0) : 0; const lb = (c.qty !== undefined || c.unitPrice !== undefined) ? (parseFloat(c.qty) || 0) * (parseFloat(c.unitPrice) || 0) : (parseFloat(c.amt) || 0); return { lb, lt: lb * (lt / 100), ltp: lt }; };
+      const olOb = olOthers.reduce((s, c) => s + olOc(c).lb, 0), olOt = olOthers.reduce((s, c) => s + olOc(c).lt, 0);
+      const olTp = pricing.taxMode === "CUSTOM" ? (parseFloat(pricing.taxCustom) || 0) : pricing.taxMode === "HST" ? 13 : pricing.taxMode === "GST" ? 5 : 0;
+      const olTax = (!pricing.taxMode || pricing.taxMode === "NONE") ? 0 : (olBase + olFuel) * (olTp / 100);
+      const olTotal = olBase + olFuel + olTax + olOb + olOt;
+      const hasStopSurcharges = stops.some(st => calcStop(st.price).total > 0);
+      if (olTotal > 0) {
+        await ensureSpace(40);
+        p1.drawText("ORDER PRICE (WHOLE BOL)", { x: M, y, size: 9, font: helveticaBold, color: gray }); y -= 16;
+        if (olBase > 0) pl(pricing.transDesc || "Base Price", olBase, M + 10, false);
+        if (olFuel > 0) pl(`Fuel Surcharge (${olFuelPct}%)`, olFuel, M + 10, false);
+        if (olTax > 0) pl(`Tax on Base (${olTp}%)`, olTax, M + 10, false);
+        for (const c of olOthers) {
+          const cc = olOc(c);
+          const hasQty = (c.qty !== undefined && c.qty !== "") || (c.unitPrice !== undefined && c.unitPrice !== "");
+          const lbl = (c.desc || "Charge") + (hasQty ? ` (${parseFloat(c.qty) || 0} × ${sym}${(parseFloat(c.unitPrice) || 0).toFixed(2)})` : "");
           pl(lbl, cc.lb, M + 10, false);
-          if (cc.lt > 0) { p1.drawText(`   Tax (${cc.ltp}%)`, { x: M + 14, y, size: 8, font: helvetica, color: gray }); const ta = `${sym}${cc.lt.toFixed(2)} ${cur}`; p1.drawText(ta, { x: W - M - 10 - helvetica.widthOfTextAtSize(ta, 8), y, size: 8, font: helvetica, color: gray }); y -= 12; }
+          if (cc.lt > 0) pl(`   Tax (${cc.ltp}%)`, cc.lt, M + 14, false, gray);
         }
+        grandTotal += olTotal;
         y -= 6;
       }
-      // Order grand total
+      if (hasStopSurcharges) { p1.drawText("PER-STOP SURCHARGES", { x: M, y, size: 9, font: helveticaBold, color: gray }); y -= 14; }
+
+      // ── Route: pickups and deliveries as paired two-column cards (pickup left,
+      // delivery right), matching the single-stop / project BOL look. Pickups are
+      // listed first within each row to follow the driver's actual sequence.
+      const allPick = (order.pickStops || []).filter(st => st && (st.co || st.addr));
+      const allDel = (order.delStops || []).filter(st => st && (st.co || st.addr));
+      const boxW = (W - 2 * M - 12) / 2;
+      const dx = M + boxW + 12;
+      const stopLineTotal = (st) => calcStop(st.price).total;
+      // Draw one stop into a fixed-width box starting at (x, top). Returns bottom y used.
+      const drawStopBox = (st, x, top, label, idx, count) => {
+        let yy = top - 12;
+        // Header: "PICK UP — STOP 1 — <date>" (matches dispatch BOL wording)
+        const lbl = count > 1 ? `${label} — STOP ${idx + 1}` : label;
+        const hdr = lbl + (st.date ? `  —  ${fd(st.date)}` : "");
+        p1.drawText(hdr, { x: x + 6, y: yy, size: 8, font: helveticaBold, color: gray });
+        const price = stopLineTotal(st);
+        if (price > 0) { const ps = `${sym}${price.toFixed(2)}`; p1.drawText(ps, { x: x + boxW - 6 - helveticaBold.widthOfTextAtSize(ps, 8), y: yy, size: 8, font: helveticaBold, color: black }); }
+        yy -= 13;
+        if (st.co) { p1.drawText(st.co.slice(0, 44), { x: x + 6, y: yy, size: 10, font: helveticaBold, color: black }); yy -= 12; }
+        if (st.addr) { yy = drawWrapped(p1, st.addr, x + 6, yy, boxW - 12, helvetica, 8, rgb(0.2,0.25,0.3)); }
+        // Contact · phone
+        const contactLine = [st.contact, st.phone].filter(Boolean).join("  ·  ");
+        if (contactLine) { p1.drawText(contactLine.slice(0, 52), { x: x + 6, y: yy - 2, size: 8, font: helvetica, color: rgb(0.3,0.35,0.4) }); yy -= 12; }
+        // Per-stop notes
+        if (st.notes) { yy -= 2; p1.drawText("NOTES:", { x: x + 6, y: yy, size: 7, font: helveticaBold, color: rgb(0.7,0.4,0.03) }); yy = drawWrapped(p1, st.notes, x + 6, yy - 9, boxW - 12, helvetica, 8, rgb(0.45,0.35,0.1)); }
+        const its = (st.items || []).filter(it => it.desc || it.pcs || it.wt);
+        for (const it of its) {
+          const parts = [];
+          if (it.pcs) parts.push(`${it.pcs} pcs`);
+          if (it.desc) parts.push(it.desc);
+          if (it.wt) parts.push(`${it.wt} ${it.wUnit || "lbs"}`);
+          p1.drawText(("• " + parts.join(" — ")).slice(0, 60), { x: x + 8, y: yy, size: 7, font: helvetica, color: gray }); yy -= 10;
+        }
+        return yy;
+      };
+      const rows = Math.max(allPick.length, allDel.length);
+      for (let r = 0; r < rows; r++) {
+        const pk = allPick[r], dl = allDel[r];
+        // Estimate row height from the taller of the two boxes (header + co + addr
+        // lines + contact + notes + items).
+        const est = (st) => { if (!st) return 0; const addrL = String(st.addr || "").split("\n").length; const noteL = st.notes ? Math.ceil(String(st.notes).length / 46) + 1 : 0; const itemL = (st.items || []).filter(it => it.desc || it.pcs || it.wt).length; const contactL = (st.contact || st.phone) ? 1 : 0; return 40 + addrL * 9 + contactL * 12 + noteL * 10 + itemL * 10; };
+        const rowH = Math.max(est(pk), est(dl), 60);
+        await ensureSpace(rowH + 10);
+        const top = y;
+        p1.drawRectangle({ x: M, y: top - rowH, width: boxW, height: rowH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
+        p1.drawRectangle({ x: dx, y: top - rowH, width: boxW, height: rowH, borderColor: rgb(0.8, 0.8, 0.8), borderWidth: 1 });
+        if (pk) drawStopBox(pk, M, top, "PICK UP", r, allPick.length); else p1.drawText("—", { x: M + 6, y: top - 12, size: 8, font: helvetica, color: gray });
+        if (dl) drawStopBox(dl, dx, top, "DELIVERY", r, allDel.length); else p1.drawText("—", { x: dx + 6, y: top - 12, size: 8, font: helvetica, color: gray });
+        y = top - rowH - 8;
+      }
+      // Accumulate the grand total from all stop surcharges (both sides).
+      grandTotal += allPick.concat(allDel).reduce((s, st) => s + stopLineTotal(st), 0);
+      // Order grand total — FX snapshot breakdown if present, else plain total.
       await ensureSpace(30);
-      y -= 4;
-      p1.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
-      p1.drawText(`ORDER TOTAL ${cur}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
-      const gStr = `${sym}${grandTotal.toFixed(2)} ${cur}`;
-      p1.drawText(gStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(gStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
-      y -= 28;
+      const drewFxMs = await drawFxSnapshotTotal();
+      if (!drewFxMs) {
+        y -= 4;
+        p1.drawRectangle({ x: M, y: y - 18, width: W - 2 * M, height: 20, color: rgb(0.95, 0.96, 0.98) });
+        p1.drawText(`ORDER TOTAL ${cur}`, { x: M + 6, y: y - 13, size: 10, font: helveticaBold, color: red });
+        const gStr = `${sym}${grandTotal.toFixed(2)} ${cur}`;
+        p1.drawText(gStr, { x: W - M - 6 - helveticaBold.widthOfTextAtSize(gStr, 11), y: y - 13, size: 11, font: helveticaBold, color: red });
+        y -= 28;
+      }
       if (order.poNumber) { p1.drawText(`PO #: ${order.poNumber}`, { x: M, y, size: 9, font: helveticaBold, color: black }); y -= 14; }
     } else {
     // ── Transport order: pickup/delivery boxes ──
@@ -877,7 +997,12 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
       y -= 6;
     }
     // ── Pricing (transport orders) ──
-    if (pricing && pricing.base) {
+    // Render pricing when there's a base price OR accessorial charges (price.other)
+    // OR a fuel surcharge. Quote-converted transport orders put everything in
+    // price.other with base blank, so gating on base alone dropped their pricing.
+    const _hasOtherCharges = (pricing && (pricing.other||[]).some(c => c.desc || parseFloat(c.amt)>0 || parseFloat(c.unitPrice)>0));
+    const _hasFuel = pricing && parseFloat(pricing.fuelPct)>0;
+    if (pricing && (pricing.base || _hasOtherCharges || _hasFuel)) {
       const cur = pricing.cur || "CAD";
       const sym = cur === "EUR" ? "€" : cur === "GBP" ? "£" : "$";
       const baseAmt = parseFloat(pricing.base) || 0;
@@ -900,11 +1025,31 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
       y -= 10; p1.drawRectangle({ x: M, y: y - 4, width: W - 2 * M, height: 2, color: red }); y -= 18;
       p1.drawText("PRICING", { x: M, y, size: 12, font: helveticaBold, color: red }); y -= 6;
       const transDesc = pricing.transDesc || "";
-      const pl = (label, amount, bold) => { y -= 14; p1.drawText(label, { x: M + 10, y, size: bold ? 10 : 9, font: bold ? helveticaBold : helvetica, color: black }); const a = `${sym}${amount.toFixed(2)} ${cur}`; p1.drawText(a, { x: W - M - 10 - (bold ? helveticaBold : helvetica).widthOfTextAtSize(a, bold ? 10 : 9), y, size: bold ? 10 : 9, font: bold ? helveticaBold : helvetica, color: bold ? red : black }); };
-      if (transDesc) {
-        pl(transDesc, baseAmt, false);
-      } else {
-        pl("Base Price", baseAmt, false);
+      const pl = (label, amount, bold) => {
+        const fnt = bold ? helveticaBold : helvetica;
+        const sz = bold ? 10 : 9;
+        const a = `${sym}${amount.toFixed(2)} ${cur}`;
+        const amtW = fnt.widthOfTextAtSize(a, sz);
+        // Wrap the label within the space left of the amount so a long
+        // description flows onto extra lines instead of overlapping the price.
+        const maxLabelW = (W - M - 10 - amtW) - (M + 10) - 12;
+        const labelLines = fnt.widthOfTextAtSize(label, sz) > maxLabelW
+          ? wrapLines(label, maxLabelW, fnt, sz)
+          : [label];
+        y -= 14;
+        // Amount is drawn once, aligned to the first line.
+        p1.drawText(a, { x: W - M - 10 - amtW, y, size: sz, font: fnt, color: bold ? red : black });
+        for (let i = 0; i < labelLines.length; i++) {
+          if (i > 0) y -= 11;
+          p1.drawText(labelLines[i], { x: M + 10, y, size: sz, font: fnt, color: black });
+        }
+      };
+      if (baseAmt > 0) {
+        if (transDesc) {
+          pl(transDesc, baseAmt, false);
+        } else {
+          pl("Base Price", baseAmt, false);
+        }
       }
       if (fuelPct > 0) pl(`Fuel Surcharge (${fuelPct}%)`, fuelAmt, false);
       if (pricing.taxMode !== "NONE" && taxAmt > 0) pl(`Tax on Base (${taxPct}% ${pricing.taxMode})`, taxAmt, false);
@@ -916,7 +1061,12 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
         if (c.ltax > 0) { y -= 12; const tl = `   Tax (${c.ltp}%)`; p1.drawText(tl, { x: M + 14, y, size: 8, font: helvetica, color: gray }); const ta = `${sym}${c.ltax.toFixed(2)} ${cur}`; p1.drawText(ta, { x: W - M - 10 - helvetica.widthOfTextAtSize(ta, 8), y, size: 8, font: helvetica, color: gray }); }
       }
       y -= 6; p1.drawRectangle({ x: M + 10, y: y + 2, width: W - 2 * M - 20, height: 1, color: gray });
-      pl("TOTAL", total, true);
+      // If the order carries an FX snapshot, show the currency conversion +
+      // admin fee + grand total (matching the BOL) after the base-currency TOTAL.
+      const drewFxTr = await drawFxSnapshotTotal();
+      if (!drewFxTr) {
+        pl("TOTAL", total, true);
+      }
       y -= 16; // breathing room after TOTAL before next section
     }
     }
@@ -940,7 +1090,8 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
     y -= 10;
   }
 
-  // ── POD (both order types) ──
+  // ── POD (both order types) — single order-level POD OR per-stop PODs ──
+  const _podStops = order.podBy ? [] : ((order.delStops||[]).concat(order.pickStops||[])).filter(st => st && st.pod && st.pod.by);
   if (order.podBy) {
     y -= 16;
     p1.drawRectangle({ x: M, y: y - 46, width: W - 2 * M, height: 48, borderColor: green, borderWidth: 1.5 });
@@ -948,6 +1099,21 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
     p1.drawText(`Received by: ${order.podBy}`, { x: M + 8, y: y - 28, size: 9, font: helveticaBold, color: black });
     p1.drawText(`Date: ${fd(order.podDate)}    Time: ${order.podTime || "—"}`, { x: M + 8, y: y - 40, size: 9, font: helvetica, color: black });
     y -= 56;
+  } else if (_podStops.length) {
+    const boxH = 24 + _podStops.length * 24 + 6;  // header + rows + bottom padding
+    await ensureSpace(boxH + 16);
+    y -= 16;
+    p1.drawRectangle({ x: M, y: y - boxH, width: W - 2 * M, height: boxH + 2, borderColor: green, borderWidth: 1.5 });
+    p1.drawText("PROOF OF DELIVERY", { x: M + 8, y: y - 14, size: 8, font: helveticaBold, color: green });
+    let py = y - 32;
+    for (const st of _podStops) {
+      const stopName = st.co || st.company || st.name || "Stop";
+      p1.drawText(`${stopName} — Received by: ${st.pod.by}`, { x: M + 8, y: py, size: 9, font: helveticaBold, color: black });
+      const dt = `${st.pod.date ? "Date: " + fd(st.pod.date) : ""}${st.pod.time ? "    Time: " + st.pod.time : ""}`.trim();
+      if (dt) { p1.drawText(dt, { x: M + 8, y: py - 11, size: 8, font: helvetica, color: rgb(0.3,0.3,0.3) }); }
+      py -= 24;
+    }
+    y -= (boxH + 10);
   }
 
   // ── Signature lines at bottom (transport orders only) ──
@@ -1086,8 +1252,20 @@ exports.sendBolEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"] }
     // Also generate a matching clean PDF to attach
     const pdfBytes = await generateBolPdf(order, client || null);
     const attachments = [{ filename: `BOL_${order.bol}.pdf`, content: Buffer.from(pdfBytes), contentType: "application/pdf" }];
+    // Attach each order file. Download into a buffer (like sendInvoiceEmail) rather
+    // than passing path:url — Firebase Storage URLs don't always fetch cleanly at
+    // send time, which would silently drop attachments. Per-file try/catch so one
+    // bad file can't stop the BOL email.
     if (includeAttachments && order.files && order.files.length > 0) {
-      attachments.push(...order.files.filter(f => f.url).map(f => ({ filename: f.name, path: f.url })));
+      for (const file of order.files) {
+        if (!file || !file.url) continue;
+        try {
+          const fileBuffer = await downloadFile(file.url);
+          attachments.push({ filename: file.name || "attachment", content: fileBuffer });
+        } catch (dlErr) {
+          console.warn(`[sendBolEmail] Could not attach ${file.name}:`, dlErr.message);
+        }
+      }
     }
     await getTransporter().sendMail({
       from: '"DBX Dispatch" <manny@diamondbackexpress.com>', to: toEmail,
@@ -1207,10 +1385,21 @@ exports.sendInvoiceEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD
     // Build file list HTML for the email body
     const fileListHtml = (orderFiles && orderFiles.length > 0) ? `<hr><p><b>Order Attachments (${orderFiles.length}):</b></p>${orderFiles.map(f => `<p>📎 ${f.name}</p>`).join("")}` : "";
 
+    // POD html — single order-level POD or per-stop PODs (multi-stop)
+    let podHtml = "";
+    if (order.podBy) {
+      podHtml = `<p><b>POD:</b> ${order.podBy} — ${fd(order.podDate)} ${order.podTime || ""}</p>`;
+    } else {
+      const podStops = ((order.delStops||[]).concat(order.pickStops||[])).filter(st => st && st.pod && st.pod.by);
+      if (podStops.length) {
+        podHtml = `<p><b>Proof of Delivery:</b><br>${podStops.map(st => `${st.co||st.company||st.name||"Stop"}: ${st.pod.by}${st.pod.date?` — ${fd(st.pod.date)}`:""}${st.pod.time?` ${st.pod.time}`:""}`).join("<br>")}</p>`;
+      }
+    }
+
     await getTransporter().sendMail({
       from: '"DBX Dispatch" <manny@diamondbackexpress.com>', to: toEmail,
       subject: subject || `Invoice — BOL ${order.bol} — ${order.cliName || "DBX"}`,
-      html: `<h2>Invoice — BOL ${order.bol}</h2><p>${order.cliName ? `<b>Client:</b> ${order.cliName}<br>` : ""}${order.billTo ? `<b>Bill To:</b> ${order.billTo}<br>` : ""}${order.ref ? `<b>Reference #:</b> ${order.ref}<br>` : ""}${order.drvName ? `<b>Driver:</b> ${order.drvName}<br>` : ""}</p>${order.podBy ? `<p><b>POD:</b> ${order.podBy} — ${fd(order.podDate)} ${order.podTime || ""}</p>` : ""}${order.orderType !== "event" && p.base ? `<h3>Pricing (${p.cur || "CAD"})</h3><p>Base: ${sym}${baseAmt.toFixed(2)}${fuelPct ? `<br>Fuel (${fuelPct}%): ${sym}${fuelAmt.toFixed(2)}` : ""}${(p.other || []).filter(c => c.desc || c.amt).map(c => `<br>${c.desc || "Other"}: ${sym}${(parseFloat(c.amt) || 0).toFixed(2)}`).join("")}${taxAmt > 0 ? `<br>Tax (${taxPct}%): ${sym}${taxAmt.toFixed(2)}` : ""}</p><p><b>TOTAL: ${sym}${total.toFixed(2)} ${p.cur || "CAD"}</b></p>` : ""}${emailMsg && emailMsg.trim() ? `<div style="margin:16px 0;padding:14px 16px;background:#fff8f0;border-left:4px solid #b45309;border-radius:4px"><p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.05em">Message to Accounting</p><p style="margin:0;font-size:13px;color:#1a1a1a;white-space:pre-wrap">${emailMsg.trim()}</p></div>` : ""}<p>See attached PDF for full details.</p>${fileListHtml}<hr><p style="font-size:10px;color:#888">DBX Dispatch</p>`,
+      html: `<h2>Invoice — BOL ${order.bol}</h2><p>${order.cliName ? `<b>Client:</b> ${order.cliName}<br>` : ""}${order.billTo ? `<b>Bill To:</b> ${order.billTo}<br>` : ""}${order.ref ? `<b>Reference #:</b> ${order.ref}<br>` : ""}${order.drvName ? `<b>Driver:</b> ${order.drvName}<br>` : ""}</p>${podHtml}${order.orderType !== "event" && p.base ? `<h3>Pricing (${p.cur || "CAD"})</h3><p>Base: ${sym}${baseAmt.toFixed(2)}${fuelPct ? `<br>Fuel (${fuelPct}%): ${sym}${fuelAmt.toFixed(2)}` : ""}${(p.other || []).filter(c => c.desc || c.amt).map(c => `<br>${c.desc || "Other"}: ${sym}${(parseFloat(c.amt) || 0).toFixed(2)}`).join("")}${taxAmt > 0 ? `<br>Tax (${taxPct}%): ${sym}${taxAmt.toFixed(2)}` : ""}</p><p><b>TOTAL: ${sym}${total.toFixed(2)} ${p.cur || "CAD"}</b></p>` : ""}${emailMsg && emailMsg.trim() ? `<div style="margin:16px 0;padding:14px 16px;background:#fff8f0;border-left:4px solid #b45309;border-radius:4px"><p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.05em">Message to Accounting</p><p style="margin:0;font-size:13px;color:#1a1a1a;white-space:pre-wrap">${emailMsg.trim()}</p></div>` : ""}<p>See attached PDF for full details.</p>${fileListHtml}<hr><p style="font-size:10px;color:#888">DBX Dispatch</p>`,
       attachments,
     });
     res.json({ success: true });
@@ -1284,258 +1473,6 @@ exports.dailyPickupReminder = onSchedule({
   }
 });
 // Thu May  7 10:51:56 PM UTC 2026
-
-// ═══ DAILY CERTIFICATION & EQUIPMENT EXPIRY DIGEST ═══════════════════════════
-// Runs every morning; emails anything expired or expiring within 30 days.
-// Fallback only — the live list is managed in the app and stored at
-// settings/alertRecipients. If that doc is missing or empty we fall back to
-// these so the digest can never silently email nobody.
-const CERT_ALERT_RECIPIENTS_FALLBACK = [
-  "manny@diamondbackexpress.com",
-  "nichole@diamondbackexpress.com",
-  "chris@diamondbackexpress.com",
-];
-
-// Read the editable recipient list from Firestore.
-async function getAlertRecipients(db) {
-  try {
-    const snap = await db.collection("settings").doc("alertRecipients").get();
-    const list = snap.exists ? (snap.data().emails || []) : [];
-    const clean = list
-      .map(e => String(e || "").trim())
-      .filter(e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e));
-    if (clean.length) return clean;
-    console.warn("alertRecipients empty or invalid — using fallback list");
-  } catch (e) {
-    console.error("Could not read alertRecipients, using fallback:", e);
-  }
-  return CERT_ALERT_RECIPIENTS_FALLBACK;
-}
-
-const DIGEST_CERTS = [
-  { k: "acrDate", l: "ACR Training", months: 12 },
-  { k: "hazmatDate", l: "HazMat Training", months: 36 },
-  { k: "crimDate", l: "Criminal Record Check", months: 60 },
-  { k: "licenseExpiry", l: "Driver's Licence", direct: true },
-];
-
-// Effective expiry (YYYY-MM-DD) for a cert, or null when it never expires.
-function digestExpiry(dateStr, months, direct) {
-  const s = digestDateStr(dateStr);
-  if (!s) return null;
-  if (direct) return s;
-  if (!months) return null;
-  const d = new Date(s + "T12:00:00");
-  d.setMonth(d.getMonth() + months);
-  return d.toISOString().slice(0, 10);
-}
-// Normalise whatever the date field holds into "YYYY-MM-DD".
-// Equipment safetyExp and cert dates are normally plain date strings, but a
-// Firestore Timestamp, a Date, or an ISO timestamp would previously produce
-// NaN days and the record was silently skipped — no error, just no email.
-function digestDateStr(v) {
-  if (!v) return null;
-  // Firestore Timestamp
-  if (typeof v === "object" && typeof v.toDate === "function") {
-    return v.toDate().toISOString().slice(0, 10);
-  }
-  if (v instanceof Date) {
-    return isNaN(v) ? null : v.toISOString().slice(0, 10);
-  }
-  const s = String(v).trim();
-  if (!s) return null;
-  // Already YYYY-MM-DD (possibly with a time component)
-  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  // MM/DD/YYYY or M/D/YYYY
-  const us = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (us) return `${us[3]}-${us[1].padStart(2,"0")}-${us[2].padStart(2,"0")}`;
-  // Last resort — let Date try, then normalise
-  const d = new Date(s);
-  return isNaN(d) ? null : d.toISOString().slice(0, 10);
-}
-
-function digestDaysLeft(expStr) {
-  const s = digestDateStr(expStr);
-  if (!s) return null;
-  const ms = new Date(s + "T12:00:00") - new Date();
-  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-  return Number.isFinite(days) ? days : null;
-}
-// ─── ALERT CADENCE ───────────────────────────────────────────────────────────
-// First notice at 30 days out, then every 5 days: 30, 25, 20, 15, 10, 5, and 0
-// (expiration day itself). Purely a function of days-remaining, so nothing is
-// stored per record — updating an expiry date pushes days back above 30 and the
-// item simply stops matching. No flags to reset.
-const ALERT_DAYS = [30, 25, 20, 15, 10, 5, 0];
-
-// Should this record be included in today's email?
-function digestDue(days) {
-  if (days === null) return false;
-  if (days < 0) return true;            // already expired — keep nagging daily
-  return ALERT_DAYS.includes(days);
-}
-
-function digestRow(name, role, kind, expStr, days) {
-  const color = days <= 0 ? "#dc2626" : days <= 10 ? "#ca8a04" : "#ea580c";
-  const state = days < 0 ? `EXPIRED ${Math.abs(days)}d ago`
-    : days === 0 ? "EXPIRES TODAY"
-    : `${days}d left`;
-  return `<tr><td><b>${name}</b></td><td>${role}</td><td>${kind}</td><td>${fd(expStr)}</td>` +
-         `<td style="color:${color};font-weight:700">${state}</td></tr>`;
-}
-
-// ─── PER-PERSON ALERT MUTE ───────────────────────────────────────────────────
-// Set alertsMuted:true on a driver/employee doc to pause their expiry emails
-// (sick leave, LOA, seasonal layoff). Optional alertsMutedUntil (YYYY-MM-DD)
-// auto-resumes the day AFTER that date, so a pause can't be forgotten.
-// alertsMutedReason is free text shown in the digest footer.
-function digestMuted(p, todayStr) {
-  if (!p.alertsMuted) return false;
-  if (p.alertsMutedUntil && p.alertsMutedUntil < todayStr) return false; // expired pause
-  return true;
-}
-
-// Driver / Employee / both — mirrors the role badges in the app.
-function digestRole(p) {
-  if (p.isSupplier) return "Supplier";
-  const r = [];
-  if (p.isDriver !== false) r.push("Driver");
-  if (p.isEmployee) r.push("Employee");
-  return r.join(" / ") || "Staff";
-}
-
-exports.dailyExpiryDigest = onSchedule({
-  schedule: "0 7 * * *",
-  timeZone: "America/Toronto",
-  secrets: ["GMAIL_APP_PASSWORD"],
-}, async () => {
-  try {
-    const db = admin.firestore();
-
-    const [drvSnap, trkSnap, trlSnap] = await Promise.all([
-      db.collection("drivers").get(),
-      db.collection("trucks").get(),
-      db.collection("trailers").get(),
-    ]);
-
-    const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "America/Toronto" });
-
-    const people = [];
-    const muted = [];
-    drvSnap.docs.forEach(d => {
-      const p = d.data();
-      if (p.isSupplier) return; // suppliers carry no certifications
-      if (digestMuted(p, todayStr)) {
-        // Record the pause so it stays visible, but raise no alerts.
-        const anyDue = DIGEST_CERTS.some(c => {
-          const e = digestExpiry(p[c.k], c.months, c.direct);
-          return e && digestDaysLeft(e) <= 30;
-        });
-        if (anyDue) muted.push({
-          name: p.name || "(unnamed)",
-          role: digestRole(p),
-          until: p.alertsMutedUntil || "",
-          reason: p.alertsMutedReason || "",
-        });
-        return;
-      }
-      DIGEST_CERTS.forEach(c => {
-        const exp = digestExpiry(p[c.k], c.months, c.direct);
-        if (!exp) return;
-        const days = digestDaysLeft(exp);
-        if (!digestDue(days)) return;
-        people.push({ name: p.name || "(unnamed)", role: digestRole(p), kind: c.l, exp, days });
-      });
-    });
-
-    const units = [];
-    const collectUnit = (snap, kindLabel) => snap.docs.forEach(d => {
-      const u = d.data();
-      if (!u.safetyExp) return;
-      const days = digestDaysLeft(u.safetyExp);
-      if (!digestDue(days)) return;
-      const desc = [u.year, u.make, u.model].filter(Boolean).join(" ");
-      units.push({
-        name: `${kindLabel} ${u.unit || "(no unit #)"}${desc ? ` — ${desc}` : ""}`,
-        unitKind: kindLabel, kind: "Safety Inspection", exp: u.safetyExp, days,
-      });
-    });
-    collectUnit(trkSnap, "Truck");
-    collectUnit(trlSnap, "Trailer");
-
-    // Diagnostics — makes it obvious from the logs whether equipment is being
-    // read at all, and how many units carry an unparseable safetyExp.
-    const badDates = [...trkSnap.docs, ...trlSnap.docs]
-      .filter(d => d.data().safetyExp && digestDaysLeft(d.data().safetyExp) === null)
-      .map(d => `${d.data().unit || d.id}="${d.data().safetyExp}"`);
-    console.log(`Equipment scan: ${trkSnap.size} truck(s), ${trlSnap.size} trailer(s), ` +
-      `${[...trkSnap.docs, ...trlSnap.docs].filter(d => d.data().safetyExp).length} with a safety date, ` +
-      `${units.length} due today` +
-      (badDates.length ? `, UNPARSEABLE: ${badDates.join(", ")}` : ""));
-
-    if (people.length === 0 && units.length === 0) {
-      console.log(`Expiry digest: nothing due today (${muted.length} muted person(s) skipped)`);
-      return;
-    }
-
-    people.sort((a, b) => a.days - b.days);
-    units.sort((a, b) => a.days - b.days);
-
-    const tableOpen = (col2) => `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:13px">` +
-      `<tr style="background:#f1f5f9"><th>Name</th><th>${col2}</th><th>Item</th><th>Expires</th><th>Status</th></tr>`;
-
-    let html = `<h2>⚠️ DBX — Certification &amp; Safety Expiry Digest</h2>` +
-      `<p style="font-size:13px;color:#475569">Notices go out 30 days before expiry, then every 5 days ` +
-      `(30, 25, 20, 15, 10, 5) and on the expiration day. Expired items are reported daily until renewed. ` +
-      `Updating the expiration date stops the reminders automatically.</p>`;
-
-    if (people.length) {
-      html += `<h3 style="color:#dc2626">Personnel Certifications (${people.length})</h3>${tableOpen("Role")}`;
-      people.forEach(r => { html += digestRow(r.name, r.role, r.kind, r.exp, r.days); });
-      html += `</table>`;
-    }
-    if (units.length) {
-      html += `<h3 style="color:#ea580c">Equipment Safety (${units.length})</h3>${tableOpen("Type")}`;
-      units.forEach(r => { html += digestRow(r.name, r.kind === "Safety Inspection" ? r.unitKind : "", r.kind, r.exp, r.days); });
-      html += `</table>`;
-    }
-
-    if (muted.length) {
-      html += `<h3 style="color:#64748b">Paused — no alerts sent (${muted.length})</h3>` +
-        `<table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:12px;color:#64748b">` +
-        `<tr style="background:#f8fafc"><th>Name</th><th>Role</th><th>Paused until</th><th>Reason</th></tr>`;
-      muted.forEach(m => {
-        html += `<tr><td><b>${m.name}</b></td><td>${m.role}</td>` +
-          `<td>${m.until ? fd(m.until) : "Indefinite"}</td><td>${m.reason || "—"}</td></tr>`;
-      });
-      html += `</table><p style="font-size:11px;color:#94a3b8">` +
-        `These people have items expiring but alerts are paused. Clear the pause in the app to resume.</p>`;
-    }
-
-    html += `<br><p style="font-size:11px;color:#888">Automated daily digest from DBX Dispatch.<br>` +
-      `Manage records at <a href="https://dbx.cargodx.ca">dbx.cargodx.ca</a></p>`;
-
-    const all = [...people, ...units];
-    const expiredCount = all.filter(r => r.days < 0).length;
-    const todayCount = all.filter(r => r.days === 0).length;
-    const soonCount = all.length - expiredCount - todayCount;
-    const subjBits = [];
-    if (expiredCount) subjBits.push(`${expiredCount} expired`);
-    if (todayCount) subjBits.push(`${todayCount} expiring today`);
-    if (soonCount) subjBits.push(`${soonCount} upcoming`);
-    await getTransporter().sendMail({
-      from: '"DBX Dispatch" <manny@diamondbackexpress.com>',
-      to: (await getAlertRecipients(db)).join(", "),
-      subject: `DBX Expiry Alert — ${subjBits.join(", ")}`,
-      html,
-    });
-
-    console.log(`Expiry digest sent: ${people.length} cert(s), ${units.length} unit(s)`);
-  } catch (error) {
-    console.error("Expiry digest error:", error);
-  }
-});
 
 // ─── TIMESHEET RECAP EMAIL WITH PDF ATTACHMENT ───────────────────────────────
 async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, cfg, event, message) {
@@ -1621,29 +1558,55 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
   const getEntryDetails = (e) => {
     const lines = [];
     const mins = calcMins(e.startTime, e.endTime);
-    if (mins > 0 && !["non-working","per-diem","working-day"].includes(e.dayType)) {
+    if (mins > 0 && !["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) {
       const r = parseFloat(e.hourlyOverride)||(parseFloat(cfg?.hourly)||0);
       lines.push(`${e.startTime} -> ${e.endTime}  (${fmtH(mins)}${r>0?` x $${r.toFixed(2)}/h`:""})`);
     }
-    const wd = (parseFloat(e.numDays)||0) + (e.dayType==="working-day"?1:0);
-    if (wd > 0) { const r=parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0); lines.push(`${wd} working day${wd>1?"s":""}${r>0?` x $${r.toFixed(2)}`:""}`);}
-    const nw = (parseFloat(e.numNwDays)||0) + (e.dayType==="non-working"?1:0);
-    if (nw > 0) { const r=parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0); lines.push(`${nw} non-working day${nw>1?"s":""}${r>0?` x $${r.toFixed(2)}`:""}`);}
-    const pd = (parseFloat(e.numPerDiem)||0) + (e.dayType==="per-diem"?1:0);
-    if (pd > 0) { const r=parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0); lines.push(`${pd} per diem${r>0?` x $${r.toFixed(2)}`:""}`);}
+    const wd = (parseFloat(e.numDays)||0) || (e.dayType==="working-day"?1:0);
+    if (wd > 0) { lines.push(`Working day`);}
+    const nw = (parseFloat(e.numNwDays)||0) || (e.dayType==="non-working"?1:0);
+    if (nw > 0) { lines.push(`Non-working day`);}
+    const tv = (parseFloat(e.numTravelDays)||0) || (e.dayType==="travel-day"?1:0);
+    if (tv > 0) { lines.push(`Traveling day`);}
+    const pd = (parseFloat(e.numPerDiem)||0) || (e.dayType==="per-diem"?1:0);
+    if (pd > 0) { lines.push(`Per diem`);}
     const tr = parseFloat(e.numTrips)||0;
-    if (tr > 0) { const r=parseFloat(e.tripRateOverride)||(parseFloat(cfg?.tripRate)||0); lines.push(`${tr} trip${tr>1?"s":""}${r>0?` x $${r.toFixed(2)}`:""}`);}
-    if ((parseFloat(e.expenseAmt)||0)>0 && e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; lines.push(`Expense: ${e.expenseDesc} $${(parseFloat(e.expenseAmt)||0).toFixed(2)}${taxLbl}`); }
+    if (tr > 0) { lines.push(`${tr} trip${tr>1?"s":""}`);}
+    if ((parseFloat(e.expenseAmt)||0)>0 && e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; const _ec=e.expenseCurrency||"CAD"; const _cad=_ec==="USD"&&typeof e.expenseAmtCad==="number"?` -> CAD ${e.expenseAmtCad.toFixed(2)}`:""; lines.push(`Expense: ${e.expenseDesc} ${_ec} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}${_cad}${taxLbl}`); }
     if (e.notes) lines.push(e.notes.substring(0,40));
     return lines.length ? lines : ["—"];
   };
+
+  // Per-entry CAD amount (matches the email recap logic exactly)
+  const getEntryAmt = (e) => {
+    let amt = 0;
+    amt += ((parseFloat(e.numDays)||0)||(e.dayType==="working-day"?1:0)) * (parseFloat(e.dayRateOverride)||parseFloat(cfg?.workDay)||0);
+    amt += ((parseFloat(e.numNwDays)||0)||(e.dayType==="non-working"?1:0)) * (parseFloat(e.nwDayRateOverride)||parseFloat(cfg?.nonWorkDay)||0);
+    amt += ((parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0)) * (parseFloat(e.travelDayRateOverride)||parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0);
+    amt += ((parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0)) * (parseFloat(e.perDiemRateOverride)||parseFloat(cfg?.perDiem)||0);
+    amt += (parseFloat(e.numTrips)||0) * (parseFloat(e.tripRateOverride)||parseFloat(cfg?.tripRate)||0);
+    const m2 = calcMins(e.startTime, e.endTime);
+    if (m2 > 0 && !["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) amt += (m2/60)*(parseFloat(e.hourlyOverride)||parseFloat(cfg?.hourly)||0);
+    const expRaw = parseFloat(e.expenseAmt)||0;
+    if (expRaw > 0) amt += (e.expenseCurrency||"CAD")==="USD"&&typeof e.expenseAmtCad==="number" ? e.expenseAmtCad : expRaw;
+    return amt;
+  };
+
+  // Column geometry for the daily table
+  const COL_DATE = M + 4;
+  const COL_DETAILS = M + 155;
+  const COL_AMT_R = W - M - 4;   // right edge for the right-aligned Amount column
+  const AMT_COL_W = 90;
+  const DETAILS_MAX_W = COL_AMT_R - AMT_COL_W - COL_DETAILS; // room before the Amount column
 
   page.drawText("DAILY ENTRIES", { x: M, y, size: 8, font: fonts.bold, color: gray });
   y -= 14;
   const drawTableHeader = () => {
     page.drawRectangle({ x: M, y: y-2, width: W-M*2, height: 14, color: rgb(0.06,0.06,0.06) });
-    page.drawText("DATE", { x: M+4, y: y+2, size: 7, font: fonts.bold, color: rgb(1,1,1) });
-    page.drawText("DETAILS", { x: M+155, y: y+2, size: 7, font: fonts.bold, color: rgb(1,1,1) });
+    page.drawText("DATE", { x: COL_DATE, y: y+2, size: 7, font: fonts.bold, color: rgb(1,1,1) });
+    page.drawText("DETAILS", { x: COL_DETAILS, y: y+2, size: 7, font: fonts.bold, color: rgb(1,1,1) });
+    const amtHdr = "AMOUNT";
+    page.drawText(amtHdr, { x: COL_AMT_R - fonts.bold.widthOfTextAtSize(amtHdr, 7), y: y+2, size: 7, font: fonts.bold, color: rgb(1,1,1) });
     y -= 14;
   };
   drawTableHeader();
@@ -1655,14 +1618,27 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
     const rowH = Math.max(14, details.length * 12 + 4);
     if (y - rowH < M + 30) { newPage(); page.drawText("DAILY ENTRIES (cont.)", { x: M, y, size: 8, font: fonts.bold, color: gray }); y -= 14; drawTableHeader(); rowIdx = 0; }
     if (rowIdx % 2 === 0) page.drawRectangle({ x: M, y: y-rowH+12, width: W-M*2, height: rowH, color: lightGray });
-    page.drawText(fmtDate(e.date), { x: M+4, y, size: 7.5, font: fonts.bold, color: black });
+    page.drawText(fmtDate(e.date), { x: COL_DATE, y, size: 7.5, font: fonts.bold, color: black });
     const mins = calcMins(e.startTime, e.endTime);
-    if (mins > 0 && !["non-working","per-diem","working-day"].includes(e.dayType)) totalMins += mins;
+    if (mins > 0 && !["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) totalMins += mins;
+    // Fit a detail line within the details column (truncate with … if too wide)
+    const fitDetail = (s) => {
+      if (fonts.regular.widthOfTextAtSize(s, 7.5) <= DETAILS_MAX_W) return s;
+      let t = s;
+      while (t.length > 1 && fonts.regular.widthOfTextAtSize(t + "…", 7.5) > DETAILS_MAX_W) t = t.slice(0, -1);
+      return t + "…";
+    };
     details.forEach((line, li) => {
       const lineY = y - li * 12;
       const isHrs = li===0 && line.includes("->");
-      page.drawText(line.substring(0,60), { x: M+155, y: lineY, size: 7.5, font: fonts.regular, color: isHrs?red:black });
+      page.drawText(fitDetail(line), { x: COL_DETAILS, y: lineY, size: 7.5, font: fonts.regular, color: isHrs?red:black });
     });
+    // Per-line amount, right-aligned on the row's top line
+    const rowAmt = getEntryAmt(e);
+    if (rowAmt > 0) {
+      const amtTxt = `CAD ${rowAmt.toFixed(2)}`;
+      page.drawText(amtTxt, { x: COL_AMT_R - fonts.bold.widthOfTextAtSize(amtTxt, 7.5), y, size: 7.5, font: fonts.bold, color: rgb(0.086, 0.639, 0.29) });
+    }
     y -= rowH; rowIdx++;
   }
   page.drawLine({ start:{x:M,y:y+4}, end:{x:W-M,y:y+4}, thickness:1, color:black });
@@ -1686,7 +1662,7 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
   const hoursByRate = {};
   sorted.forEach(e => {
     const m = calcMins(e.startTime, e.endTime);
-    if (m > 0 && !["non-working","per-diem","working-day"].includes(e.dayType)) {
+    if (m > 0 && !["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) {
       const r = parseFloat(e.hourlyOverride)||(parseFloat(cfg?.hourly)||0);
       if (r > 0) { const k=r.toFixed(2); hoursByRate[k]=(hoursByRate[k]||0)+m; }
     }
@@ -1700,7 +1676,7 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
   // Working days — group by rate
   const wdByRate = {};
   sorted.forEach(e => {
-    const d=(parseFloat(e.numDays)||0)+(e.dayType==="working-day"?1:0);
+    const d=(parseFloat(e.numDays)||0)||(e.dayType==="working-day"?1:0);
     if(d>0){const r=parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0); if(r>0){const k=r.toFixed(2); wdByRate[k]=(wdByRate[k]||0)+d;}}
   });
   Object.entries(wdByRate).forEach(([rate,days]) => {
@@ -1709,18 +1685,24 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
 
   // Non-working days — group by rate
   const nwByRate = {};
+  const tvByRate = {};
   sorted.forEach(e => {
-    const d=(parseFloat(e.numNwDays)||0)+(e.dayType==="non-working"?1:0);
+    const d=(parseFloat(e.numNwDays)||0)||(e.dayType==="non-working"?1:0);
     if(d>0){const r=parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0); if(r>0){const k=r.toFixed(2); nwByRate[k]=(nwByRate[k]||0)+d;}}
+    const dtv=(parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0);
+    if(dtv>0){const r=parseFloat(e.travelDayRateOverride)||(parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0); if(r>0){const k=r.toFixed(2); tvByRate[k]=(tvByRate[k]||0)+dtv;}}
   });
   Object.entries(nwByRate).forEach(([rate,days]) => {
     const amt=days*parseFloat(rate); addRow(`${days} non-working day${days>1?"s":""} x $${rate}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
+  });
+  Object.entries(tvByRate).forEach(([rate,days]) => {
+    const amt=days*parseFloat(rate); addRow(`${days} traveling day${days>1?"s":""} x $${rate}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
   });
 
   // Per diem — group by rate
   const pdByRate = {};
   sorted.forEach(e => {
-    const d=(parseFloat(e.numPerDiem)||0)+(e.dayType==="per-diem"?1:0);
+    const d=(parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0);
     if(d>0){const r=parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0); if(r>0){const k=r.toFixed(2); pdByRate[k]=(pdByRate[k]||0)+d;}}
   });
   Object.entries(pdByRate).forEach(([rate,days]) => {
@@ -1737,23 +1719,19 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
     const amt=trips*parseFloat(rate); addRow(`${trips} trip${trips>1?"s":""} x $${rate}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
   });
 
-  // Inline expenses from entries
-  const inlineExp = {};
+  // Inline expenses from entries — list each once, and record amount+date keys
+  // so a matching approved submitted expense (the same physical expense) isn't
+  // counted twice.
+  // Expenses live ON the entries (approving a submitted expense MOVES it onto
+  // the entry). So count only entry expenses here; the `expenses` array is the
+  // pre-approval submission queue and must NOT be added to the total (doing so
+  // was the double-count). Show the note.
   sorted.forEach(e => {
-    const amt=parseFloat(e.expenseAmt)||0;
-    if(amt>0&&e.expenseDesc){inlineExp[e.expenseDesc]=(inlineExp[e.expenseDesc]||0)+amt;}
-  });
-  Object.entries(inlineExp).forEach(([desc,amt]) => {
-    addRow(`Expense: ${desc}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
-  });
-
-  // Approved submitted expenses
-  const appExp = {};
-  (expenses||[]).filter(e=>e.status==="approved").forEach(e => {
-    const t=e.type||"Miscellaneous"; appExp[t]=(appExp[t]||0)+(parseFloat(e.amount)||0);
-  });
-  Object.entries(appExp).forEach(([type,amt]) => {
-    addRow(`Expense: ${type}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
+    const raw=parseFloat(e.expenseAmt)||0;
+    if(raw>0&&e.expenseDesc){
+      const amt=(e.expenseCurrency||"CAD")==="USD"&&typeof e.expenseAmtCad==="number"?e.expenseAmtCad:raw;
+      addRow(`Expense: ${e.expenseDesc}`, `CAD ${amt.toFixed(2)}`); grandTotal+=amt;
+    }
   });
 
   ensureSpace(30);
@@ -1776,6 +1754,7 @@ async function generateRecapPdf(empName, empEmail, empPhone, entries, expenses, 
 exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"] }, async (req, res) => {
   try {
     const { empName, empEmail, empPhone, entries, expenses, cfg, event, message, extraEmails, ccManny } = req.body;
+
     if (!empEmail || !empName) { res.status(400).json({ error: "Missing employee info" }); return; }
 
     // Generate PDF
@@ -1792,41 +1771,62 @@ exports.sendRecapEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD"]
     const dayRows = sorted.map(e=>{
       const m=calcMins(e.startTime,e.endTime);
       const parts=[];
-      if(m>0&&!["non-working","per-diem","working-day"].includes(e.dayType)) parts.push(`<span style="color:#d42b2b;font-weight:700">${e.startTime} → ${e.endTime} (${fmtH(m)})</span>`);
-      const wd=(parseFloat(e.numDays)||0)+(e.dayType==="working-day"?1:0); if(wd>0){const r=parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0); parts.push(`${wd} working day${wd>1?"s":""}${r>0?` × $${r.toFixed(2)}`:""}`);}
-      const nw=(parseFloat(e.numNwDays)||0)+(e.dayType==="non-working"?1:0); if(nw>0){const r=parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0); parts.push(`${nw} NW day${nw>1?"s":""}${r>0?` × $${r.toFixed(2)}`:""}`);}
-      const pd=(parseFloat(e.numPerDiem)||0)+(e.dayType==="per-diem"?1:0); if(pd>0){const r=parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0); parts.push(`${pd} per diem${r>0?` × $${r.toFixed(2)}`:""}`);}
-      const tr=parseFloat(e.numTrips)||0; if(tr>0){const r=parseFloat(e.tripRateOverride)||(parseFloat(cfg?.tripRate)||0); parts.push(`${tr} trip${tr>1?"s":""}${r>0?` × $${r.toFixed(2)}`:""}`);}
-      if((parseFloat(e.expenseAmt)||0)>0&&e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; parts.push(`Expense: ${esc(e.expenseDesc)} $${(parseFloat(e.expenseAmt)||0).toFixed(2)}${taxLbl}`); }
+      if(m>0&&!["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) parts.push(`<span style="color:#d42b2b;font-weight:700">${e.startTime} → ${e.endTime} (${fmtH(m)})</span>`);
+      const wd=(parseFloat(e.numDays)||0)||(e.dayType==="working-day"?1:0); if(wd>0){ parts.push(`Working day`);}
+      const nw=(parseFloat(e.numNwDays)||0)||(e.dayType==="non-working"?1:0); if(nw>0){ parts.push(`Non-working day`);}
+      const tv=(parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0); if(tv>0){ parts.push(`Traveling day`);}
+      const pd=(parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0); if(pd>0){ parts.push(`Per diem`);}
+      const tr=parseFloat(e.numTrips)||0; if(tr>0){ parts.push(`${tr} trip${tr>1?"s":""}`);}
+      if((parseFloat(e.expenseAmt)||0)>0&&e.expenseDesc) { const r=e.expenseTax==="HST on Purchases - 13%"?0.13:e.expenseTax==="GST on Purchases - 5%"?0.05:0; const taxLbl=r>0?` (incl. $${((parseFloat(e.expenseAmt)||0)*(r/(1+r))).toFixed(2)} ${e.expenseTax.includes("HST")?"HST":"GST"})`:""; const _ec=e.expenseCurrency||"CAD"; const _cad=_ec==="USD"&&typeof e.expenseAmtCad==="number"?` → CAD ${e.expenseAmtCad.toFixed(2)}`:""; parts.push(`Expense: ${esc(e.expenseDesc)} ${_ec} ${(parseFloat(e.expenseAmt)||0).toFixed(2)}${_cad}${taxLbl}`); }
       if(e.notes) parts.push(`<em style="color:#888">${esc(e.notes)}</em>`);
-      return `<tr><td style="padding:8px 10px;border-bottom:1px solid #eee;font-weight:600;white-space:nowrap;vertical-align:top">${fmtDate(e.date)}</td><td style="padding:8px 10px;border-bottom:1px solid #eee;font-size:12px">${parts.join("<br>") || "—"}</td></tr>`;
+      // Per-entry amount (CAD) shown beside the details for quick reference.
+      const _r=(f,cfgKey,fb)=>parseFloat(e[f+"Override"])||parseFloat(cfg?.[cfgKey])||fb||0;
+      let amt=0;
+      amt += ((parseFloat(e.numDays)||0)||(e.dayType==="working-day"?1:0)) * (parseFloat(e.dayRateOverride)||parseFloat(cfg?.workDay)||0);
+      amt += ((parseFloat(e.numNwDays)||0)||(e.dayType==="non-working"?1:0)) * (parseFloat(e.nwDayRateOverride)||parseFloat(cfg?.nonWorkDay)||0);
+      amt += ((parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0)) * (parseFloat(e.travelDayRateOverride)||parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0);
+      amt += ((parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0)) * (parseFloat(e.perDiemRateOverride)||parseFloat(cfg?.perDiem)||0);
+      amt += (parseFloat(e.numTrips)||0) * (parseFloat(e.tripRateOverride)||parseFloat(cfg?.tripRate)||0);
+      const m2=calcMins(e.startTime,e.endTime); if(m2>0&&!["non-working","travel-day","per-diem","working-day"].includes(e.dayType)) amt += (m2/60)*(parseFloat(e.hourlyOverride)||parseFloat(cfg?.hourly)||0);
+      const expRaw=parseFloat(e.expenseAmt)||0; if(expRaw>0) amt += (e.expenseCurrency||"CAD")==="USD"&&typeof e.expenseAmtCad==="number"?e.expenseAmtCad:expRaw;
+      const amtCell = amt>0 ? `<td style="padding:8px 10px;border-bottom:1px solid #eee;font-size:12px;text-align:right;font-weight:700;color:#16a34a;white-space:nowrap;vertical-align:top">CAD ${amt.toFixed(2)}</td>` : `<td style="padding:8px 10px;border-bottom:1px solid #eee"></td>`;
+      return `<tr><td style="padding:8px 10px;border-bottom:1px solid #eee;font-weight:600;white-space:nowrap;vertical-align:top">${fmtDate(e.date)}</td><td style="padding:8px 10px;border-bottom:1px solid #eee;font-size:12px">${parts.join("<br>") || "—"}</td>${amtCell}</tr>`;
     }).join("");
     let payRows = "";
     let grandTot = 0;
     // Hours by rate
-    const hByR={}; sorted.forEach(e=>{const m=calcMins(e.startTime,e.endTime); if(m>0&&!["non-working","per-diem","working-day"].includes(e.dayType)){const r=parseFloat(e.hourlyOverride)||(parseFloat(cfg?.hourly)||0); if(r>0){const k=r.toFixed(2);hByR[k]=(hByR[k]||0)+m;}}});
+    const hByR={}; sorted.forEach(e=>{const m=calcMins(e.startTime,e.endTime); if(m>0&&!["non-working","travel-day","per-diem","working-day"].includes(e.dayType)){const r=parseFloat(e.hourlyOverride)||(parseFloat(cfg?.hourly)||0); if(r>0){const k=r.toFixed(2);hByR[k]=(hByR[k]||0)+m;}}});
     Object.entries(hByR).forEach(([rate,mins])=>{const a=(mins/60)*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${fmtH(mins)} × $${rate}/h</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
     // WD by rate
-    const wdByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numDays)||0)+(e.dayType==="working-day"?1:0); if(d>0){const r=parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0); if(r>0){const k=r.toFixed(2);wdByR[k]=(wdByR[k]||0)+d;}}});
+    const wdByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numDays)||0)||(e.dayType==="working-day"?1:0); if(d>0){const r=parseFloat(e.dayRateOverride)||(parseFloat(cfg?.workDay)||0); if(r>0){const k=r.toFixed(2);wdByR[k]=(wdByR[k]||0)+d;}}});
     Object.entries(wdByR).forEach(([rate,d])=>{const a=d*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${d} working day${d>1?"s":""} × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
     // NW by rate
-    const nwByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numNwDays)||0)+(e.dayType==="non-working"?1:0); if(d>0){const r=parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0); if(r>0){const k=r.toFixed(2);nwByR[k]=(nwByR[k]||0)+d;}}});
+    const nwByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numNwDays)||0)||(e.dayType==="non-working"?1:0); if(d>0){const r=parseFloat(e.nwDayRateOverride)||(parseFloat(cfg?.nonWorkDay)||0); if(r>0){const k=r.toFixed(2);nwByR[k]=(nwByR[k]||0)+d;}}});
     Object.entries(nwByR).forEach(([rate,d])=>{const a=d*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${d} non-working day${d>1?"s":""} × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
+    // Travel by rate
+    const tvByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numTravelDays)||0)||(e.dayType==="travel-day"?1:0); if(d>0){const r=parseFloat(e.travelDayRateOverride)||(parseFloat(cfg?.travelDay)||parseFloat(cfg?.nonWorkDay)||0); if(r>0){const k=r.toFixed(2);tvByR[k]=(tvByR[k]||0)+d;}}});
+    Object.entries(tvByR).forEach(([rate,d])=>{const a=d*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${d} traveling day${d>1?"s":""} × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
     // PD by rate
-    const pdByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numPerDiem)||0)+(e.dayType==="per-diem"?1:0); if(d>0){const r=parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0); if(r>0){const k=r.toFixed(2);pdByR[k]=(pdByR[k]||0)+d;}}});
+    const pdByR={}; sorted.forEach(e=>{const d=(parseFloat(e.numPerDiem)||0)||(e.dayType==="per-diem"?1:0); if(d>0){const r=parseFloat(e.perDiemRateOverride)||(parseFloat(cfg?.perDiem)||0); if(r>0){const k=r.toFixed(2);pdByR[k]=(pdByR[k]||0)+d;}}});
     Object.entries(pdByR).forEach(([rate,d])=>{const a=d*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${d} per diem × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
     // Trips by rate
     const trByR={}; sorted.forEach(e=>{const t=parseFloat(e.numTrips)||0; if(t>0){const r=parseFloat(e.tripRateOverride)||(parseFloat(cfg?.tripRate)||0); if(r>0){const k=r.toFixed(2);trByR[k]=(trByR[k]||0)+t;}}});
     Object.entries(trByR).forEach(([rate,t])=>{const a=t*parseFloat(rate); payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">${t} trip${t>1?"s":""} × $${rate}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
-    // Inline expenses
-    const iExp={}; sorted.forEach(e=>{const a=parseFloat(e.expenseAmt)||0; if(a>0&&e.expenseDesc){iExp[e.expenseDesc]=(iExp[e.expenseDesc]||0)+a;}});
-    Object.entries(iExp).forEach(([desc,a])=>{payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">Expense: ${desc}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
-    // Approved submitted expenses
-    const appE={}; (expenses||[]).filter(e=>e.status==="approved").forEach(e=>{const t=e.type||"Misc";appE[t]=(appE[t]||0)+(parseFloat(e.amount)||0);});
-    Object.entries(appE).forEach(([t,a])=>{payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">Expense: ${t}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`; grandTot+=a;});
+    // Expenses live ON the entries (approving moves a submitted expense onto the
+    // entry). Count only entry expenses; do NOT add the `expenses` submission
+    // queue to the total (that was the double-count). Show the note.
+    sorted.forEach(e=>{
+      const raw=parseFloat(e.expenseAmt)||0;
+      if(raw>0&&e.expenseDesc){
+        // Always total expenses in CAD: use the converted amountCad for USD, raw for CAD.
+        const a=(e.expenseCurrency||"CAD")==="USD"&&typeof e.expenseAmtCad==="number"?e.expenseAmtCad:raw;
+        payRows+=`<tr><td style="padding:6px 10px;border-bottom:1px solid #eee">Expense: ${e.expenseDesc}</td><td style="padding:6px 10px;border-bottom:1px solid #eee;text-align:right;font-weight:600">CAD ${a.toFixed(2)}</td></tr>`;
+        grandTot+=a;
+      }
+    });
     if(grandTot>0) payRows+=`<tr style="background:#f5f5f5"><td style="padding:8px 10px;font-weight:700;font-size:13px">GROSS TOTAL</td><td style="padding:8px 10px;text-align:right;font-weight:700;font-size:14px;color:#d42b2b">CAD ${grandTot.toFixed(2)}</td></tr>`;
     const evtLabel = (event && event !== "__all__") ? event : "";
-    const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto"><div style="background:#0f0f0f;padding:14px 24px;display:flex;justify-content:space-between;align-items:center"><div style="display:flex;align-items:center;gap:14px"><img src="data:image/jpeg;base64,${LOGO_B64}" style="height:36px;display:block;" alt="DBX"/><div style="color:#fff;font-size:15px;font-weight:700">DIAMOND BACK EXPRESS INC.</div></div><div style="color:#dc2626;font-size:11px;font-weight:600">${esc(evtLabel)}</div></div><div style="padding:18px 24px;background:#f5f5f5;border-bottom:1px solid #ddd"><div style="font-size:18px;font-weight:700">${esc(empName)}</div><div style="font-size:11px;color:#666;margin-top:2px">${esc(empEmail)} · ${esc(empPhone||"")}</div></div>${msgHtml}<div style="padding:16px 24px;display:flex;gap:32px;background:#fff;border-bottom:1px solid #eee"><div><div style="font-size:26px;font-weight:700;color:#d42b2b">${fmtH(totalMins)}</div><div style="font-size:9px;text-transform:uppercase;color:#888">Total Hours</div></div><div><div style="font-size:26px;font-weight:700">${sorted.length}</div><div style="font-size:9px;text-transform:uppercase;color:#888">Days on Record</div></div></div><div style="padding:18px 24px"><div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#666;margin-bottom:8px;border-bottom:2px solid #000;padding-bottom:4px">Daily Entries</div><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f0f0f0"><th style="text-align:left;padding:7px 10px;font-size:9px;text-transform:uppercase;color:#666;width:160px">Date</th><th style="text-align:left;padding:7px 10px;font-size:9px;text-transform:uppercase;color:#666">Details</th></tr></thead><tbody>${dayRows}</tbody></table></div>${payRows?`<div style="padding:0 24px 18px"><div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#666;margin-bottom:8px;border-bottom:2px solid #000;padding-bottom:4px">Pay Summary</div><table style="width:100%;border-collapse:collapse">${payRows}</table></div>`:""}<div style="padding:14px 24px;background:#f5f5f5;border-top:1px solid #ddd;font-size:10px;color:#888;text-align:center">Diamond Back Express Inc. · 4515 Ebenezer Rd Unit 212, Brampton, Ontario, L6P 2K7<br>Generated ${new Date().toLocaleDateString("en-CA",{month:"long",day:"numeric",year:"numeric"})}</div></div>`;
+    const htmlBody = `<div style="font-family:Arial,sans-serif;max-width:680px;margin:0 auto"><div style="background:#0f0f0f;padding:14px 24px;display:flex;justify-content:space-between;align-items:center"><div style="display:flex;align-items:center;gap:14px"><img src="data:image/jpeg;base64,${LOGO_B64}" style="height:36px;display:block;" alt="DBX"/><div style="color:#fff;font-size:15px;font-weight:700">DIAMOND BACK EXPRESS INC.</div></div><div style="color:#dc2626;font-size:11px;font-weight:600">${esc(evtLabel)}</div></div><div style="padding:18px 24px;background:#f5f5f5;border-bottom:1px solid #ddd"><div style="font-size:18px;font-weight:700">${esc(empName)}</div><div style="font-size:11px;color:#666;margin-top:2px">${esc(empEmail)} · ${esc(empPhone||"")}</div></div>${msgHtml}<div style="padding:16px 24px;display:flex;gap:32px;background:#fff;border-bottom:1px solid #eee"><div><div style="font-size:26px;font-weight:700;color:#d42b2b">${fmtH(totalMins)}</div><div style="font-size:9px;text-transform:uppercase;color:#888">Total Hours</div></div><div><div style="font-size:26px;font-weight:700">${new Set(sorted.map(e=>e.date).filter(Boolean)).size}</div><div style="font-size:9px;text-transform:uppercase;color:#888">Days on Record</div></div></div><div style="padding:18px 24px"><div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#666;margin-bottom:8px;border-bottom:2px solid #000;padding-bottom:4px">Daily Entries</div><table style="width:100%;border-collapse:collapse"><thead><tr style="background:#f0f0f0"><th style="text-align:left;padding:7px 10px;font-size:9px;text-transform:uppercase;color:#666;width:160px">Date</th><th style="text-align:left;padding:7px 10px;font-size:9px;text-transform:uppercase;color:#666">Details</th><th style="text-align:right;padding:7px 10px;font-size:9px;text-transform:uppercase;color:#666">Amount</th></tr></thead><tbody>${dayRows}</tbody></table></div>${payRows?`<div style="padding:0 24px 18px"><div style="font-size:11px;font-weight:700;text-transform:uppercase;color:#666;margin-bottom:8px;border-bottom:2px solid #000;padding-bottom:4px">Pay Summary</div><table style="width:100%;border-collapse:collapse">${payRows}</table></div>`:""}<div style="padding:14px 24px;background:#f5f5f5;border-top:1px solid #ddd;font-size:10px;color:#888;text-align:center">Diamond Back Express Inc. · 4515 Ebenezer Rd Unit 212, Brampton, Ontario, L6P 2K7<br>Generated ${new Date().toLocaleDateString("en-CA",{month:"long",day:"numeric",year:"numeric"})}</div></div>`;
 
     const safeName = empName.replace(/[^a-zA-Z0-9]+/g,"_");
     const attachment = { filename: `Recap_${safeName}_${(evtLabel||"DBX").replace(/[^a-zA-Z0-9]+/g,"_")}.pdf`, content: Buffer.from(pdfBytes), contentType: "application/pdf" };

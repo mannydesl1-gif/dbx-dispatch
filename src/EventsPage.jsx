@@ -65,10 +65,30 @@ export default function EventsPage() {
     } catch (e) { console.error(e); }
   };
 
+  // Lock an event: freezes all its timesheet entries/expenses so employees can no
+  // longer edit or delete them in the employee app. Stores locked + lockedAt on the
+  // event doc; the employee app reads this live and switches to read-only.
+  const toggleLocked = async (event) => {
+    const willLock = !event.locked;
+    if (willLock && !window.confirm(`Lock "${event.name}"? Employees will no longer be able to edit or delete their entries or expenses for this event. You can unlock it again anytime.`)) return;
+    try {
+      const patch = willLock ? { locked: true, lockedAt: new Date().toISOString() } : { locked: false, lockedAt: null };
+      await updateDoc(doc(db, "events", event.id), patch);
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, ...patch } : e));
+    } catch (e) { console.error(e); }
+  };
+
   const toggleNwDays = async (event) => {
     try {
       await updateDoc(doc(db, "events", event.id), { allowNwDays: !event.allowNwDays });
       setEvents(prev => prev.map(e => e.id === event.id ? { ...e, allowNwDays: !e.allowNwDays } : e));
+    } catch (e) { console.error(e); }
+  };
+
+  const toggleTravelDays = async (event) => {
+    try {
+      await updateDoc(doc(db, "events", event.id), { allowTravelDays: !event.allowTravelDays });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, allowTravelDays: !e.allowTravelDays } : e));
     } catch (e) { console.error(e); }
   };
 
@@ -107,6 +127,46 @@ export default function EventsPage() {
       const current = event.allowHours !== false;
       await updateDoc(doc(db, "events", event.id), { allowHours: !current });
       setEvents(prev => prev.map(e => e.id === event.id ? { ...e, allowHours: !current } : e));
+    } catch (e) { console.error(e); }
+  };
+
+  // ── Sub-events (optional) ──────────────────────────────────────────────
+  // A simple named list stored on the event (event.subEvents: string[]).
+  // Optional and purely additive — used later to group entries (e.g.
+  // "May Concert" for Evenko, or "Week 32" for Daily Operations).
+  const [subInput, setSubInput] = useState({}); // { [eventId]: "typing..." }
+
+  const addSubEvent = async (event) => {
+    const name = (subInput[event.id] || "").trim();
+    if (!name) return;
+    const list = Array.isArray(event.subEvents) ? event.subEvents : [];
+    if (list.includes(name)) { setSubInput(p => ({ ...p, [event.id]: "" })); return; }
+    const next = [...list, name];
+    try {
+      await updateDoc(doc(db, "events", event.id), { subEvents: next });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, subEvents: next } : e));
+      setSubInput(p => ({ ...p, [event.id]: "" }));
+    } catch (e) { console.error(e); }
+  };
+
+  const removeSubEvent = async (event, name) => {
+    const next = (event.subEvents || []).filter(s => s !== name);
+    const nextArch = (event.archivedSubEvents || []).filter(s => s !== name);
+    try {
+      await updateDoc(doc(db, "events", event.id), { subEvents: next, archivedSubEvents: nextArch });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, subEvents: next, archivedSubEvents: nextArch } : e));
+    } catch (e) { console.error(e); }
+  };
+
+  // Archive a sub-event: it leaves the employee picker (so a finished week
+  // stops showing) but the main event stays active and all its entries/reports
+  // are preserved. Additive — tracked in archivedSubEvents; subEvents is unchanged.
+  const archiveSubEvent = async (event, name) => {
+    const arch = event.archivedSubEvents || [];
+    const next = arch.includes(name) ? arch.filter(s => s !== name) : [...arch, name];
+    try {
+      await updateDoc(doc(db, "events", event.id), { archivedSubEvents: next });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, archivedSubEvents: next } : e));
     } catch (e) { console.error(e); }
   };
 
@@ -161,18 +221,30 @@ export default function EventsPage() {
       )}
 
       {activeEvents.map(ev => (
-        <div key={ev.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px", marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div key={ev.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px", marginBottom: 8 }}>
+         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ width: 8, height: 8, borderRadius: "50%", background: T.green, flexShrink: 0 }} />
             <div>
-              <div style={{ fontSize: 14, fontWeight: 600, color: T.text }}>{ev.name}</div>
+              <div style={{ fontSize: 14, fontWeight: 600, color: T.text, display:"flex", alignItems:"center", gap:8 }}>{ev.name}
+                {ev.locked && <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 5, background: "rgba(220,38,38,0.15)", color: "#dc2626", letterSpacing:"0.04em" }}>🔒 LOCKED</span>}
+              </div>
               <div style={{ fontSize: 11, color: T.muted, marginTop: 2 }}>
                 Added {new Date(ev.createdAt).toLocaleDateString("en-CA", { month: "short", day: "numeric", year: "numeric" })}
+                {ev.locked && ev.lockedAt && <span style={{color:"#dc2626",marginLeft:6}}>· locked {new Date(ev.lockedAt).toLocaleDateString("en-CA",{month:"short",day:"numeric"})}</span>}
               </div>
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+            <button onClick={() => toggleLocked(ev)} style={{
+              padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.locked ? "#dc2626" : T.border}`,
+              background: ev.locked ? "rgba(220,38,38,0.15)" : "transparent",
+              color: ev.locked ? "#dc2626" : T.dim,
+              fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", whiteSpace:"nowrap"
+            }}>
+              {ev.locked ? "🔒 Locked" : "🔓 Unlocked"}
+            </button>
             <button onClick={() => toggleHours(ev)} style={{
               padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.allowHours !== false ? "#3b82f6" : T.border}`,
               background: ev.allowHours !== false ? "rgba(59,130,246,0.15)" : "transparent",
@@ -199,6 +271,15 @@ export default function EventsPage() {
               display: "flex", alignItems: "center", gap: 4
             }}>
               📅 NW Days {ev.allowNwDays ? "ON" : "OFF"}
+            </button>
+            <button onClick={() => toggleTravelDays(ev)} style={{
+              padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.allowTravelDays ? "#8b5cf6" : T.border}`,
+              background: ev.allowTravelDays ? "rgba(139,92,246,0.15)" : "transparent",
+              color: ev.allowTravelDays ? "#8b5cf6" : T.dim,
+              fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+              display: "flex", alignItems: "center", gap: 4
+            }}>
+              ✈️ Travel {ev.allowTravelDays ? "ON" : "OFF"}
             </button>
             <button onClick={() => togglePerDiem(ev)} style={{
               padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.allowPerDiem ? "#0ea5e9" : T.border}`,
@@ -232,6 +313,45 @@ export default function EventsPage() {
               <Ic n="archive" s={12} /> Archive
             </button>
           </div>
+         </div>
+         {/* Sub-events (optional) */}
+         <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+           <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color: T.dim, marginBottom: 8 }}>
+             Sub-events <span style={{ color: T.muted, fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>— optional (e.g. "May Concert", "Week 32")</span>
+           </div>
+           {(ev.subEvents || []).length > 0 && (
+             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+               {(ev.subEvents || []).map(s => {
+                 const archived = (ev.archivedSubEvents || []).includes(s);
+                 return (
+                 <span key={s} style={{ display: "inline-flex", alignItems: "center", gap: 10, padding: "6px 10px", borderRadius: 6, background: archived ? "rgba(100,116,139,0.12)" : "rgba(14,165,233,0.12)", border: `1px solid ${archived ? "rgba(100,116,139,0.4)" : "rgba(14,165,233,0.4)"}`, color: archived ? T.dim : "#0ea5e9", fontSize: 12, fontWeight: 600, opacity: archived ? 0.7 : 1 }}>
+                   {archived && <span style={{ fontSize: 10 }}>📦</span>}
+                   <span>{s}</span>
+                   <span style={{ display: "inline-flex", alignItems: "center", gap: 12, marginLeft: 4, paddingLeft: 10, borderLeft: `1px solid ${archived ? "rgba(100,116,139,0.4)" : "rgba(14,165,233,0.3)"}` }}>
+                     <button onClick={() => archiveSubEvent(ev, s)} title={archived ? "Show again in the employee app" : "Hide from the employee app"} style={{ background: "none", border: "none", color: archived ? "#0ea5e9" : T.muted, cursor: "pointer", fontSize: 11, lineHeight: 1, padding: "2px 4px", fontWeight: 700, fontFamily: "inherit" }}>{archived ? "Restore" : "Archive"}</button>
+                     <button onClick={() => { if (window.confirm(`Delete sub-event "${s}"?\n\nThis removes it from the list. Entries already tagged with it keep their data.`)) removeSubEvent(ev, s); }} title="Delete this sub-event" style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 11, lineHeight: 1, padding: "2px 4px", fontWeight: 700, fontFamily: "inherit" }}>Delete</button>
+                   </span>
+                 </span>
+                 );
+               })}
+             </div>
+           )}
+           {(ev.archivedSubEvents || []).length > 0 && (
+             <div style={{ fontSize: 10, color: T.dim, marginBottom: 8 }}>📦 {(ev.archivedSubEvents || []).length} archived — hidden from the employee app, still in reports.</div>
+           )}
+           <div style={{ display: "flex", gap: 6, maxWidth: 360 }}>
+             <input
+               value={subInput[ev.id] || ""}
+               onChange={e => setSubInput(p => ({ ...p, [ev.id]: e.target.value }))}
+               onKeyDown={e => e.key === "Enter" && addSubEvent(ev)}
+               placeholder="Add a sub-event…"
+               style={{ flex: 1, padding: "7px 10px", borderRadius: 6, fontFamily: "inherit", fontSize: 12, color: T.text, background: T.surface, border: `1px solid ${T.border}`, outline: "none" }}
+             />
+             <button onClick={() => addSubEvent(ev)} disabled={!(subInput[ev.id] || "").trim()} style={{ ...bS, fontSize: 11, opacity: !(subInput[ev.id] || "").trim() ? 0.5 : 1 }}>
+               <Ic n="plus" s={12} /> Add
+             </button>
+           </div>
+         </div>
         </div>
       ))}
 

@@ -14,6 +14,7 @@
 //     label:     "Drug Testing"
 //     targets:   ["drivers","trucks"]    where it appears
 //     kind:      "text" | "number" | "date" | "expiry"
+//     area:      "general" | "certs"          which section it appears in
 //     docs:      true|false               allow document upload
 //     alert:     true|false               expiry only — include in email digest
 //     alertDays: 30                       expiry only — first-notice window
@@ -26,6 +27,7 @@
 import { useState, useEffect } from "react";
 import { db } from "./firebase.js";
 import { doc, getDoc, setDoc } from "firebase/firestore";
+import { DEFAULT_TERMS } from "./client.config.js";
 
 const T = {
   bg: "#0a0f1a", card: "#111827", border: "#1f2937", hover: "#1a2332",
@@ -70,6 +72,7 @@ const BUILTIN_COLUMNS = {
            "Background Verification","Code of Conduct","Driver's Licence"],
   equipment: ["Unit #","Plate #","Year","Make","Model","Type","VIN",
               "Safety Exp","Safety Status","Notes"],
+  maintenance: ["Date","Unit","Type","Description","Vendor","Invoice #","Cost"],
 };
 
 const Section = ({ title, subtitle, children, right }) => (
@@ -106,7 +109,7 @@ export default function AdminPage() {
       </div>
 
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
-        {[["fields","Custom Fields"],["columns","Report Columns"],["alerts","Alert Recipients"]]
+        {[["fields","Custom Fields"],["columns","Report Columns"],["alerts","Alert Recipients"],["terms","Terms & Conditions"]]
           .map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 14px", borderRadius: 6,
@@ -121,6 +124,7 @@ export default function AdminPage() {
       {tab === "fields"  && <CustomFields />}
       {tab === "columns" && <ReportColumns />}
       {tab === "alerts"  && <AlertRecipients />}
+      {tab === "terms"   && <TermsEditor />}
     </div>
   );
 }
@@ -135,6 +139,7 @@ function CustomFields() {
 
   const blank = {
     id: "", label: "", targets: [], kind: "text",
+    area: "general",
     docs: false, alert: false, alertDays: 30,
   };
   const [fm, setFm] = useState(blank);
@@ -181,6 +186,7 @@ function CustomFields() {
       id, label,
       targets: fm.targets,
       kind: fm.kind,
+      area: fm.area === "certs" ? "certs" : "general",
       docs: !!fm.docs,
       // alert only means anything for an expiry field
       alert: fm.kind === "expiry" ? !!fm.alert : false,
@@ -240,6 +246,11 @@ function CustomFields() {
                             display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
                 <span style={{ padding: "1px 7px", borderRadius: 10, background: T.hover }}>
                   {kindMeta(f.kind).label}
+                </span>
+                <span style={{ padding: "1px 7px", borderRadius: 10,
+                  background: (f.area||(f.kind==="expiry"?"certs":"general"))==="certs" ? "rgba(34,197,94,0.12)" : T.hover,
+                  color: (f.area||(f.kind==="expiry"?"certs":"general"))==="certs" ? "#22c55e" : T.muted }}>
+                  {(f.area||(f.kind==="expiry"?"certs":"general"))==="certs" ? "🏅 Certifications" : "Profile"}
                 </span>
                 {f.targets.map(t => (
                   <span key={t} style={{ padding: "1px 7px", borderRadius: 10,
@@ -318,6 +329,32 @@ function CustomFields() {
             </div>
           </Field>
 
+          <Field l="Section — where it appears in the record">
+            <div style={{ display: "grid", gap: 6 }}>
+              {[
+                { id: "general", label: "General Profile", hint: "Shows in the main info area with the standard fields." },
+                { id: "certs",   label: "Certifications & Checks", hint: "Shows in the Certifications & Checks section (good for licences, inspections, checks with a document)." },
+              ].map(s => {
+                const on = (fm.area || "general") === s.id;
+                return (
+                  <label key={s.id} style={{
+                    display: "flex", alignItems: "flex-start", gap: 8, padding: "8px 10px",
+                    borderRadius: 6, cursor: "pointer",
+                    background: on ? T.hover : "transparent",
+                    border: `1px solid ${on ? "#334155" : T.border}`,
+                  }}>
+                    <input type="radio" name="cfarea" checked={on} style={{ accentColor: T.red, marginTop: 2 }}
+                      onChange={() => setFm(p => ({ ...p, area: s.id }))} />
+                    <div>
+                      <div style={{ fontSize: 12, fontWeight: 600, color: T.text }}>{s.label}</div>
+                      <div style={{ fontSize: 10, color: T.dim }}>{s.hint}</div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </Field>
+
           <Field l="Documents">
             <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12,
                             color: T.text, cursor: "pointer" }}>
@@ -375,6 +412,7 @@ function ReportColumns() {
     { id: "suppliers", label: "Suppliers", base: "people" },
     { id: "trucks",    label: "Trucks",    base: "equipment" },
     { id: "trailers",  label: "Trailers",  base: "equipment" },
+    { id: "maintenance", label: "Maintenance & Repairs", base: "maintenance" },
   ];
   const [scope, setScope] = useState("drivers");
   const [sel, setSel] = useState({});          // { scopeId: [labels] }
@@ -539,11 +577,11 @@ function AlertRecipients() {
   };
 
   const remove = (e) => {
-    if (emails.length === 1) {
-      alert("Keep at least one recipient — otherwise the expiry alerts go to nobody.");
-      return;
-    }
-    if (!window.confirm(`Stop sending expiry alerts to ${e}?`)) return;
+    const isLast = emails.length === 1;
+    const prompt = isLast
+      ? `Remove ${e}? This empties the list, which turns the daily expiry email OFF entirely — no one will be notified until you add a recipient back.`
+      : `Stop sending expiry alerts to ${e}?`;
+    if (!window.confirm(prompt)) return;
     persist(emails.filter(x => x !== e));
   };
 
@@ -556,7 +594,7 @@ function AlertRecipients() {
 
       {loaded && emails.length === 0 && (
         <div style={{ fontSize: 11, color: "#eab308", marginBottom: 10 }}>
-          No recipients set — the alert function will fall back to its built-in list.
+          No recipients — the daily expiry email is OFF. Add an address below to turn it back on.
         </div>
       )}
 
@@ -579,6 +617,71 @@ function AlertRecipients() {
 
       {msg && <div style={{ fontSize: 11, marginTop: 8,
         color: msg === "Saved" ? "#22c55e" : "#eab308" }}>{msg}</div>}
+    </Section>
+  );
+}
+
+// ── Terms & Conditions editor ──────────────────────────────────────────────
+// Stores the default Terms & Conditions text used on new quotes and orders,
+// and shown at the bottom of the quote / order PDFs. Read from
+// settings/orderTerms; falls back to DEFAULT_TERMS (client.config.js) until set.
+function TermsEditor() {
+  const [text, setText] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const snap = await getDoc(doc(db, "settings", "orderTerms"));
+        const saved = snap.exists() ? snap.data().text : undefined;
+        setText(saved !== undefined ? saved : DEFAULT_TERMS);
+      } catch { setText(DEFAULT_TERMS); }
+      setLoaded(true);
+    })();
+  }, []);
+
+  const save = async () => {
+    setSaving(true); setMsg("");
+    try {
+      await setDoc(doc(db, "settings", "orderTerms"), { text }, { merge: true });
+      setMsg("Saved");
+    } catch (e) { console.error(e); setMsg("Error saving"); }
+    setSaving(false);
+    setTimeout(() => setMsg(""), 2500);
+  };
+
+  const resetDefault = () => setText(DEFAULT_TERMS);
+
+  return (
+    <Section
+      title="Terms & Conditions"
+      subtitle="This text pre-fills new quotes and orders and prints at the bottom of the quote and order PDFs. Editing here changes the default for future records; existing records keep whatever text they were saved with."
+    >
+      {!loaded ? (
+        <div style={{ color: T.muted, fontSize: 13 }}>Loading…</div>
+      ) : (
+        <>
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            style={{ ...sIn, width: "100%", minHeight: 180, resize: "vertical",
+              fontSize: 12, lineHeight: 1.5, boxSizing: "border-box" }}
+            placeholder="Standard terms & conditions text…"
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+            <button style={bP} disabled={saving} onClick={save}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+            <button style={bS} onClick={resetDefault} type="button">
+              Reset to built-in default
+            </button>
+            {msg && <span style={{ fontSize: 11,
+              color: msg === "Saved" ? "#22c55e" : "#eab308" }}>{msg}</span>}
+          </div>
+        </>
+      )}
     </Section>
   );
 }

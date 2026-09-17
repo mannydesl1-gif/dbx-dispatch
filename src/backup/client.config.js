@@ -32,8 +32,10 @@ export const ACCT_EMAILS = [
 export const REPORTS_EMAIL = "manny@diamondbackexpress.com";
 
 export const CLOUD_FUNCTIONS = {
-  sendBolEmail:     "https://sendbolemail-lmhvg7gefa-uc.a.run.app",
-  sendInvoiceEmail: "https://sendinvoiceemail-lmhvg7gefa-uc.a.run.app",
+  sendBolEmail:         "https://sendbolemail-lmhvg7gefa-uc.a.run.app",
+  sendInvoiceEmail:     "https://sendinvoiceemail-lmhvg7gefa-uc.a.run.app",
+  downloadBolPdf:       "https://downloadbolpdf-lmhvg7gefa-uc.a.run.app",
+  sendRecapEmail:       "https://sendrecapemail-lmhvg7gefa-uc.a.run.app",
 };
 
 export const BOL_COMPANY_LABEL = "Diamond Back Express Inc.";

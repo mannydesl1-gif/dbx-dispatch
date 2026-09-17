@@ -6,7 +6,7 @@ import { useState, useEffect } from "react";
 import { db as db_inst, storage } from "./firebase.js";
 import { collection, getDocs, addDoc, updateDoc, doc, orderBy, query, where } from "firebase/firestore";
 import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
-import { DIVISIONS, COMPANY_NAME, APP_NAME } from "./client.config.js";
+import { DIVISIONS, COMPANY_NAME, APP_NAME, CLOUD_FUNCTIONS } from "./client.config.js";
 
 // ── Theme ──
 const T = {
@@ -264,6 +264,53 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
     setUpdatingStatus(false);
   };
 
+  // View / share the BOL PDF. Calls the same Cloud Function the desktop uses
+  // (downloadBolPdf) to generate the PDF, then opens it — and offers the native
+  // share sheet on phones that support the Web Share API with files.
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const viewPdf = async () => {
+    const url = CLOUD_FUNCTIONS && CLOUD_FUNCTIONS.downloadBolPdf;
+    if (!url) { alert("PDF service isn't configured. Please use the desktop app to generate the BOL PDF."); return; }
+    setPdfLoading(true);
+    try {
+      const cli = (db.clients||[]).find(c=>c.id===o.cliId) || null;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          order: { ...o, divName: div?.name || "" },
+          client: cli ? {
+            name: cli.name||"", street: cli.street||"", city: cli.city||"",
+            provState: cli.provState||"", postalZip: cli.postalZip||"",
+            country: cli.country||"", email: cli.billingEmail||cli.email||"",
+          } : null,
+          includePricing: false,
+        }),
+      });
+      if (!res.ok) throw new Error(`PDF request failed (${res.status})`);
+      const blob = await res.blob();
+      const file = new File([blob], `BOL_${o.bol}.pdf`, { type: "application/pdf" });
+      // Native share sheet (iOS/Android) when the browser can share files
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file], title: `BOL ${o.bol}`, text: `BOL ${o.bol}` }); setPdfLoading(false); return; }
+        catch(shareErr){ if (shareErr && shareErr.name === "AbortError") { setPdfLoading(false); return; } /* fall through to open */ }
+      }
+      // Fallback: open the PDF in a new tab (phone displays it, with its own share/download)
+      const objUrl = URL.createObjectURL(blob);
+      const w = window.open(objUrl, "_blank");
+      if (!w) {
+        // Popup blocked — download instead
+        const a = document.createElement("a");
+        a.href = objUrl; a.download = `BOL_${o.bol}.pdf`; document.body.appendChild(a); a.click(); a.remove();
+      }
+      setTimeout(()=>URL.revokeObjectURL(objUrl), 60000);
+    } catch(e) {
+      console.error("viewPdf failed", e);
+      alert("Couldn't generate the PDF. Please check your connection and try again, or use the desktop app.");
+    }
+    setPdfLoading(false);
+  };
+
   const Row = ({l,v}) => v ? <div style={{marginBottom:10}}>
     <div style={{fontSize:11,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>{l}</div>
     <div style={{fontSize:14,color:T.text,marginTop:2}}>{v}</div>
@@ -273,6 +320,15 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
   const fuelPct = parseFloat(o.price?.fuelPct)||0;
   const fuelAmt = baseAmt*(fuelPct/100);
   const total = baseAmt+fuelAmt;
+
+  // Full pricing summary — includes accessorial charges (price.other) and per-stop
+  // pricing, so orders priced without a base still show their real total.
+  const _lineTot = (c)=>{const lb=(c.qty!==undefined||c.unitPrice!==undefined)?(parseFloat(c.qty)||0)*(parseFloat(c.unitPrice)||0):(parseFloat(c.amt)||0);const lt=c.taxMode==="HST"?13:c.taxMode==="GST"?5:c.taxMode==="CUSTOM"?(parseFloat(c.taxCustom)||0):0;return lb+lb*(lt/100);};
+  const _stopTot = (pr)=>{pr=pr||{};const b=parseFloat(pr.base)||0;const f=b*((parseFloat(pr.fuelPct)||0)/100);const ob=(pr.other||[]).reduce((s,c)=>s+_lineTot(c),0);const tp=pr.taxMode==="CUSTOM"?(parseFloat(pr.taxCustom)||0):pr.taxMode==="HST"?13:pr.taxMode==="GST"?5:0;const tx=(!pr.taxMode||pr.taxMode==="NONE")?0:(b+f)*(tp/100);return b+f+tx+ob;};
+  const _orderOther = (o.price?.other||[]).reduce((s,c)=>s+_lineTot(c),0);
+  const _stopSurcharges = ((o.delStops||[]).concat(o.pickStops||[])).reduce((s,st)=>s+(st&&st.price?_stopTot(st.price):0),0);
+  const fullPricingTotal = total + _orderOther + _stopSurcharges;
+  const _podStops = ((o.delStops||[]).concat(o.pickStops||[])).filter(st=>st&&st.pod&&st.pod.by);
 
   return (
     <div style={{padding:16,paddingBottom:40}}>
@@ -288,6 +344,11 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
         </div>
         <button onClick={onEdit} style={{marginLeft:"auto",...outBtn(T.muted),padding:"8px 16px",fontSize:13}}>Edit</button>
       </div>
+
+      {/* View / Share BOL PDF */}
+      <button onClick={viewPdf} disabled={pdfLoading} style={{...outBtn(T.text),marginBottom:16,borderRadius:10,width:"100%",justifyContent:"center",display:"flex",alignItems:"center",gap:8,padding:"12px",fontSize:14,fontWeight:600,opacity:pdfLoading?0.6:1}}>
+        <Ic n="docs" s={18}/> {pdfLoading ? "Preparing PDF…" : "View / Share BOL PDF"}
+      </button>
 
       {/* Advance status button */}
       {nextStatus && (
@@ -310,6 +371,11 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
       {/* Pricing card */}
       <div style={{...card,marginBottom:12}}>
         <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",marginBottom:10}}>Pricing</div>
+        {fullPricingTotal>0 && <div style={{marginBottom:12,padding:"10px 12px",background:"rgba(34,197,94,0.08)",border:`1px solid ${T.green}`,borderRadius:8}}>
+          <div style={{fontSize:11,color:T.muted,marginBottom:2}}>Price on file{(_orderOther>0||_stopSurcharges>0)?" (incl. accessorials/surcharges)":""}</div>
+          <div style={{fontSize:16,fontWeight:700,color:T.green}}>{sym}{fullPricingTotal.toFixed(2)} {o.price?.cur||"CAD"}</div>
+          {_orderOther>0 && <div style={{fontSize:11,color:T.muted,marginTop:4}}>Includes {sym}{_orderOther.toFixed(2)} in accessorial charges — edit on desktop for full detail.</div>}
+        </div>}
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:8}}>
           <div>
             <label style={{fontSize:10,color:T.muted,display:"block",marginBottom:4}}>Currency</label>
@@ -343,6 +409,10 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
       {/* POD section */}
       <div style={{...card,marginBottom:12}}>
         <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",marginBottom:10}}>POD (Proof of Delivery)</div>
+        {_podStops.length>0 && <div style={{marginBottom:12,padding:"10px 12px",background:"rgba(34,197,94,0.08)",border:`1px solid ${T.green}`,borderRadius:8}}>
+          <div style={{fontSize:11,color:T.muted,marginBottom:6}}>PODs on file — {_podStops.length} stop{_podStops.length>1?"s":""} delivered</div>
+          {_podStops.map((st,i)=><div key={i} style={{fontSize:12,color:T.text,marginBottom:3}}>✓ <b>{st.co||st.company||st.name||`Stop ${i+1}`}</b> — {st.pod.by}{st.pod.date?` · ${fd(st.pod.date)}`:""}{st.pod.time?` ${st.pod.time}`:""}</div>)}
+        </div>}
         <label style={{fontSize:10,color:T.muted,display:"block",marginBottom:4}}>Received by</label>
         <input style={{...inp,padding:"10px 12px",marginBottom:8}} value={o.podBy||""} onChange={e=>update("podBy",e.target.value)} placeholder="Name of receiver"/>
         <label style={{fontSize:10,color:T.muted,display:"block",marginBottom:4}}>Date</label>
@@ -868,7 +938,147 @@ function DocsTab() {
 // ════════════════════════════════════════════════════════════════
 //  MAIN MOBILE APP
 // ════════════════════════════════════════════════════════════════
+function QuotesTab({ db }) {
+  const [search, setSearch] = useState("");
+  const [sel, setSel] = useState(null);
+  const [collapsed, setCollapsed] = useState({});  // status group -> collapsed?
+  const quotes = db.quotes || [];
+
+  const qSym = (c) => c==="USD"?"US$":c==="EUR"?"€":c==="GBP"?"£":"$";
+  const lineAmt = (l) => (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+  const quoteTotal = (q) => {
+    const sub = (q.lines||[]).reduce((s,l)=>s+lineAmt(l),0);
+    const tax = sub*((parseFloat(q.taxRate)||0)/100);
+    const other = parseFloat(q.other)||0;
+    return sub+tax+other;
+  };
+
+  const genQuotePdf = (q) => {
+    const cur = q.totalCurrency || q.cur || (q.lines&&q.lines[0]&&q.lines[0].currency) || "CAD";
+    const sym = qSym(cur);
+    const sub = (q.lines||[]).reduce((s,l)=>s+lineAmt(l),0);
+    const taxRate = parseFloat(q.taxRate)||0;
+    const tax = sub*(taxRate/100);
+    const other = parseFloat(q.other)||0;
+    const total = sub+tax+other;
+    const lineRows = (q.lines||[]).filter(l=>l.desc||l.unitPrice).map(l=>{
+      const amt=lineAmt(l);
+      return `<tr>
+        <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:center;font-size:11px">${l.qty||""}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:11px">${l.desc||""}${l.equipment?`<br><span style="font-size:9px;color:#666;font-style:italic">${l.equipment}</span>`:""}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;font-size:11px">${(parseFloat(l.unitPrice)||0)>0?`${sym}${(parseFloat(l.unitPrice)||0).toFixed(2)}`:""}</td>
+        <td style="padding:6px 8px;border-bottom:1px solid #eee;text-align:right;font-weight:600;font-size:11px">${amt>0?`${sym}${amt.toFixed(2)}`:""}</td>
+      </tr>`;
+    }).join("");
+    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Quote ${q.quoteNum||""}</title>
+    <style>@page{margin:14mm}body{font-family:'Helvetica Neue',Arial,sans-serif;color:#1a1a1a;margin:0;padding:20px}
+    .hd{display:flex;justify-content:space-between;border-bottom:3px solid #dc2626;padding-bottom:12px;margin-bottom:16px}
+    .qn{font-size:26px;font-weight:800;color:#dc2626}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th{background:#f3f4f6;padding:6px 8px;text-align:left;font-size:10px;text-transform:uppercase;color:#666;border-bottom:2px solid #ddd}
+    .tot{text-align:right;margin-top:14px;font-size:13px;line-height:1.9}
+    .no-print{margin-top:24px;text-align:center}
+    @media print{.no-print{display:none}}</style></head><body>
+    <div class="hd"><div><div class="qn">QUOTE ${q.quoteNum||""}</div>
+      <div style="font-size:12px;color:#666;margin-top:4px">${fd(q.date)}${q.project?` &nbsp;·&nbsp; ${q.project}`:""}</div></div>
+      <div style="text-align:right;font-size:11px;color:#444"><strong>${COMPANY_NAME||"Diamond Back Express"}</strong><br>${q.salesperson?`Prepared by: ${q.salesperson}`:""}</div>
+    </div>
+    <div style="font-size:12px;margin-bottom:6px"><strong>To:</strong> ${q.cliName||""}</div>
+    ${q.notes?`<div style="font-size:11px;color:#555;margin-bottom:8px">${q.notes}</div>`:""}
+    <table><thead><tr><th style="text-align:center">Qty</th><th>Description</th><th style="text-align:right">Unit</th><th style="text-align:right">Amount</th></tr></thead>
+    <tbody>${lineRows}</tbody></table>
+    <div class="tot">
+      <div>Subtotal: <strong>${sym}${sub.toFixed(2)}</strong></div>
+      ${tax>0?`<div>Tax (${taxRate}%): ${sym}${tax.toFixed(2)}</div>`:""}
+      ${other>0?`<div>Other: ${sym}${other.toFixed(2)}</div>`:""}
+      <div style="font-size:16px;color:#dc2626;font-weight:800;border-top:2px solid #dc2626;padding-top:6px;margin-top:6px;display:inline-block">TOTAL: ${sym}${total.toFixed(2)} ${cur}</div>
+    </div>
+    ${q.terms?`<div style="margin-top:18px;font-size:9px;color:#888;border-top:1px solid #eee;padding-top:8px">${q.terms}</div>`:""}
+    <div class="no-print"><button onclick="window.print()" style="padding:12px 28px;background:#dc2626;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:700">Print / Save as PDF</button></div>
+    </body></html>`;
+    const blob = new Blob([html],{type:"text/html"});
+    const url = URL.createObjectURL(blob);
+    window.open(url,"_blank");
+    setTimeout(()=>URL.revokeObjectURL(url),60000);
+  };
+
+  const outBtn = (c)=>({background:"transparent",border:`1px solid ${c}`,color:c,borderRadius:8,padding:"8px 14px",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"inherit"});
+
+  if (sel) {
+    const q = quotes.find(x=>x.id===sel.id)||sel;
+    const cur = q.totalCurrency || q.cur || (q.lines&&q.lines[0]&&q.lines[0].currency) || "CAD";
+    const sym = qSym(cur);
+    return <div style={{padding:16,overflowY:"auto",height:"100%"}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+        <button onClick={()=>setSel(null)} style={{background:"none",border:"none",color:T.muted,fontSize:22,cursor:"pointer"}}>←</button>
+        <div style={{fontSize:22,fontWeight:700}}>Quote {q.quoteNum}</div>
+      </div>
+      <button onClick={()=>genQuotePdf(q)} style={{...outBtn(T.text),width:"100%",display:"flex",alignItems:"center",justifyContent:"center",gap:8,padding:12,fontSize:14,marginBottom:16}}><Ic n="docs" s={18}/> View / Share Quote PDF</button>
+      <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:16,marginBottom:14}}>
+        {[["Client",q.cliName],["Date",fd(q.date)],["Project",q.project],["Salesperson",q.salesperson],["Status",q.status]].filter(([,v])=>v).map(([l,v])=>
+          <div key={l} style={{marginBottom:8}}><div style={{fontSize:11,color:T.muted,textTransform:"uppercase"}}>{l}</div><div style={{fontSize:14}}>{v}</div></div>
+        )}
+      </div>
+      <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:16}}>
+        <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",marginBottom:10}}>Line Items</div>
+        {(q.lines||[]).filter(l=>l.desc||l.unitPrice).map((l,i)=>
+          <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${T.border}`,fontSize:13}}>
+            <span>{l.qty?`${l.qty} × `:""}{l.desc||"—"}</span>
+            <span style={{fontWeight:600}}>{sym}{lineAmt(l).toFixed(2)}</span>
+          </div>
+        )}
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:10,fontSize:16,fontWeight:700,color:T.red}}>
+          <span>Total</span><span>{sym}{quoteTotal(q).toFixed(2)} {cur}</span>
+        </div>
+      </div>
+    </div>;
+  }
+
+  const filtered = quotes.filter(q=>{
+    const s=search.toLowerCase();
+    return !s || (q.quoteNum||"").toLowerCase().includes(s) || (q.cliName||"").toLowerCase().includes(s) || (q.project||"").toLowerCase().includes(s);
+  });
+
+  // Status groups matching the dispatch app (Draft / Sent / Accepted / Declined).
+  const GROUPS = [
+    {key:"draft",    label:"Draft",    color:"#94a3b8"},
+    {key:"sent",     label:"Sent",     color:"#0ea5e9"},
+    {key:"accepted", label:"Accepted", color:"#22c55e"},
+    {key:"declined", label:"Declined", color:"#ef4444"},
+  ];
+  const qCard = (q) => {
+    const cur = q.totalCurrency || q.cur || (q.lines&&q.lines[0]&&q.lines[0].currency) || "CAD";
+    return <button key={q.id} onClick={()=>setSel(q)} style={{width:"100%",textAlign:"left",background:T.card,border:`1px solid ${T.border}`,borderRadius:12,padding:14,marginBottom:10,cursor:"pointer",fontFamily:"inherit"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <span style={{fontSize:15,fontWeight:700,color:T.text}}>{q.quoteNum}</span>
+        <span style={{fontSize:14,fontWeight:700,color:T.red}}>{qSym(cur)}{quoteTotal(q).toFixed(2)}</span>
+      </div>
+      <div style={{fontSize:13,color:T.muted,marginTop:4}}>{q.cliName||"—"}</div>
+      <div style={{fontSize:12,color:T.muted,marginTop:2}}>{fd(q.date)}{q.project?` · ${q.project}`:""}</div>
+    </button>;
+  };
+
+  return <div style={{padding:16,overflowY:"auto",height:"100%"}}>
+    <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search quotes..." style={{width:"100%",padding:"12px 14px",borderRadius:10,border:`1px solid ${T.border}`,background:T.card,color:T.text,fontSize:15,marginBottom:14,fontFamily:"inherit",boxSizing:"border-box"}}/>
+    {filtered.length===0 && <div style={{textAlign:"center",color:T.muted,fontSize:14,marginTop:40}}>No quotes found.</div>}
+    {GROUPS.map(grp=>{
+      const grpQuotes = filtered.filter(q=>(q.status||"draft")===grp.key);
+      if(grpQuotes.length===0) return null;
+      const isCollapsed = !!collapsed[grp.key];
+      return <div key={grp.key} style={{marginBottom:14}}>
+        <button onClick={()=>setCollapsed(c=>({...c,[grp.key]:!c[grp.key]}))} style={{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",borderRadius:10,border:`1px solid ${grp.color}`,background:`${grp.color}18`,cursor:"pointer",fontFamily:"inherit",marginBottom:isCollapsed?0:10}}>
+          <span style={{fontSize:13,fontWeight:700,color:grp.color,textTransform:"uppercase",letterSpacing:"0.05em"}}>{grp.label} <span style={{opacity:0.7}}>({grpQuotes.length})</span></span>
+          <span style={{color:grp.color}}>{isCollapsed?"▼":"▲"}</span>
+        </button>
+        {!isCollapsed && grpQuotes.map(qCard)}
+      </div>;
+    })}
+  </div>;
+}
+
 export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }) {
+
   const [tab, setTab] = useState("orders");
   const [db, setDb] = useState(dbProp||{orders:[],clients:[],locations:[],trucks:[],trailers:[],events:[]});
   const [loadingData, setLoadingData] = useState(!dbProp?.orders?.length);
@@ -878,13 +1088,14 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
     if(dbProp?.orders?.length){ setDb(dbProp); setLoadingData(false); return; }
     const load = async () => {
       try {
-        const [ordSnap,cliSnap,locSnap,trkSnap,trlSnap,evtSnap] = await Promise.all([
+        const [ordSnap,cliSnap,locSnap,trkSnap,trlSnap,evtSnap,qteSnap] = await Promise.all([
           getDocs(query(collection(db_inst,"orders"), orderBy("reqDate","desc"))),
           getDocs(collection(db_inst,"clients")),
           getDocs(collection(db_inst,"locations")),
           getDocs(collection(db_inst,"trucks")),
           getDocs(collection(db_inst,"trailers")),
           getDocs(collection(db_inst,"events")),
+          getDocs(collection(db_inst,"quotes")),
         ]);
         setDb({
           orders:  ordSnap.docs.map(d=>({id:d.id,...d.data()})),
@@ -893,6 +1104,7 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
           trucks:  trkSnap.docs.map(d=>({id:d.id,...d.data()})),
           trailers: trlSnap.docs.map(d=>({id:d.id,...d.data()})),
           events:  evtSnap.docs.map(d=>({id:d.id,...d.data()})),
+          quotes:  qteSnap.docs.map(d=>({id:d.id,...d.data()})),
         });
       } catch(e){ console.error("Mobile load error:", e); }
       setLoadingData(false);
@@ -900,11 +1112,22 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
     load();
   },[]);
 
-  // Sync when parent updates
-  useEffect(()=>{ if(dbProp?.orders?.length) setDb(dbProp); },[dbProp]);
+  // Sync when parent updates (preserve separately-loaded quotes)
+  useEffect(()=>{ if(dbProp?.orders?.length) setDb(prev=>({...dbProp, quotes: prev.quotes||dbProp.quotes||[]})); },[dbProp]);
+
+  // Quotes aren't part of the parent's dbData, so always fetch them for the
+  // Quotes tab (merged into db without disturbing parent-provided collections).
+  useEffect(()=>{
+    let alive = true;
+    getDocs(collection(db_inst,"quotes"))
+      .then(snap=>{ if(alive) setDb(prev=>({...prev, quotes: snap.docs.map(d=>({id:d.id,...d.data()}))})); })
+      .catch(e=>console.error("Mobile quotes load error:", e));
+    return ()=>{ alive=false; };
+  },[]);
 
   const TABS = [
     { id:"orders",    l:"Orders",    icon:"orders"    },
+    { id:"quotes",    l:"Quotes",    icon:"docs"      },
     { id:"clients",   l:"Clients",   icon:"clients"   },
     { id:"equipment", l:"Equipment", icon:"equipment" },
     { id:"docs",      l:"Docs",      icon:"docs"      },
@@ -941,6 +1164,7 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
       {/* Content */}
       {!loadingData && <div style={{ flex:1, overflowY:"auto", overflowX:"hidden", paddingBottom:"calc(env(safe-area-inset-bottom, 0px) + 70px)" }}>
         {tab==="orders"    && <OrdersTab    db={db} savOrd={savOrd}/>}
+        {tab==="quotes"    && <QuotesTab    db={db}/>}
         {tab==="clients"   && <ClientsTab   db={db} saveColl={saveColl}/>}
         {tab==="equipment" && <EquipmentTab db={db}/>}
         {tab==="docs"      && <DocsTab/>}

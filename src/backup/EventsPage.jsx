@@ -79,6 +79,13 @@ export default function EventsPage() {
     } catch (e) { console.error(e); }
   };
 
+  const toggleTrips = async (event) => {
+    try {
+      await updateDoc(doc(db, "events", event.id), { allowTrips: !event.allowTrips });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, allowTrips: !e.allowTrips } : e));
+    } catch (e) { console.error(e); }
+  };
+
   const toggleExpenses = async (event) => {
     try {
       const current = event.allowExpenses !== false;
@@ -100,6 +107,46 @@ export default function EventsPage() {
       const current = event.allowHours !== false;
       await updateDoc(doc(db, "events", event.id), { allowHours: !current });
       setEvents(prev => prev.map(e => e.id === event.id ? { ...e, allowHours: !current } : e));
+    } catch (e) { console.error(e); }
+  };
+
+  // ── Sub-events (optional) ──────────────────────────────────────────────
+  // A simple named list stored on the event (event.subEvents: string[]).
+  // Optional and purely additive — used later to group entries (e.g.
+  // "May Concert" for Evenko, or "Week 32" for Daily Operations).
+  const [subInput, setSubInput] = useState({}); // { [eventId]: "typing..." }
+
+  const addSubEvent = async (event) => {
+    const name = (subInput[event.id] || "").trim();
+    if (!name) return;
+    const list = Array.isArray(event.subEvents) ? event.subEvents : [];
+    if (list.includes(name)) { setSubInput(p => ({ ...p, [event.id]: "" })); return; }
+    const next = [...list, name];
+    try {
+      await updateDoc(doc(db, "events", event.id), { subEvents: next });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, subEvents: next } : e));
+      setSubInput(p => ({ ...p, [event.id]: "" }));
+    } catch (e) { console.error(e); }
+  };
+
+  const removeSubEvent = async (event, name) => {
+    const next = (event.subEvents || []).filter(s => s !== name);
+    const nextArch = (event.archivedSubEvents || []).filter(s => s !== name);
+    try {
+      await updateDoc(doc(db, "events", event.id), { subEvents: next, archivedSubEvents: nextArch });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, subEvents: next, archivedSubEvents: nextArch } : e));
+    } catch (e) { console.error(e); }
+  };
+
+  // Archive a sub-event: it leaves the employee picker (so a finished week
+  // stops showing) but the main event stays active and all its entries/reports
+  // are preserved. Additive — tracked in archivedSubEvents; subEvents is unchanged.
+  const archiveSubEvent = async (event, name) => {
+    const arch = event.archivedSubEvents || [];
+    const next = arch.includes(name) ? arch.filter(s => s !== name) : [...arch, name];
+    try {
+      await updateDoc(doc(db, "events", event.id), { archivedSubEvents: next });
+      setEvents(prev => prev.map(e => e.id === event.id ? { ...e, archivedSubEvents: next } : e));
     } catch (e) { console.error(e); }
   };
 
@@ -154,7 +201,8 @@ export default function EventsPage() {
       )}
 
       {activeEvents.map(ev => (
-        <div key={ev.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px", marginBottom: 8, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div key={ev.id} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 10, padding: "14px 16px", marginBottom: 8 }}>
+         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ width: 8, height: 8, borderRadius: "50%", background: T.green, flexShrink: 0 }} />
             <div>
@@ -202,6 +250,15 @@ export default function EventsPage() {
             }}>
               🍽️ Per Diem {ev.allowPerDiem ? "ON" : "OFF"}
             </button>
+            <button onClick={() => toggleTrips(ev)} style={{
+              padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.allowTrips ? "#f59e0b" : T.border}`,
+              background: ev.allowTrips ? "rgba(245,158,11,0.15)" : "transparent",
+              color: ev.allowTrips ? "#f59e0b" : T.dim,
+              fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+              display: "flex", alignItems: "center", gap: 4
+            }}>
+              🚗 Trips {ev.allowTrips ? "ON" : "OFF"}
+            </button>
             <button onClick={() => toggleExpenses(ev)} style={{
               padding: "5px 10px", borderRadius: 7, border: `1px solid ${ev.allowExpenses !== false ? "#8b5cf6" : T.border}`,
               background: ev.allowExpenses !== false ? "rgba(139,92,246,0.15)" : "transparent",
@@ -216,6 +273,43 @@ export default function EventsPage() {
               <Ic n="archive" s={12} /> Archive
             </button>
           </div>
+         </div>
+         {/* Sub-events (optional) */}
+         <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+           <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color: T.dim, marginBottom: 8 }}>
+             Sub-events <span style={{ color: T.muted, fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>— optional (e.g. "May Concert", "Week 32")</span>
+           </div>
+           {(ev.subEvents || []).length > 0 && (
+             <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+               {(ev.subEvents || []).map(s => {
+                 const archived = (ev.archivedSubEvents || []).includes(s);
+                 return (
+                 <span key={s} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", borderRadius: 6, background: archived ? "rgba(100,116,139,0.12)" : "rgba(14,165,233,0.12)", border: `1px solid ${archived ? "rgba(100,116,139,0.4)" : "rgba(14,165,233,0.4)"}`, color: archived ? T.dim : "#0ea5e9", fontSize: 12, fontWeight: 600, opacity: archived ? 0.7 : 1 }}>
+                   {archived && <span style={{ fontSize: 10 }}>📦</span>}
+                   {s}
+                   <button onClick={() => archiveSubEvent(ev, s)} title={archived ? "Restore (show in employee app)" : "Archive (hide from employee app)"} style={{ background: "none", border: "none", color: archived ? T.dim : "#0ea5e9", cursor: "pointer", fontSize: 11, lineHeight: 1, padding: 0, fontWeight: 700 }}>{archived ? "↩" : "📦"}</button>
+                   <button onClick={() => { if (window.confirm(`Delete sub-event "${s}"? This removes it from the list. Entries already tagged with it keep their data.`)) removeSubEvent(ev, s); }} title="Delete" style={{ background: "none", border: "none", color: archived ? T.dim : "#0ea5e9", cursor: "pointer", fontSize: 13, lineHeight: 1, padding: 0, opacity: 0.7 }}>×</button>
+                 </span>
+                 );
+               })}
+             </div>
+           )}
+           {(ev.archivedSubEvents || []).length > 0 && (
+             <div style={{ fontSize: 10, color: T.dim, marginBottom: 8 }}>📦 {(ev.archivedSubEvents || []).length} archived — hidden from the employee app, still in reports.</div>
+           )}
+           <div style={{ display: "flex", gap: 6, maxWidth: 360 }}>
+             <input
+               value={subInput[ev.id] || ""}
+               onChange={e => setSubInput(p => ({ ...p, [ev.id]: e.target.value }))}
+               onKeyDown={e => e.key === "Enter" && addSubEvent(ev)}
+               placeholder="Add a sub-event…"
+               style={{ flex: 1, padding: "7px 10px", borderRadius: 6, fontFamily: "inherit", fontSize: 12, color: T.text, background: T.surface, border: `1px solid ${T.border}`, outline: "none" }}
+             />
+             <button onClick={() => addSubEvent(ev)} disabled={!(subInput[ev.id] || "").trim()} style={{ ...bS, fontSize: 11, opacity: !(subInput[ev.id] || "").trim() ? 0.5 : 1 }}>
+               <Ic n="plus" s={12} /> Add
+             </button>
+           </div>
+         </div>
         </div>
       ))}
 
