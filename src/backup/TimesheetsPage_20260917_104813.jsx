@@ -1614,7 +1614,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
       return String(dt.getDate()).padStart(2,"0") + " " + months[dt.getMonth()] + " " + dt.getFullYear();
     };
     const acct = "5002";
-    const acctPerDiem = "5002";
+    const acctPerDiem = "5390";
     const allDates = [...empEntries.map(e=>e.date),...empExpenses.map(e=>e.date)].filter(Boolean).sort();
     if(!allDates.length) return [];
     const today = new Date();
