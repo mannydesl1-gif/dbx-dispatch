@@ -267,6 +267,11 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
       }
     }
   }
+  // A digital POD exists on this order (order-level or any stop). The blank
+  // signature line is the PAPER POD, so it's only shown when no digital POD was
+  // recorded — never both. Keyed off the raw data, not podSection (which depends
+  // on includePod), so the gate holds even when the POD isn't rendered.
+  const hasPod = !!o.podBy || ((o.delStops||[]).concat(o.pickStops||[])).some(st => st && st.pod && st.pod.by);
 
   // CBSA-approved customs barcode label (PARS 12cm×3.5cm / PAPS 63mm×28mm) — reuses
   // the SAME dimensions, layout and barcode data rule as the standalone sticker
@@ -446,7 +451,7 @@ function buildBolHtml(o, divInfo, includePod=false, includePricing=false, driver
   ${o.poNumber?`<div style="margin-top:8px;font-size:11px;color:#666">PO #: <strong>${o.poNumber}</strong></div>`:""}
 </div>` : "";
 
-  return `<div style="font-family:'Helvetica Neue',Arial,sans-serif;color:#000;max-width:800px">
+  return `<div class="bol-page" style="font-family:'Helvetica Neue',Arial,sans-serif;color:#000;max-width:800px;display:flex;flex-direction:column;min-height:255mm">
 
 <!-- Header -->
 <div style="display:grid;grid-template-columns:auto 1fr 1fr;gap:20px;align-items:center;border-bottom:2px solid #dc2626;padding-bottom:14px;margin-bottom:0">
@@ -552,11 +557,19 @@ ${pricingSection}
 
 <!-- POD -->
 ${podSection}
-${!isEvent?`<div class="bol-sign" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:40px;page-break-inside:avoid">
+${(()=>{
+  // Footer = signature (paper POD) + terms, as ONE unit pinned to the bottom of
+  // the page. margin-top:auto pushes it to the bottom of the flex column on a
+  // short (1-page) BOL; break-inside:avoid keeps it whole so on a 2-page BOL it
+  // flows to page 2 and sits at the bottom there instead of splitting.
+  const sign = (!isEvent && !hasPod) ? `<div class="bol-sign" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;page-break-inside:avoid">
   <div><div style="border-top:1.5px solid #000;padding-top:8px;font-size:10px;color:#666">Signature and name in print</div></div>
   <div><div style="border-top:1.5px solid #000;padding-top:8px;font-size:10px;color:#666">Date and Time</div></div>
-</div>`:""}
-${(()=>{const t=termsOrDefault(o.terms);return t&&t.trim()?`<div class="bol-terms" style="margin-top:28px;padding-top:8px;border-top:1px solid #e2e8f0;page-break-inside:avoid"><div style="font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px">Terms &amp; Conditions</div><div style="font-size:7.5px;color:#94a3b8;line-height:1.35;white-space:pre-line">${t.replace(/</g,"&lt;")}</div></div>`:"";})()}
+</div>` : "";
+  const t = termsOrDefault(o.terms);
+  const terms = (t && t.trim()) ? `<div class="bol-terms" style="margin-top:${sign?"28px":"0"};padding-top:8px;border-top:1px solid #e2e8f0"><div style="font-size:7px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:3px">Terms &amp; Conditions</div><div style="font-size:7.5px;color:#94a3b8;line-height:1.35;white-space:pre-line">${t.replace(/</g,"&lt;")}</div></div>` : "";
+  return (sign || terms) ? `<div class="bol-footer" style="margin-top:auto;padding-top:40px;page-break-inside:avoid">${sign}${terms}</div>` : "";
+})()}
 
 </div>`;
 }
@@ -574,8 +587,8 @@ async function downloadBolPdf(o, divInfo, includePod=false, includePricing=false
       @media print {
         body { margin: 0; padding: 0; }
         .no-print { display: none !important; }
-        /* Keep stop rows, cards, totals and signature from splitting across pages */
-        .bol-row, .bol-card, .bol-totals, .bol-sign, .bol-notes { page-break-inside: avoid; }
+        /* Keep stop rows, cards, totals, signature and footer from splitting across pages */
+        .bol-row, .bol-card, .bol-totals, .bol-sign, .bol-notes, .bol-footer, .bol-terms { page-break-inside: avoid; break-inside: avoid; }
       }
       body { font-family: 'Helvetica Neue', Arial, sans-serif; margin: 0; padding: 24px; background: #fff; }
     </style>
