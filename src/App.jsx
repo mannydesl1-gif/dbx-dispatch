@@ -1056,7 +1056,8 @@ export default function App() {
     try {
       const {id, bol:_bol, status:_s, drvId:_d, drvName:_dn, drvEmail:_de, trkId:_tk, trkUnit:_tu, trkPlate:_tp,
         trlId:_tl, trlUnit:_tlu, trlPlate:_tlp, extraDrivers:_ex,
-        podBy:_pb, podDate:_pd, podTime:_pt, billingType:_bt, noInvoiceReason:_nir, price:_pr, ...rest} = source;
+        podBy:_pb, podDate:_pd, podTime:_pt, billingType:_bt, noInvoiceReason:_nir, price:_pr,
+        xeroInvoiceUrl:_xu, xeroInvoiceFile:_xf, invoiceNum:_in, invoiceDate:_id2, files:_files, ...rest} = source;
       const lastBol = {current: null};
       for(let i=0;i<copies;i++) {
         const bol = await getNextBol();
@@ -1068,6 +1069,7 @@ export default function App() {
           drvId:"", drvName:"", drvEmail:"", trkId:"", trkUnit:"", trkPlate:"",
           trlId:"", trlUnit:"", trlPlate:"", extraDrivers:[],
           podBy:"", podDate:"", podTime:"", billingType:"", noInvoiceReason:"",
+          xeroInvoiceUrl:null, xeroInvoiceFile:null, invoiceNum:"", invoiceDate:"", files:[],
           price:{cur:"CAD",base:"",fuelPct:"",taxMode:"NONE",taxCustom:"",other:[{desc:"",amt:""}]},
           pickDate, delDate:"", reqDate:pickDate||td(),
           pickStops: pickStops.length>0 ? pickStops : rest.pickStops,
@@ -4053,7 +4055,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
     </div>;})}
 
     {isEvent && o.notes && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:4}}>Description / Scope of Work</div><div style={{fontSize:12,whiteSpace:"pre-line"}}>{o.notes}</div></div>}
-    {o.xeroInvoiceUrl && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:4}}>Xero Invoice</div><a href={o.xeroInvoiceUrl} target="_blank" rel="noopener noreferrer" style={{fontSize:12,color:"#0ea5e9",display:"flex",alignItems:"center",gap:4,textDecoration:"none"}}><Ic n="dl" s={12}/>{o.xeroInvoiceFile||"Xero Invoice PDF"}</a></div>}
+    {o.xeroInvoiceUrl && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:4,display:"flex",alignItems:"center",justifyContent:"space-between"}}><span>Xero Invoice</span><button onClick={async()=>{if(!window.confirm(`Remove the Xero invoice attachment from BOL ${o.bol}?\n\nThis only detaches it from this order — the file in Xero is not deleted.`))return;await savOrd({...o,xeroInvoiceUrl:null,xeroInvoiceFile:null});}} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:12,fontWeight:600,padding:0,fontFamily:"inherit"}}>× Remove</button></div><a href={o.xeroInvoiceUrl} target="_blank" rel="noopener noreferrer" style={{fontSize:12,color:"#0ea5e9",display:"flex",alignItems:"center",gap:4,textDecoration:"none"}}><Ic n="dl" s={12}/>{o.xeroInvoiceFile||"Xero Invoice PDF"}</a></div>}
     {o.podBy && <div style={{...sCrd,borderColor:"#22c55e"}}><div style={{fontSize:10,fontWeight:600,color:"#22c55e",textTransform:"uppercase",marginBottom:4}}>Proof of Delivery</div><div style={{fontSize:12}}>Received by: <strong>{o.podBy}</strong> — {fd(o.podDate)} {o.podTime}</div>{o.podNote&&<div style={{fontSize:11,color:T.muted,marginTop:4}}>Note: {o.podNote}</div>}</div>}
     {o.noInvoiceReason && !["ready-to-bill","closed"].includes(o.status) || (o.noInvoiceReason && o.status==="closed" && o.billingType==="no-charge") ? <div style={{...sCrd,borderColor:"#eab308"}}><div style={{fontSize:10,fontWeight:600,color:"#eab308",textTransform:"uppercase",marginBottom:4}}>No Charge Reason</div><div style={{fontSize:12}}>{o.noInvoiceReason}</div></div> : null}
 
