@@ -1119,7 +1119,7 @@ export default function App() {
       const {id, bol:_bol, status:_s, drvId:_d, drvName:_dn, drvEmail:_de, trkId:_tk, trkUnit:_tu, trkPlate:_tp,
         trlId:_tl, trlUnit:_tlu, trlPlate:_tlp, extraDrivers:_ex,
         podBy:_pb, podDate:_pd, podTime:_pt, billingType:_bt, noInvoiceReason:_nir, price:_pr,
-        xeroInvoiceUrl:_xu, xeroInvoiceFile:_xf, invoiceNum:_in, invoiceDate:_id2, files:_files, ...rest} = source;
+        xeroInvoiceUrl:_xu, xeroInvoiceFile:_xf, invoiceNum:_in, invoiceDate:_id2, files:_files, dispatchNotes:_dnotes, ...rest} = source;
       const lastBol = {current: null};
       for(let i=0;i<copies;i++) {
         const bol = await getNextBol();
@@ -1131,7 +1131,7 @@ export default function App() {
           drvId:"", drvName:"", drvEmail:"", trkId:"", trkUnit:"", trkPlate:"",
           trlId:"", trlUnit:"", trlPlate:"", extraDrivers:[],
           podBy:"", podDate:"", podTime:"", billingType:"", noInvoiceReason:"",
-          xeroInvoiceUrl:null, xeroInvoiceFile:null, invoiceNum:"", invoiceDate:"", files:[],
+          xeroInvoiceUrl:null, xeroInvoiceFile:null, invoiceNum:"", invoiceDate:"", files:[], dispatchNotes:"",
           price:{cur:"CAD",base:"",fuelPct:"",taxMode:"NONE",taxCustom:"",other:[{desc:"",amt:""}]},
           pickDate, delDate:"", reqDate:pickDate||td(),
           pickStops: pickStops.length>0 ? pickStops : rest.pickStops,
@@ -1849,7 +1849,7 @@ function OrderList({orders, q, setQ, flt, setFlt, multiFlts, setMultiFlts, go, n
         <tbody>
           {sorted.length===0 && <tr><td colSpan={10} style={{padding:24,textAlign:"center",color:T.dim,fontSize:12}}>No orders found</td></tr>}
           {sorted.map(o=><tr key={o.id} onClick={()=>go("od",o)} style={{cursor:"pointer",borderBottom:`1px solid ${T.hover}`,background:o.bol===highlightBol?"rgba(34,197,94,0.08)":"transparent",outline:o.bol===highlightBol?`1px solid #22c55e`:"none"}}>
-            <td style={{padding:8,fontSize:12,fontWeight:600,fontFamily:"'IBM Plex Mono'"}}>{o.bol}</td>
+            <td style={{padding:8,fontSize:12,fontWeight:600,fontFamily:"'IBM Plex Mono'"}}>{o.bol}{o.dispatchNotes&&o.dispatchNotes.trim()?<span title={o.dispatchNotes} style={{marginLeft:5,fontSize:11,cursor:"help"}}>📝</span>:null}</td>
             <td style={{padding:8}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
             <td style={{padding:8,fontSize:11}}>{DIVS.find(d=>d.id===o.divId)?.short||"—"}</td>
             <td style={{padding:8,fontSize:12}}>{o.cliName||"—"}</td>
@@ -3866,6 +3866,52 @@ function PoEditor({o, savOrd}) {
   </div>;
 }
 
+// Inline internal-notes card shown on the order detail at ANY status. Saves to
+// order.dispatchNotes via savOrd — never shown on the BOL/invoice PDF. Lets Manuel
+// jot follow-ups ("PO request emailed Sept 17") without opening Edit.
+function DispatchNotesCard({o, savOrd}) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(o.dispatchNotes||"");
+  const [saving, setSaving] = useState(false);
+  const has = !!(o.dispatchNotes && o.dispatchNotes.trim());
+  const save = async () => {
+    setSaving(true);
+    await savOrd({...o, dispatchNotes: val.replace(/\s+$/,"")});
+    setSaving(false);
+    setEditing(false);
+  };
+  const startEdit = () => { setVal(o.dispatchNotes||""); setEditing(true); };
+  // Prepend a dated stamp on its own line to jot a quick follow-up.
+  const stamp = () => {
+    const d = new Date().toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"});
+    setVal(v => (v && v.trim() ? v.replace(/\s+$/,"")+"\n" : "") + `${d}: `);
+  };
+  return <div style={sCrd}>
+    <div style={{display:"flex",alignItems:"center",marginBottom:has||editing?6:0}}>
+      <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase"}}>Dispatch Notes <span style={{color:T.dim,fontWeight:400,textTransform:"none"}}>· internal, not on PDF</span></div>
+      {!editing && <button onClick={startEdit} style={{marginLeft:"auto",fontSize:10,padding:"2px 10px",borderRadius:4,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,cursor:"pointer",fontFamily:"inherit"}}>{has?"Edit":"+ Add note"}</button>}
+    </div>
+    {!editing
+      ? (has
+          ? <div style={{fontSize:12,whiteSpace:"pre-line",lineHeight:1.5,color:T.text}}>{o.dispatchNotes}</div>
+          : <div style={{fontSize:11,color:T.dim,fontStyle:"italic"}}>No notes yet — add follow-ups, PO chase dates, reminders…</div>)
+      : <>
+          <textarea autoFocus value={val} onChange={e=>setVal(e.target.value)}
+            onKeyDown={e=>{if(e.key==="Enter"&&(e.metaKey||e.ctrlKey))save();if(e.key==="Escape")setEditing(false);}}
+            style={{...sIn,width:"100%",minHeight:90,resize:"vertical",fontSize:12,lineHeight:1.5}}
+            placeholder={"e.g. PO request emailed to client Sept 17\nFollow up if no reply by Sept 22"}/>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginTop:6,flexWrap:"wrap"}}>
+            <button onClick={stamp} type="button" style={{...bS,padding:"4px 10px",fontSize:11}}>+ Date stamp</button>
+            <div style={{marginLeft:"auto",display:"flex",gap:8}}>
+              <button onClick={()=>setEditing(false)} style={{...bS,padding:"4px 12px",fontSize:11}}>Cancel</button>
+              <button onClick={save} disabled={saving} style={{...sBtn,background:"#22c55e",padding:"4px 14px",fontSize:11}}>{saving?"Saving…":"Save"}</button>
+            </div>
+          </div>
+          <div style={{fontSize:9,color:T.dim,marginTop:4}}>⌘/Ctrl+Enter to save · Esc to cancel</div>
+        </>}
+  </div>;
+}
+
 // ═══ ORDER DETAIL ═══
 function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
   const [sending, setSending] = useState(false);
@@ -4115,6 +4161,8 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         </select>
       </div>
     </div>
+
+    <DispatchNotesCard o={o} savOrd={savOrd}/>
 
     {!isEvent && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:6}}>Transport</div>
       <div style={{fontSize:10,fontWeight:600,color:T.muted,marginBottom:4}}>DRIVER 1</div>
@@ -8070,7 +8118,7 @@ function SearchPage({db, go}) {
         <tbody>
           {results.length===0 && <tr><td colSpan={6} style={{padding:24,textAlign:"center",color:T.dim,fontSize:12}}>No orders match your search</td></tr>}
           {results.map(o => <tr key={o.id} onClick={()=>go("od",o)} style={{cursor:"pointer",borderBottom:`1px solid ${T.hover}`}}>
-            <td style={{padding:8,fontSize:12,fontWeight:600,fontFamily:"'IBM Plex Mono'"}}>{o.bol}</td>
+            <td style={{padding:8,fontSize:12,fontWeight:600,fontFamily:"'IBM Plex Mono'"}}>{o.bol}{o.dispatchNotes&&o.dispatchNotes.trim()?<span title={o.dispatchNotes} style={{marginLeft:5,fontSize:11,cursor:"help"}}>📝</span>:null}</td>
             <td style={{padding:8}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
             <td style={{padding:8,fontSize:12}}>{o.cliName||"—"}</td>
             <td style={{padding:8,fontSize:12}}>{o.drvName||"—"}</td>
