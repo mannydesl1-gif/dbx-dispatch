@@ -4409,13 +4409,17 @@ function ClientDocDropZone({itemId, docs, onUploaded, onDelete}) {
     if(!files?.length) return;
     setUploading(true);
     try {
+      const uploaded = [];
       for(const file of Array.from(files)) {
         const path = `clients/${itemId}/${Date.now()}_${file.name}`;
         const ref = storageRef(storage, path);
         await uploadBytes(ref, file);
         const url = await getDownloadURL(ref);
-        await onUploaded({name:file.name, url, path, uploadedAt:new Date().toISOString()});
+        uploaded.push({name:file.name, url, path, uploadedAt:new Date().toISOString()});
       }
+      // Append ALL uploaded docs in a single call so multiple files dropped at once
+      // don't clobber each other (each per-file save would start from stale docs).
+      if(uploaded.length) await onUploaded(uploaded);
     } catch(e) { console.error(e); alert("Upload failed"); }
     setUploading(false);
   };
@@ -4447,10 +4451,10 @@ function ClientDocDropZone({itemId, docs, onUploaded, onDelete}) {
     {/* Existing documents */}
     {docs.length>0 && <div>
       {docs.map((d,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",background:T.hover,borderRadius:6,marginBottom:5}}>
-        <span style={{fontSize:16}}>📄</span>
-        <span style={{fontSize:12,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.name}</span>
-        <span style={{fontSize:10,color:T.dim,whiteSpace:"nowrap"}}>{d.uploadedAt?new Date(d.uploadedAt).toLocaleDateString("en-CA",{month:"short",day:"numeric",year:"numeric"}):""}</span>
-        <button onClick={e=>{e.stopPropagation();window.open(d.url,"_blank");}} style={{fontSize:10,padding:"3px 8px",borderRadius:4,border:"1px solid #3b82f6",background:"transparent",color:"#3b82f6",cursor:"pointer",fontFamily:"inherit",fontWeight:600,whiteSpace:"nowrap"}}>📄 Open</button>
+        <span style={{fontSize:16,flexShrink:0}}>📄</span>
+        <span style={{fontSize:12,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"55%"}}>{d.name}</span>
+        <button onClick={e=>{e.stopPropagation();window.open(d.url,"_blank");}} style={{fontSize:10,padding:"3px 8px",borderRadius:4,border:"1px solid #3b82f6",background:"transparent",color:"#3b82f6",cursor:"pointer",fontFamily:"inherit",fontWeight:600,whiteSpace:"nowrap",flexShrink:0}}>📄 Open</button>
+        <span style={{fontSize:10,color:T.dim,whiteSpace:"nowrap",marginLeft:"auto"}}>{d.uploadedAt?new Date(d.uploadedAt).toLocaleDateString("en-CA",{month:"short",day:"numeric",year:"numeric"}):""}</span>
         <button onClick={e=>{e.stopPropagation();onDelete(d.path);}} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:14,padding:"0 2px",lineHeight:1,flexShrink:0}}>×</button>
       </div>)}
     </div>}
@@ -4642,9 +4646,10 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
       {/* Document upload — clients only */}
       {isClients && ed !== "new" && <div style={{marginTop:10}}>
         <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em",marginBottom:8}}>Documents</div>
-        <ClientDocDropZone itemId={ed} docs={items.find(x=>x.id===ed)?.docs||[]} onUploaded={async(doc)=>{
+        <ClientDocDropZone itemId={ed} docs={items.find(x=>x.id===ed)?.docs||[]} onUploaded={async(newDocs)=>{
           const item = items.find(x=>x.id===ed);
-          await save(items.map(x=>x.id===ed?{...item,docs:[...(item.docs||[]),doc]}:x));
+          const add = Array.isArray(newDocs) ? newDocs : [newDocs];
+          await save(items.map(x=>x.id===ed?{...item,docs:[...(item.docs||[]),...add]}:x));
         }} onDelete={async(docPath)=>{
           const ok = await cfm("Delete Document","Remove this document? This cannot be undone.");
           if(!ok) return;
@@ -4671,30 +4676,33 @@ function CrudPage({title, items, fields, save, orders, orderKey}) {
               <span style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",letterSpacing:"0.05em"}}>Documents ({(item.docs||[]).length})</span>
               <label style={{display:"flex",alignItems:"center",gap:4,fontSize:10,padding:"3px 8px",borderRadius:4,border:`1px solid ${T.border}`,background:"transparent",color:T.muted,cursor:"pointer",fontWeight:600}}>
                 <Ic n="clip" s={10}/> Upload
-                <input type="file" accept="*/*" style={{display:"none"}} onChange={async e=>{
-                  const file = e.target.files[0]; if(!file) return;
+                <input type="file" multiple accept="*/*" style={{display:"none"}} onChange={async e=>{
+                  const files = Array.from(e.target.files||[]); if(!files.length) return;
                   e.target.value="";
                   try {
-                    const path = `clients/${item.id}/${Date.now()}_${file.name}`;
-                    const r = storageRef(storage, path);
-                    await uploadBytes(r, file);
-                    const url = await getDownloadURL(r);
-                    const d = {name:file.name,url,path,uploadedAt:new Date().toISOString()};
-                    await save(items.map(x=>x.id===item.id?{...item,docs:[...(item.docs||[]),d]}:x));
+                    const added = [];
+                    for(const file of files){
+                      const path = `clients/${item.id}/${Date.now()}_${file.name}`;
+                      const r = storageRef(storage, path);
+                      await uploadBytes(r, file);
+                      const url = await getDownloadURL(r);
+                      added.push({name:file.name,url,path,uploadedAt:new Date().toISOString()});
+                    }
+                    if(added.length) await save(items.map(x=>x.id===item.id?{...item,docs:[...(item.docs||[]),...added]}:x));
                   } catch(e){ console.error(e); alert("Upload failed"); }
                 }}/>
               </label>
             </div>
             {(item.docs||[]).length===0 && <div style={{fontSize:11,color:T.dim,fontStyle:"italic"}}>No documents yet</div>}
             {(item.docs||[]).map((d,i)=><div key={i} style={{display:"flex",alignItems:"center",gap:6,padding:"5px 8px",background:T.hover,borderRadius:5,marginBottom:4}}>
-              <span style={{fontSize:11,flex:1,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.name}</span>
-              <a href={d.url} target="_blank" rel="noopener noreferrer" onClick={e=>{e.stopPropagation();window.open(d.url,"_blank");}} style={{fontSize:10,color:"#3b82f6",textDecoration:"none",fontWeight:600,whiteSpace:"nowrap"}}>📄 Open</a>
+              <span style={{fontSize:11,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:"60%"}}>{d.name}</span>
+              <a href={d.url} target="_blank" rel="noopener noreferrer" onClick={e=>{e.stopPropagation();window.open(d.url,"_blank");}} style={{fontSize:10,color:"#3b82f6",textDecoration:"none",fontWeight:600,whiteSpace:"nowrap",flexShrink:0}}>📄 Open</a>
               <button onClick={async()=>{
                 const ok = await cfm("Delete Document","Remove this document? This cannot be undone.");
                 if(!ok) return;
                 try { await deleteObject(storageRef(storage,d.path)); } catch{}
                 await save(items.map(x=>x.id===item.id?{...item,docs:(item.docs||[]).filter(dd=>dd.path!==d.path)}:x));
-              }} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:12,padding:"0 2px",lineHeight:1}}>×</button>
+              }} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:12,padding:"0 2px",lineHeight:1,marginLeft:"auto"}}>×</button>
             </div>)}
           </div>}
 
