@@ -7848,7 +7848,7 @@ function ReportsPage({db, go}) {
       String(a.bol||"").localeCompare(String(b.bol||""), undefined, { numeric: true })
     ).map(o => {
       const t = calcTotal(o); const cur = (o.price?.cur)||"CAD";
-      return `<tr><td style="font-weight:700">${o.bol}</td><td>${fd(o.reqDate)}</td><td class="txt">${o.cliName||"—"}</td><td class="txt">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td class="num">${csym(cur)}${nf(t)}</td><td class="muted">${cur}</td></tr>`;
+      return `<tr><td style="font-weight:700">${o.bol}</td><td>${o.invoiceNum||"—"}</td><td>${fd(o.reqDate)}</td><td class="txt">${o.cliName||"—"}</td><td class="txt">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td class="num">${csym(cur)}${nf(t)}</td><td class="muted">${cur}</td></tr>`;
     }).join("");
 
     const evtLabel = evtFilter !== "ALL" ? (db.events||[]).find(e=>e.id===evtFilter)?.name || "" : "";
@@ -7910,7 +7910,7 @@ function ReportsPage({db, go}) {
 <div class="subhead"><b>Period:</b> ${periodLabel} &nbsp;&nbsp;·&nbsp;&nbsp; <b>Group by:</b> ${groupBy} &nbsp;&nbsp;·&nbsp;&nbsp; <b>Orders:</b> ${pricedOrders.length}${evtLabel?` &nbsp;&nbsp;·&nbsp;&nbsp; <b>Event:</b> ${evtLabel}`:""}</div>
 <div class="kpis">${totalsHTML}</div>
 ${rows.length>0?`<h3>Revenue Breakdown</h3><table><thead><tr><th class="txt">Breakdown</th><th>Orders</th><th>Total</th><th>Currency</th></tr></thead><tbody>${tableRows}</tbody></table>`:""}
-${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th>Date</th><th class="txt">Client</th><th class="txt">Ref</th><th>Total</th><th>Cur</th></tr></thead><tbody>${detailRows}</tbody></table>`:""}
+${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th>Invoice #</th><th>Date</th><th class="txt">Client</th><th class="txt">Ref</th><th>Total</th><th>Cur</th></tr></thead><tbody>${detailRows}</tbody></table>`:""}
 <div class="ft">Confidential — internal use only. ${COMPANY_NAME}</div>
 </body></html>`;
   };
@@ -8056,7 +8056,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
       {showDetail && <div style={{background:T.card,border:`1px solid ${T.border}`,borderRadius:8,overflow:"auto",maxWidth:900}}>
         <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
           <thead><tr style={{background:T.hover,textAlign:"left"}}>
-            <th style={{padding:"6px 8px"}}>BOL</th><th style={{padding:"6px 8px"}}>Date</th><th style={{padding:"6px 8px"}}>Client</th>
+            <th style={{padding:"6px 8px"}}>BOL</th><th style={{padding:"6px 8px"}}>Invoice #</th><th style={{padding:"6px 8px"}}>Date</th><th style={{padding:"6px 8px"}}>Client</th>
             <th style={{padding:"6px 8px"}}>Reference</th><th style={{padding:"6px 8px"}}>Status</th>
             <th style={{padding:"6px 8px",textAlign:"right"}}>Total</th><th style={{padding:"6px 8px"}}>Cur</th>
           </tr></thead>
@@ -8066,6 +8066,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
             const t=calcTotal(o); const cur=(o.price?.cur)||"CAD";
             return <tr key={o.id} style={{borderTop:`1px solid ${T.border}`,cursor:"pointer"}} onClick={()=>go("od",o)}>
               <td style={{padding:"5px 8px",fontWeight:600}}>{o.bol}</td>
+              <td style={{padding:"5px 8px",color:o.invoiceNum?T.text:T.dim}}>{o.invoiceNum||"—"}</td>
               <td style={{padding:"5px 8px"}}>{fd(o.reqDate)}</td>
               <td style={{padding:"5px 8px"}}>{o.cliName||"—"}</td>
               <td style={{padding:"5px 8px"}}>{o.ref||"—"}</td>
