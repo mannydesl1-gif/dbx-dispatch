@@ -7706,6 +7706,28 @@ function ReportsPage({db, go}) {
   // Calculate total for an order
   const calcTotal = (o) => {
     const p = o.price || {};
+    const snap = p.fxSnapshot;
+    // If a multi-currency / FX conversion applies, return the SAME footed grand
+    // total the order detail, BOL PDF, and Xero CSV show — converted to the target
+    // (invoice) currency, with the admin-fee/adjustment applied. Otherwise fall
+    // back to the plain native sum below.
+    if (snap && (snap.applies || snap.multi) && snap.grand != null) {
+      const evForSum = (p.eventLines || []).filter(l => l.desc).map(l => {
+        const lb = (parseFloat(l.qty) || 0) * (parseFloat(l.unitPrice) || 0);
+        const ltp = l.taxMode === "HST" ? 13 : l.taxMode === "GST" ? 5 : l.taxMode === "CUSTOM" ? (parseFloat(l.taxCustom) || 0) : 0;
+        return { ltot: lb + lb * (ltp / 100), currency: l.currency || p.cur || "CAD" };
+      });
+      // Include transport base+fuel as a line in the order's own currency.
+      const baseAmt0 = parseFloat(p.base) || 0;
+      if (baseAmt0 > 0) {
+        const fuel0 = baseAmt0 * ((parseFloat(p.fuelPct) || 0) / 100);
+        const tax0 = p.taxMode && p.taxMode !== "NONE" ? (baseAmt0 + fuel0) * (((p.taxMode==="HST"?13:p.taxMode==="GST"?5:p.taxMode==="CUSTOM"?(parseFloat(p.taxCustom)||0):0))/100) : 0;
+        evForSum.unshift({ ltot: baseAmt0 + fuel0 + tax0, currency: p.cur || "CAD" });
+      }
+      const footed = fxConvertedLineSum(evForSum, snap);
+      const adjAmt = snap.adjVal ? (snap.adjMode === "pct" ? Math.round(footed.sum * (snap.adjVal / 100) * 100) / 100 : (parseFloat(snap.adjVal) || 0)) : 0;
+      return Math.round((footed.sum + adjAmt) * 100) / 100;
+    }
     const baseAmt = parseFloat(p.base) || 0;
     const fuelPct = parseFloat(p.fuelPct) || 0;
     const fuelAmt = baseAmt * (fuelPct / 100);
@@ -7723,6 +7745,14 @@ function ReportsPage({db, go}) {
     }, 0);
     return transportTotal + evtLinesTotal;
   };
+  // Displayed currency for an order in the report: the FX target when a conversion
+  // applies, else the order's own price currency.
+  const orderCur = (o) => {
+    const p = o.price || {};
+    const snap = p.fxSnapshot;
+    if (snap && (snap.applies || snap.multi) && snap.target) return snap.target;
+    return p.cur || "CAD";
+  };
 
   // Filter orders that have pricing and fall within date range
   const pricedOrders = db.orders.filter(o => {
@@ -7734,7 +7764,7 @@ function ReportsPage({db, go}) {
     const d = o.pickDate || o.pickStops?.[0]?.date || o.delDate || o.delStops?.[0]?.date || o.reqDate || (o.created ? o.created.slice(0,10) : "");
     if (!d) return false;
     if (d < rangeFrom || d > rangeTo) return false;
-    if (curFilter !== "ALL" && (p.cur || "CAD") !== curFilter) return false;
+    if (curFilter !== "ALL" && orderCur(o) !== curFilter) return false;
     if (cliFilter !== "ALL" && o.cliId !== cliFilter) return false;
     if (drvFilter !== "ALL" && o.drvId !== drvFilter) return false;
     if (divFilter !== "ALL" && o.divId !== divFilter) return false;
@@ -7750,7 +7780,7 @@ function ReportsPage({db, go}) {
   // Group by currency
   const byCurrency = {};
   pricedOrders.forEach(o => {
-    const cur = (o.price?.cur) || "CAD";
+    const cur = orderCur(o);
     if (!byCurrency[cur]) byCurrency[cur] = { orders: [], total: 0 };
     const t = calcTotal(o);
     byCurrency[cur].orders.push({ ...o, _total: t });
@@ -7847,7 +7877,7 @@ function ReportsPage({db, go}) {
     const detailRows = [...pricedOrders].sort((a,b)=>
       String(a.bol||"").localeCompare(String(b.bol||""), undefined, { numeric: true })
     ).map(o => {
-      const t = calcTotal(o); const cur = (o.price?.cur)||"CAD";
+      const t = calcTotal(o); const cur = orderCur(o);
       return `<tr><td style="font-weight:700">${o.bol}</td><td>${o.invoiceNum||"—"}</td><td>${fd(o.reqDate)}</td><td class="txt">${o.cliName||"—"}</td><td class="txt">${(typeof o.ref==="string"?o.ref:o.ref?.value||"")||"—"}</td><td class="num">${csym(cur)}${nf(t)}</td><td class="muted">${cur}</td></tr>`;
     }).join("");
 
@@ -8063,7 +8093,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
           <tbody>{[...pricedOrders].sort((a,b)=>
             String(a.bol||"").localeCompare(String(b.bol||""), undefined, { numeric: true })
           ).map(o=>{
-            const t=calcTotal(o); const cur=(o.price?.cur)||"CAD";
+            const t=calcTotal(o); const cur=orderCur(o);
             return <tr key={o.id} style={{borderTop:`1px solid ${T.border}`,cursor:"pointer"}} onClick={()=>go("od",o)}>
               <td style={{padding:"5px 8px",fontWeight:600}}>{o.bol}</td>
               <td style={{padding:"5px 8px",color:o.invoiceNum?T.text:T.dim}}>{o.invoiceNum||"—"}</td>
