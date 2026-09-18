@@ -93,7 +93,7 @@ function fxLineToTarget(amtNative, nativeCur, snap) {
 function fxConvertedLineSum(lines, snap) {
   let sum = 0;
   const rows = (lines || []).map(l => {
-    const cur = l.currency || (snap && snap.cur) || "CAD";
+    const cur = l.currency || (snap && snap.cur) || (snap && snap.target) || "CAD";
     const r = fxLineToTarget(l.ltot, cur, snap || {});
     const rounded = Math.round(r.val * 100) / 100;
     sum += rounded;
