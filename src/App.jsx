@@ -2037,11 +2037,19 @@ function OrderEdit({data, db, savOrd, go}) {
       if (amt) byCur[cur] = (byCur[cur]||0) + amt;
     });
     const fxTarget = o.price?.totalCurrency || o.price?.cur || "CAD";
-    const convertedBase = fxConvertToTarget(byCur, fxTarget, fxRates);
+    // Foot the converted subtotal from per-line rounded conversions (same method as
+    // the pricing editor, order detail, report and Xero CSV) so all surfaces match.
+    const _liveSnap = { target: fxTarget, rates: { ...fxRates, USD: 1 }, rateBase: "USD" };
+    const _evForFoot = filledLines.map(l => {
+      const ltp = l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+      const lb = (parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+      return { ltot: lb + lb*(ltp/100), currency: l.currency || o.price?.cur || "CAD" };
+    });
+    const convertedBase = Object.keys(byCur).length ? fxConvertedLineSum(_evForFoot, _liveSnap).sum : null;
     const fxAdjMode = o.price?.adjMode || "pct";
     const fxAdjVal = parseFloat(o.price?.adjVal)||0;
-    const fxAdjAmount = (convertedBase!=null && fxAdjVal!==0) ? (fxAdjMode==="pct"?convertedBase*(fxAdjVal/100):fxAdjVal) : 0;
-    const fxGrand = convertedBase!=null ? convertedBase + fxAdjAmount : null;
+    const fxAdjAmount = (convertedBase!=null && fxAdjVal!==0) ? (fxAdjMode==="pct"?Math.round(convertedBase*(fxAdjVal/100)*100)/100:fxAdjVal) : 0;
+    const fxGrand = convertedBase!=null ? Math.round((convertedBase + fxAdjAmount)*100)/100 : null;
     const fxSnapshot = {
       byCur, target: fxTarget, convertedBase, adjMode: fxAdjMode, adjVal: fxAdjVal,
       adjLabel: o.price?.adjLabel || "Adjustment", adjAmount: fxAdjAmount, grand: fxGrand,
@@ -2227,13 +2235,26 @@ function OrderEdit({data, db, savOrd, go}) {
           const target = o.price?.totalCurrency || o.price?.cur || "CAD";
           const targetSym = fxSym(target);
           const multi = evtCurrenciesUsed().length > 1;
-          const convertedBase = fxConvertToTarget(byCur, target, fxRates);
+          const _liveSnap2 = { target, rates: { ...fxRates, USD: 1 }, rateBase: "USD" };
+          const _ev2 = [];
+          const _base2 = parseFloat(o.price?.base)||0;
+          if (_base2>0) {
+            const _f2 = _base2*((parseFloat(o.price?.fuelPct)||0)/100);
+            const _t2 = o.price?.taxMode&&o.price?.taxMode!=="NONE" ? (_base2+_f2)*(((o.price?.taxMode==="HST"?13:o.price?.taxMode==="GST"?5:o.price?.taxMode==="CUSTOM"?(parseFloat(o.price?.taxCustom)||0):0))/100) : 0;
+            _ev2.push({ ltot: _base2+_f2+_t2, currency: o.price?.cur||"CAD" });
+          }
+          (o.price?.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).forEach(l=>{
+            const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+            const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+            _ev2.push({ ltot: lb+lb*(ltp/100), currency: l.currency||o.price?.cur||"CAD" });
+          });
+          const convertedBase = curList.length ? fxConvertedLineSum(_ev2, _liveSnap2).sum : null;
           const adjMode = o.price?.adjMode || "pct";
           const adjVal = parseFloat(o.price?.adjVal)||0;
           const adjLabel = o.price?.adjLabel || "Adjustment";
           let adjAmount = 0;
-          if (convertedBase!=null && adjVal!==0) adjAmount = adjMode==="pct" ? convertedBase*(adjVal/100) : adjVal;
-          const grand = convertedBase!=null ? convertedBase + adjAmount : null;
+          if (convertedBase!=null && adjVal!==0) adjAmount = adjMode==="pct" ? Math.round(convertedBase*(adjVal/100)*100)/100 : adjVal;
+          const grand = convertedBase!=null ? Math.round((convertedBase + adjAmount)*100)/100 : null;
           return <div style={{marginTop:10,padding:12,background:T["bg"],borderRadius:8,border:`1px solid ${T.border}`}}>
             <div style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.4px",marginBottom:6}}>Subtotals by currency</div>
             {curList.map(c=>(
@@ -3366,7 +3387,26 @@ function PricingEntry({o:io, db, savOrd, go}) {
             const target = p.totalCurrency || p.cur || "CAD";
             const targetSym = fxSym(target);
             const multi = evtCurrenciesUsed().length > 1;
-            const convertedBase = fxConvertToTarget(byCur, target, fxRates); // pre-adjustment
+            // Foot the converted subtotal from PER-LINE rounded conversions — the
+            // same method the order detail, report, and Xero CSV use — so every
+            // surface matches to the cent. (Converting the aggregate byCur instead
+            // drifts by rounding.) Build a live snapshot from the current fxRates.
+            const liveSnap = { target, rates: { ...fxRates, USD: 1 }, rateBase: "USD" };
+            const evForFoot = [];
+            const baseAmtE = parseFloat(p.base)||0;
+            if (baseAmtE>0) {
+              const fuelE = baseAmtE*((parseFloat(p.fuelPct)||0)/100);
+              const taxE = p.taxMode&&p.taxMode!=="NONE" ? (baseAmtE+fuelE)*(((p.taxMode==="HST"?13:p.taxMode==="GST"?5:p.taxMode==="CUSTOM"?(parseFloat(p.taxCustom)||0):0))/100) : 0;
+              evForFoot.push({ ltot: baseAmtE+fuelE+taxE, currency: p.cur||"CAD" });
+            }
+            (p.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).forEach(l=>{
+              const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+              const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+              evForFoot.push({ ltot: lb+lb*(ltp/100), currency: l.currency||p.cur||"CAD" });
+            });
+            const footedE = fxConvertedLineSum(evForFoot, liveSnap);
+            const anyMissingE = footedE.rows.some(r=>!r.ok);
+            const convertedBase = curList.length ? footedE.sum : null; // pre-adjustment, footed
             // Adjustment: named, either % of the converted total or a flat amount
             // in the target currency. Positive adds, negative reduces.
             const adjMode = p.adjMode || "pct"; // "pct" | "flat"
@@ -3374,9 +3414,9 @@ function PricingEntry({o:io, db, savOrd, go}) {
             const adjLabel = p.adjLabel || "Adjustment";
             let adjAmount = 0;
             if (convertedBase!=null && adjVal!==0) {
-              adjAmount = adjMode==="pct" ? convertedBase*(adjVal/100) : adjVal;
+              adjAmount = adjMode==="pct" ? Math.round(convertedBase*(adjVal/100)*100)/100 : adjVal;
             }
-            const grand = convertedBase!=null ? convertedBase + adjAmount : null;
+            const grand = convertedBase!=null ? Math.round((convertedBase + adjAmount)*100)/100 : null;
             return <div style={{marginTop:10,padding:12,background:T["bg"],borderRadius:8,border:`1px solid ${T.border}`}}>
               {/* Per-currency subtotals */}
               <div style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:"uppercase",letterSpacing:"0.4px",marginBottom:6}}>Subtotals by currency</div>
@@ -3440,19 +3480,35 @@ function PricingEntry({o:io, db, savOrd, go}) {
       <div style={{display:"flex",gap:8,marginTop:14,flexWrap:"wrap"}}>
         <button style={{...sBtn,background:"#0ea5e9"}} onClick={()=>{
           // Snapshot the multi-currency computation so the PDF (which has no live
-          // FX access) renders exactly what was shown here at save time.
+          // FX access) renders exactly what was shown here at save time. Uses the
+          // SAME per-line footed method as the preview, report and Xero CSV so all
+          // surfaces match to the cent.
           const byCur = evtSubtotalByCurrency();
           const target = p.totalCurrency || p.cur || "CAD";
-          const convertedBase = fxConvertToTarget(byCur, target, fxRates);
+          const snapRates = { ...fxRates, USD: 1 };
+          const liveSnap = { target, rates: snapRates, rateBase: "USD" };
+          const evForFoot = [];
+          const baseAmtS = parseFloat(p.base)||0;
+          if (baseAmtS>0) {
+            const fuelS = baseAmtS*((parseFloat(p.fuelPct)||0)/100);
+            const taxS = p.taxMode&&p.taxMode!=="NONE" ? (baseAmtS+fuelS)*(((p.taxMode==="HST"?13:p.taxMode==="GST"?5:p.taxMode==="CUSTOM"?(parseFloat(p.taxCustom)||0):0))/100) : 0;
+            evForFoot.push({ ltot: baseAmtS+fuelS+taxS, currency: p.cur||"CAD" });
+          }
+          (p.eventLines||[]).filter(l=>l.desc&&parseFloat(l.unitPrice)>0).forEach(l=>{
+            const lb=(parseFloat(l.qty)||0)*(parseFloat(l.unitPrice)||0);
+            const ltp=l.taxMode==="HST"?13:l.taxMode==="GST"?5:l.taxMode==="CUSTOM"?(parseFloat(l.taxCustom)||0):0;
+            evForFoot.push({ ltot: lb+lb*(ltp/100), currency: l.currency||p.cur||"CAD" });
+          });
+          const convertedBase = Object.keys(byCur).length ? fxConvertedLineSum(evForFoot, liveSnap).sum : null;
           const adjMode = p.adjMode || "pct";
           const adjVal = parseFloat(p.adjVal)||0;
-          const adjAmount = (convertedBase!=null && adjVal!==0) ? (adjMode==="pct"?convertedBase*(adjVal/100):adjVal) : 0;
-          const grand = convertedBase!=null ? convertedBase+adjAmount : null;
+          const adjAmount = (convertedBase!=null && adjVal!==0) ? (adjMode==="pct"?Math.round(convertedBase*(adjVal/100)*100)/100:adjVal) : 0;
+          const grand = convertedBase!=null ? Math.round((convertedBase+adjAmount)*100)/100 : null;
           const fxSnapshot = {
             byCur, target, convertedBase, adjMode, adjVal,
             adjLabel: p.adjLabel||"Adjustment", adjAmount, grand,
             fxDate, multi: evtCurrenciesUsed().length>1,
-            rates: { ...fxRates, USD: 1 }, rateBase: "USD",
+            rates: snapRates, rateBase: "USD",
             applies: (Object.keys(byCur).length > 1) || (adjVal !== 0)
               || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== target),
           };
