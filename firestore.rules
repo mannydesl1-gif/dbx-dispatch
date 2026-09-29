@@ -1,36 +1,42 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // ── Tightened: was `if true` (world-readable AND writable). Now requires
-    // an auth token. Both apps authenticate (dispatch login; timesheet
-    // signInAnonymously), so legitimate users still pass. This closes public
-    // internet access; it does NOT scope each driver to their own record
-    // (anonymous tokens are interchangeable) — that would need real per-driver auth.
-    match /timesheets/{doc} { allow read, write: if request.auth != null; }
-    match /sessions/{doc} { allow read, write: if request.auth != null; }
-    match /expenses/{doc} { allow read, write: if request.auth != null; }
-    match /employees/{doc} { allow read, write: if request.auth != null; }
 
-    // Driver-uploaded docs (void cheque, licence, headshot) — driver → manager.
-    // Was read:if true; now auth-gated. Writes already fell through to the
-    // authenticated catch-all, so keep write auth'd here explicitly.
-    match /employee_documents/{doc} { allow read, write: if request.auth != null; }
+    // ── Who is who ──────────────────────────────────────────────────────────
+    //  • STAFF = signed in to dispatch with an email + password.
+    //  • TIMESHEET PHONES = signed in anonymously. Any device that opens the
+    //    timesheet site gets one of these automatically, BEFORE the Employee
+    //    ID + PIN screen — and anyone on the internet can get one with the
+    //    public web config. So an anonymous token only proves "someone opened
+    //    the app", never "this is an employee".
+    function signedIn() { return request.auth != null; }
+    function isStaff()  { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
 
-    // Company → driver shared docs (drug screens, border letters). Read by the
-    // driver's timesheet app; written only by dispatch (authenticated admin).
-    // NEW collection for the upcoming feature.
-    match /driver_shared_docs/{doc} { allow read, write: if request.auth != null; }
+    // ── What the timesheet phone app needs (anonymous for now) ──────────────
+    // Still open to any signed-in device. Phase B (PIN check moved to a Cloud
+    // Function that signs each phone in AS that employee) will scope these to
+    // each person's own records.
+    match /timesheets/{doc}         { allow read, write: if signedIn(); }
+    match /sessions/{doc}           { allow read, write: if signedIn(); }
+    match /expenses/{doc}           { allow read, write: if signedIn(); }
+    match /employees/{doc}          { allow read, write: if signedIn(); }
+    match /employee_documents/{doc} { allow read, write: if signedIn(); }
+    match /acknowledgments/{doc}    { allow read, write: if signedIn(); }
+    match /orders/{doc}             { allow read, write: if signedIn(); }   // driver Orders tab reads + updates
+    match /drivers/{doc}            { allow read, write: if signedIn(); }   // login lookup (Phase B removes this)
 
-    // Was read:if true — now auth-gated. Events writes stay admin-authed.
-    match /events/{doc} { allow read, write: if request.auth != null; }
-    match /drivers/{doc} { allow read, write: if request.auth != null; }
-    match /trucks/{doc} { allow read, write: if request.auth != null; }
-    match /trailers/{doc} { allow read, write: if request.auth != null; }
-    match /company_docs/{doc} { allow read, write: if request.auth != null; }
+    // Phones only READ these; only staff (dispatch) may change them.
+    match /events/{doc}             { allow read: if signedIn(); allow write: if isStaff(); }
+    match /trucks/{doc}             { allow read: if signedIn(); allow write: if isStaff(); }
+    match /trailers/{doc}           { allow read: if signedIn(); allow write: if isStaff(); }
+    match /company_docs/{doc}       { allow read: if signedIn(); allow write: if isStaff(); }
+    match /driver_shared_docs/{doc} { allow read: if signedIn(); allow write: if isStaff(); }
 
-    // Everything else (orders, settings, letters, …) already required auth.
+    // ── Everything else — clients, quotes, settings, letters, IFTA, stickers,
+    // locations, maintenance, config… — dispatch staff only.
+    // (Previously ANY signed-in device, including anonymous ones.)
     match /{document=**} {
-      allow read, write: if request.auth != null;
+      allow read, write: if isStaff();
     }
   }
 }
