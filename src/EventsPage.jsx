@@ -388,7 +388,7 @@ export default function EventsPage() {
            const editing = crewEdit && crewEdit.evId === ev.id;
            const cardHead = (
              <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color: T.dim, marginBottom: 8 }}>
-               Assigned crew <span style={{ color: T.muted, fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>— optional · pre-selected for supervisors in the timesheet app's Crew Entry</span>
+               Assigned crew <span style={{ color: T.muted, fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>— optional · the people offered first in Crew Entry (dispatch Timesheets + the supervisor's phone)</span>
              </div>
            );
            if (!editing) return (

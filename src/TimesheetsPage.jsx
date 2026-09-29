@@ -1099,10 +1099,14 @@ function CrewEntryModal({ events = [], eventDocs = [], selectedEvent, onClose, o
     setShowAll(false);
   }, [event]); // eslint-disable-line
 
-  const inCat = p => category === "drivers" ? p.isDriver !== false : (p.isEmployee === true && p.isDriver !== true);
+  // Everyone lands in exactly one tab: Employees = not a driver (Employee ticked with Driver
+  // unticked, or Driver unticked); Drivers = everyone else. (Same rule as the phone app.)
+  const isEmpCat = p => p.isDriver === false || (p.isEmployee === true && p.isDriver !== true);
+  const inCat = p => category === "employees" ? isEmpCat(p) : !isEmpCat(p);
   const crewSet = new Set(evObj && Array.isArray(evObj.crewIds) ? evObj.crewIds : []);
   const roster = people.filter(inCat);
   const crewInCat = roster.filter(p => crewSet.has(p.id));
+  const crewOtherTab = people.filter(p => crewSet.has(p.id) && !inCat(p)).length;
   const crewOnly = crewInCat.length > 0 && !showAll;
   const pool = crewOnly ? crewInCat : roster;
   const q = search.trim().toLowerCase();
@@ -1264,6 +1268,9 @@ function CrewEntryModal({ events = [], eventDocs = [], selectedEvent, onClose, o
                     {!crewOnly && crewSet.has(p.id) && <span style={{ marginLeft: "auto", fontSize: 9, color: T.green, fontWeight: 700 }}>★ crew</span>}
                   </label>))}
             </div>
+            {crewOtherTab > 0 && <button onClick={() => { setCategory(category === "drivers" ? "employees" : "drivers"); setSelected({}); setSearch(""); setShowAll(false); }}
+              style={{ display: "block", background: "none", border: "none", color: T.amber, fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", padding: "4px 0" }}>
+              + {crewOtherTab} more of this event's crew under {category === "drivers" ? "👷 Employees" : "🚚 Drivers"} — switch</button>}
             {crewInCat.length > 0 && <button onClick={() => setShowAll(v => !v)} style={{ background: "none", border: "none", color: T.muted, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", padding: "4px 0" }}>
               {showAll ? "← Event crew only" : "Someone else? Show everyone"}</button>}
 
