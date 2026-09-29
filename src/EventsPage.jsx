@@ -170,6 +170,36 @@ export default function EventsPage() {
     } catch (e) { console.error(e); }
   };
 
+  // ── Assigned crew (optional) — roster record ids stored on the event as crewIds.
+  // The timesheet app's Crew Entry pre-selects these people for supervisors.
+  const [roster, setRoster] = useState([]);
+  const [crewEdit, setCrewEdit] = useState(null); // { evId, sel:{id:true}, cat:"all"|"drivers"|"employees", q:"" }
+  const [crewSaving, setCrewSaving] = useState(false);
+  useEffect(() => { (async () => {
+    try {
+      const snap = await getDocs(collection(db, "drivers"));
+      setRoster(snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .filter(p => p.archived !== true && !p.isSupplier && p.name)
+        .sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (e) { console.error(e); }
+  })(); }, []);
+  const rosterById = Object.fromEntries(roster.map(p => [p.id, p]));
+  const crewOf = ev => (ev.crewIds || []).filter(id => rosterById[id]); // ignore archived/removed people
+  const isDrv = p => p.isDriver !== false;
+  const isEmp = p => p.isEmployee === true;
+  const openCrew = ev => setCrewEdit({ evId: ev.id, sel: Object.fromEntries(crewOf(ev).map(id => [id, true])), cat: "all", q: "" });
+  const saveCrew = async ev => {
+    if (!crewEdit) return;
+    const ids = Object.keys(crewEdit.sel).filter(id => crewEdit.sel[id] && rosterById[id]);
+    setCrewSaving(true);
+    try {
+      await updateDoc(doc(db, "events", ev.id), { crewIds: ids });
+      setEvents(prev => prev.map(e => e.id === ev.id ? { ...e, crewIds: ids } : e));
+      setCrewEdit(null);
+    } catch (e) { console.error(e); alert("Couldn't save the crew — check your connection and try again."); }
+    setCrewSaving(false);
+  };
+
   const activeEvents = events.filter(e => e.active);
   const archivedEvents = events.filter(e => !e.active);
 
@@ -352,6 +382,73 @@ export default function EventsPage() {
              </button>
            </div>
          </div>
+         {/* Assigned crew (optional) */}
+         {(() => {
+           const crew = crewOf(ev);
+           const editing = crewEdit && crewEdit.evId === ev.id;
+           const cardHead = (
+             <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.05em", textTransform: "uppercase", color: T.dim, marginBottom: 8 }}>
+               Assigned crew <span style={{ color: T.muted, fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>— optional · pre-selected for supervisors in the timesheet app's Crew Entry</span>
+             </div>
+           );
+           if (!editing) return (
+             <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+               {cardHead}
+               <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                 {crew.length === 0
+                   ? <span style={{ fontSize: 12, color: T.dim }}>No crew assigned</span>
+                   : <>
+                       <span style={{ fontSize: 12, fontWeight: 700, color: T.green }}>{crew.length} assigned</span>
+                       <span style={{ fontSize: 12, color: T.muted }}>
+                         {crew.slice(0, 8).map(id => rosterById[id].name).join(", ")}{crew.length > 8 ? ` +${crew.length - 8} more` : ""}
+                       </span>
+                     </>}
+                 <button onClick={() => openCrew(ev)} disabled={!!crewEdit} style={{ ...bS, fontSize: 11, padding: "5px 10px", opacity: crewEdit ? 0.5 : 1 }}>
+                   {crew.length ? "Edit crew" : "+ Assign crew"}
+                 </button>
+               </div>
+             </div>
+           );
+           const q = crewEdit.q.trim().toLowerCase();
+           const list = roster.filter(p =>
+             (crewEdit.cat === "all" || (crewEdit.cat === "drivers" ? isDrv(p) : isEmp(p))) &&
+             (!q || p.name.toLowerCase().includes(q)));
+           const selN = Object.keys(crewEdit.sel).filter(id => crewEdit.sel[id]).length;
+           const allShown = list.length > 0 && list.every(p => crewEdit.sel[p.id]);
+           const setSel = (fn) => setCrewEdit(c => ({ ...c, sel: fn(c.sel) }));
+           const catBtn = (k, l) => (
+             <button key={k} onClick={() => setCrewEdit(c => ({ ...c, cat: k }))} style={{ ...bS, fontSize: 11, padding: "5px 10px", ...(crewEdit.cat === k ? { border: `1px solid ${T.green}`, color: T.green, background: T.greenDim } : {}) }}>{l}</button>
+           );
+           return (
+             <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${T.border}` }}>
+               {cardHead}
+               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 8 }}>
+                 {catBtn("all", "All")}{catBtn("drivers", "🚚 Drivers")}{catBtn("employees", "👷 Employees")}
+                 <input value={crewEdit.q} onChange={e => setCrewEdit(c => ({ ...c, q: e.target.value }))} placeholder="Search a name…"
+                   style={{ flex: "1 1 160px", maxWidth: 240, padding: "6px 10px", borderRadius: 6, fontFamily: "inherit", fontSize: 12, color: T.text, background: T.surface, border: `1px solid ${T.border}`, outline: "none" }} />
+                 <button onClick={() => setSel(sel => { const n = { ...sel }; list.forEach(p => { if (allShown) delete n[p.id]; else n[p.id] = true; }); return n; })}
+                   style={{ background: "none", border: "none", color: T.green, fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+                   {allShown ? "Clear shown" : "Select shown"}
+                 </button>
+               </div>
+               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 2, maxHeight: 260, overflowY: "auto", border: `1px solid ${T.border}`, borderRadius: 7, padding: 6 }}>
+                 {list.length === 0 && <div style={{ fontSize: 12, color: T.dim, padding: 6 }}>No match.</div>}
+                 {list.map(p => (
+                   <label key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, padding: "5px 6px", borderRadius: 5, cursor: "pointer", background: crewEdit.sel[p.id] ? T.greenDim : "transparent" }}>
+                     <input type="checkbox" checked={!!crewEdit.sel[p.id]} style={{ accentColor: T.green }}
+                       onChange={e => { const on = e.target.checked; setSel(sel => { const n = { ...sel }; if (on) n[p.id] = true; else delete n[p.id]; return n; }); }} />
+                     <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                     <span style={{ marginLeft: "auto", fontSize: 9, color: T.dim }}>{isDrv(p) && isEmp(p) ? "D/E" : isDrv(p) ? "D" : "E"}</span>
+                   </label>
+                 ))}
+               </div>
+               <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 8 }}>
+                 <button onClick={() => saveCrew(ev)} disabled={crewSaving} style={{ ...bP, fontSize: 11, padding: "6px 14px" }}>{crewSaving ? "Saving…" : `Save crew (${selN})`}</button>
+                 <button onClick={() => setCrewEdit(null)} disabled={crewSaving} style={{ ...bS, fontSize: 11, padding: "6px 12px" }}>Cancel</button>
+               </div>
+             </div>
+           );
+         })()}
         </div>
       ))}
 
