@@ -1,5 +1,6 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
+const { onDocumentCreated, onDocumentWritten } = require("firebase-functions/v2/firestore");
 const admin = require("firebase-admin");
 const nodemailer = require("nodemailer");
 const { PDFDocument, rgb, StandardFonts } = require("pdf-lib");
@@ -1673,6 +1674,83 @@ async function tsVerifyEmployee(req) {
   catch (e) { return null; }
 }
 
+// ── Record ownership (step 2) ────────────────────────────────────────────────
+// Every timesheet / expense / uploaded-document record gets drvId = the
+// owner's drivers-collection id, so the database rules can check "this is
+// yours" with one exact match. Old records are tagged the first time their
+// owner logs in; anything created without it (e.g. from dispatch) is tagged
+// by the stamp* triggers below. Orders get appDrvIds = the drivers the order
+// is pushed to while it is active, so a phone can query only its own orders.
+const TS_AUTH_VERSION = 2;                     // bump to force every phone to sign in again
+const TS_OWNED = ["timesheets", "expenses", "employee_documents"];
+const TS_ACTIVE_ORDER = ["assigned", "in-transit"];
+const tsDigits = v => String(v || "").replace(/\D/g, "");
+const tsNameKey = v => String(v || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+// Index of the roster for resolving an owner from email / phone / name.
+// A name only counts when exactly one person has it.
+async function tsRosterIndex() {
+  const snap = await admin.firestore().collection("drivers").get();
+  const byEmail = {}, byPhone = {}, byName = {};
+  snap.docs.forEach(d => {
+    const x = d.data(); if (x.isSupplier) return;
+    const e = tsNorm(x.email), p = tsDigits(x.phone), n = tsNameKey(x.name);
+    if (e) byEmail[e] = d.id;
+    if (p.length >= 7) byPhone[p] = d.id;
+    if (n) byName[n] = byName[n] === undefined ? d.id : null;   // null = ambiguous
+  });
+  return ({ email, phone, name }) =>
+    byEmail[tsNorm(email)] || byPhone[tsDigits(phone)] || byName[tsNameKey(name)] || null;
+}
+
+// Tag this driver's untagged history. Never blocks login if it fails.
+async function tsBackfillOwner(d) {
+  const x = d.data(), fs = admin.firestore();
+  const email = String(x.email || "").trim(), phone = String(x.phone || "").trim(), name = String(x.name || "").trim();
+  // Only use the name if nobody else on the roster shares it
+  const same = name ? (await fs.collection("drivers").get()).docs.filter(o => tsNameKey(o.data().name) === tsNameKey(name)).length : 0;
+  let tagged = 0;
+  for (const col of TS_OWNED) {
+    const probes = [];
+    if (email) probes.push(["employeeEmail", email]);
+    if (phone) { probes.push(["employeePhone", phone]); if (tsDigits(phone) !== phone) probes.push(["employeePhone", tsDigits(phone)]); }
+    if (name && same === 1) probes.push(["employeeName", name]);
+    const seen = new Set(); let batch = fs.batch(), n = 0;
+    for (const [field, val] of probes) {
+      const snap = await fs.collection(col).where(field, "==", val).get();
+      for (const r of snap.docs) {
+        if (seen.has(r.id) || r.data().drvId) continue;
+        seen.add(r.id); batch.update(r.ref, { drvId: d.id }); n++; tagged++;
+        if (n >= 450) { await batch.commit(); batch = fs.batch(); n = 0; }
+      }
+    }
+    if (n) await batch.commit();
+  }
+  return tagged;
+}
+
+// Which drivers can see an order on their phone right now
+function tsOrderDrvIds(o, resolve) {
+  if (!o || o.pushToApp === false || !TS_ACTIVE_ORDER.includes(o.status)) return [];
+  const list = [{ id: o.drvId, email: o.drvEmail, phone: o.drvPhone, name: o.drvName },
+    ...(Array.isArray(o.extraDrivers) ? o.extraDrivers : []).map(e => ({ id: e && e.drvId, email: e && e.drvEmail, phone: e && e.drvPhone, name: e && e.drvName }))];
+  const ids = list.map(p => (p && p.id) || (p && resolve ? resolve(p) : null)).filter(Boolean);
+  return [...new Set(ids)].sort();
+}
+const tsSameIds = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+
+// One-time-ish: make sure every active order carries appDrvIds (cheap; few active orders)
+async function tsSyncActiveOrders(resolve) {
+  const fs = admin.firestore();
+  const snap = await fs.collection("orders").where("status", "in", TS_ACTIVE_ORDER).get();
+  let fixed = 0;
+  for (const d of snap.docs) {
+    const ids = tsOrderDrvIds(d.data(), resolve);
+    if (!tsSameIds(ids, d.data().appDrvIds)) { await d.ref.update({ appDrvIds: ids }); fixed++; }
+  }
+  return fixed;
+}
+
 exports.timesheetLogin = onRequest({ cors: true }, async (req, res) => {
   if (req.method !== "POST") { res.status(405).json({ error: "method" }); return; }
   const typedId = String((req.body && req.body.employeeId) || "").trim();
@@ -1708,7 +1786,19 @@ exports.timesheetLogin = onRequest({ cors: true }, async (req, res) => {
     if (pin !== realPin) { await fail("badPin", 401); return; }
 
     await attemptsRef.delete().catch(() => {});
-    const token = await admin.auth().createCustomToken("drv_" + d.id, { drvId: d.id, employeeId: empKey });
+    // Tag this person's past records + active orders so the phone (and the rules) can find them by id
+    try {
+      const tagged = await tsBackfillOwner(d);
+      const fixed = await tsSyncActiveOrders(await tsRosterIndex());
+      if (tagged || fixed) console.log(`[timesheetLogin] ${d.id}: tagged ${tagged} record(s), synced ${fixed} order(s)`);
+    } catch (e) { console.error("[timesheetLogin] backfill (non-fatal)", e); }
+    const token = await admin.auth().createCustomToken("drv_" + d.id, {
+      v: TS_AUTH_VERSION,
+      drvId: d.id,                                            // owner id on records
+      employeeId: empKey,                                     // = shared-docs key (trimmed, lowercase)
+      key: typedId.toLowerCase().replace(/\s/g, ""),         // = employee.key (sessions / employees doc ids)
+      em: String(x.email || ""),                              // = employee.email (acknowledgments)
+    });
     res.json({ success: true, token, profile: tsProfile(d, typedId) });
   } catch (error) {
     console.error("[timesheetLogin]", error);
@@ -1740,6 +1830,33 @@ exports.crewRoster = onRequest({ cors: true }, async (req, res) => {
     console.error("[crewRoster]", error);
     res.status(500).json({ error: "server" });
   }
+});
+
+// ═══ OWNERSHIP STAMPS — tag records created without an owner id ═══
+// Covers entries made in dispatch (manual timesheet entries, approved expenses…)
+// so they still show up on the employee's phone.
+async function tsStamp(event) {
+  const snap = event.data; if (!snap) return;
+  const x = snap.data() || {};
+  if (x.drvId) return;
+  const resolve = await tsRosterIndex();
+  const id = resolve({ email: x.employeeEmail, phone: x.employeePhone, name: x.employeeName });
+  if (id) await snap.ref.update({ drvId: id });
+}
+exports.stampTimesheetOwner = onDocumentCreated("timesheets/{id}", tsStamp);
+exports.stampExpenseOwner = onDocumentCreated("expenses/{id}", tsStamp);
+exports.stampEmployeeDocOwner = onDocumentCreated("employee_documents/{id}", tsStamp);
+
+// Keep orders.appDrvIds = drivers who should see this order in the app right now
+exports.syncOrderDrivers = onDocumentWritten("orders/{id}", async (event) => {
+  const after = event.data && event.data.after;
+  if (!after || !after.exists) return;
+  const o = after.data();
+  let ids = tsOrderDrvIds(o, null);
+  const needsLookup = TS_ACTIVE_ORDER.includes(o.status) && o.pushToApp !== false &&
+    [o, ...(o.extraDrivers || [])].some(p => p && !p.drvId && (p.drvEmail || p.drvPhone || p.drvName));
+  if (needsLookup) ids = tsOrderDrvIds(o, await tsRosterIndex());
+  if (!tsSameIds(ids, o.appDrvIds)) await after.ref.update({ appDrvIds: ids });   // no-op when unchanged → no loop
 });
 
 // ═══ DAILY PICKUP REMINDER (runs every day at 7:00 AM ET) ═══
