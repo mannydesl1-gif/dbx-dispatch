@@ -2,32 +2,36 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
-    // Same split as the Firestore rules:
-    //  • STAFF = signed in to dispatch with an email + password.
-    //  • TIMESHEET PHONES = anonymous sign-in (anyone who opens the app —
-    //    or any outsider who knows how — can get one).
-    function signedIn()  { return request.auth != null; }
-    function isStaff()   { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
-    function sizeOk()    { return request.resource.size < 25 * 1024 * 1024; }   // 25 MB per file
+    // Same roles as the Firestore rules:
+    //  • STAFF    = dispatch login (email + password)
+    //  • EMPLOYEE = timesheet phone signed in through the server login (custom sign-in, v:2)
+    //  • anonymous phones (before login) get nothing here
+    function signedIn() { return request.auth != null; }
+    function isStaff()  { return signedIn() && request.auth.token.firebase.sign_in_provider == 'password'; }
+    function isEmp()    { return signedIn() && request.auth.token.firebase.sign_in_provider == 'custom'
+                                 && request.auth.token.v == 2 && request.auth.token.drvId is string; }
+    function sizeOk()   { return request.resource.size < 25 * 1024 * 1024; }   // 25 MB per file
 
-    // Timesheet phones upload their own documents (licence, void cheque, headshot).
-    // "get" (not "read") = they can fetch the file they just uploaded, but can't
-    // LIST the folder to browse other people's documents.
+    // Employees upload their own documents (licence, void cheque, headshot).
+    // "get" (not "read") = fetch a file they just uploaded, but no listing/browsing.
     match /employee_docs/{allPaths=**} {
-      allow get:    if signedIn();
-      allow create: if signedIn() && sizeOk();
+      allow get:    if isEmp();
+      allow create: if isEmp() && sizeOk();
     }
 
-    // Timesheet phones upload expense receipts, and delete one when an expense is withdrawn.
-    match /expenses/{allPaths=**} {
-      allow get:    if signedIn();
-      allow create: if signedIn() && sizeOk();
-      allow delete: if signedIn();
+    // Expense receipts live at expenses/<event>/<employee email>/<file>.
+    // Employees upload, and delete only receipts in their own email folder.
+    // (Any depth, in case an event name contains "/"; the email folder is always 2nd from the end.)
+    match /expenses/{rest=**} {
+      allow get:    if isEmp();
+      allow create: if isEmp() && sizeOk();
+      allow delete: if isEmp() && request.auth.token.em != ''
+                    && rest.split('/').size() >= 2
+                    && rest.split('/')[rest.split('/').size() - 2] == request.auth.token.em;
     }
 
     // Everything else — order attachments, BOLs, cert documents, quote attachments,
     // company docs, documents shared with drivers — dispatch staff only.
-    // (Phones open shared files through their download links, which don't need this.)
     match /{allPaths=**} {
       allow read, write: if isStaff();
     }
