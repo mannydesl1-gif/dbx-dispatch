@@ -1637,6 +1637,111 @@ exports.adminUsers = onRequest({ cors: true }, async (req, res) => {
   }
 });
 
+// ═══ TIMESHEET APP LOGIN — Employee ID + PIN checked on the SERVER ═══
+// The phone sends the ID + PIN here; this checks them against the drivers
+// collection (which phones will no longer need to download) and returns a
+// Firebase custom token so the phone is signed in AS THAT EMPLOYEE
+// (uid "drv_<driverDocId>", claim drvId). Firestore/Storage rules can then
+// tell employees apart. 5 wrong tries on one Employee ID = locked 15 minutes.
+const TS_LOGIN_MAX_FAILS = 5;
+const TS_LOGIN_LOCK_MS = 15 * 60 * 1000;
+const tsNorm = v => String(v || "").trim().toLowerCase();
+
+async function tsFindDriver(empKey) {
+  const snap = await admin.firestore().collection("drivers").get();
+  return snap.docs.find(d => tsNorm(d.data().employeeId) === empKey) || null;
+}
+
+// What the phone keeps about the signed-in person (never the PIN)
+function tsProfile(d, typedId) {
+  const x = d.data();
+  return {
+    name: x.name || typedId, phone: x.phone || "", email: x.email || "",
+    employeeId: typedId, drvId: d.id, payCfg: x.payCfg || null,
+    logRestricted: x.logRestricted === true, driverLog: x.driverLog === true,
+    isDriver: x.isDriver !== false, isEmployee: x.isEmployee === true,
+    tsBulkEntry: x.tsBulkEntry === true,
+  };
+}
+
+// Returns the decoded token of a phone signed in through timesheetLogin, else null
+async function tsVerifyEmployee(req) {
+  const h = req.get("Authorization") || "";
+  const tok = h.startsWith("Bearer ") ? h.slice(7) : "";
+  if (!tok) return null;
+  try { const dec = await admin.auth().verifyIdToken(tok); return dec.drvId ? dec : null; }
+  catch (e) { return null; }
+}
+
+exports.timesheetLogin = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== "POST") { res.status(405).json({ error: "method" }); return; }
+  const typedId = String((req.body && req.body.employeeId) || "").trim();
+  const pin = String((req.body && req.body.pin) || "").trim();
+  const empKey = tsNorm(typedId);
+  if (!empKey || !pin) { res.status(400).json({ error: "empty" }); return; }
+  const attemptsRef = admin.firestore().collection("ts_login_attempts")
+    .doc(empKey.replace(/[\/.#$\[\]]/g, "_").slice(0, 200));
+  try {
+    const now = Date.now();
+    const a = (await attemptsRef.get()).data() || {};
+    if (a.lockedUntil && a.lockedUntil > now) {
+      res.status(429).json({ error: "locked", minutes: Math.ceil((a.lockedUntil - now) / 60000) }); return;
+    }
+    // Count a failed try; lock the ID after TS_LOGIN_MAX_FAILS within the window
+    const fail = async (code, status) => {
+      const inWindow = a.firstFailAt && (now - a.firstFailAt) < TS_LOGIN_LOCK_MS;
+      const fails = inWindow ? (a.fails || 0) + 1 : 1;
+      if (fails >= TS_LOGIN_MAX_FAILS) {
+        await attemptsRef.set({ fails: 0, firstFailAt: null, lockedUntil: now + TS_LOGIN_LOCK_MS, lastFailAt: now }, { merge: true });
+        res.status(429).json({ error: "locked", minutes: Math.ceil(TS_LOGIN_LOCK_MS / 60000) }); return;
+      }
+      await attemptsRef.set({ fails, firstFailAt: inWindow ? a.firstFailAt : now, lastFailAt: now }, { merge: true });
+      res.status(status).json({ error: code, remaining: TS_LOGIN_MAX_FAILS - fails });
+    };
+
+    const d = await tsFindDriver(empKey);
+    if (!d) { await fail("notFound", 404); return; }
+    const x = d.data();
+    if (x.archived === true) { res.status(403).json({ error: "archived" }); return; }
+    const realPin = String(x.pin || "").trim();
+    if (!realPin) { res.status(403).json({ error: "noPin" }); return; }   // no PIN on file = no login
+    if (pin !== realPin) { await fail("badPin", 401); return; }
+
+    await attemptsRef.delete().catch(() => {});
+    const token = await admin.auth().createCustomToken("drv_" + d.id, { drvId: d.id, employeeId: empKey });
+    res.json({ success: true, token, profile: tsProfile(d, typedId) });
+  } catch (error) {
+    console.error("[timesheetLogin]", error);
+    const msg = String((error && error.message) || error);
+    // Most likely first-time cause: the function's service account can't sign tokens
+    const signBlob = /signBlob|iam\.serviceAccounts|Token Creator|iamcredentials|Service Account Credentials/i.test(msg);
+    res.status(500).json({ error: "server", detail: signBlob ? "signBlob" : "" });
+  }
+});
+
+// ═══ CREW ROSTER for supervisors (Crew Entry in the timesheet app) ═══
+// Names/contacts of active drivers + employees, never PINs. Only for a phone
+// signed in as someone whose record currently has tsBulkEntry = true.
+exports.crewRoster = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== "POST") { res.status(405).json({ error: "method" }); return; }
+  const me = await tsVerifyEmployee(req);
+  if (!me) { res.status(401).json({ error: "signin" }); return; }
+  try {
+    const meDoc = await admin.firestore().collection("drivers").doc(me.drvId).get();
+    const m = meDoc.exists ? meDoc.data() : null;
+    if (!m || m.archived === true || m.tsBulkEntry !== true) { res.status(403).json({ error: "notSupervisor" }); return; }
+    const snap = await admin.firestore().collection("drivers").get();
+    const people = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      .filter(p => p.archived !== true && !p.isSupplier && p.name)
+      .map(p => ({ id: p.id, name: p.name, phone: p.phone || "", email: p.email || "",
+                   isDriver: p.isDriver, isEmployee: p.isEmployee, isSupplier: false }));
+    res.json({ success: true, people });
+  } catch (error) {
+    console.error("[crewRoster]", error);
+    res.status(500).json({ error: "server" });
+  }
+});
+
 // ═══ DAILY PICKUP REMINDER (runs every day at 7:00 AM ET) ═══
 exports.dailyPickupReminder = onSchedule({
   schedule: "0 7 * * *",
