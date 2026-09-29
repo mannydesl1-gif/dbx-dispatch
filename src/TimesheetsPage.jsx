@@ -1099,10 +1099,12 @@ function CrewEntryModal({ events = [], eventDocs = [], selectedEvent, onClose, o
     setShowAll(false);
   }, [event]); // eslint-disable-line
 
-  // Everyone lands in exactly one tab: Employees = not a driver (Employee ticked with Driver
-  // unticked, or Driver unticked); Drivers = everyone else. (Same rule as the phone app.)
-  const isEmpCat = p => p.isDriver === false || (p.isEmployee === true && p.isDriver !== true);
-  const inCat = p => category === "employees" ? isEmpCat(p) : !isEmpCat(p);
+  // Drivers tab = Driver ticked (or nothing ticked — the default); Employees tab = Employee
+  // ticked or Driver unticked. Someone ticked as BOTH shows in both tabs; nobody is left out.
+  // (Same rule as the phone app.)
+  const isDrvCat = p => p.isDriver === true || (p.isDriver === undefined && p.isEmployee !== true);
+  const isEmpCat = p => p.isEmployee === true || p.isDriver === false;
+  const inCat = p => category === "employees" ? isEmpCat(p) : isDrvCat(p);
   const crewSet = new Set(evObj && Array.isArray(evObj.crewIds) ? evObj.crewIds : []);
   const roster = people.filter(inCat);
   const crewInCat = roster.filter(p => crewSet.has(p.id));
