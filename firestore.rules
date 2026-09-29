@@ -3,38 +3,78 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // ── Who is who ──────────────────────────────────────────────────────────
-    //  • STAFF = signed in to dispatch with an email + password.
-    //  • TIMESHEET PHONES = signed in anonymously. Any device that opens the
-    //    timesheet site gets one of these automatically, BEFORE the Employee
-    //    ID + PIN screen — and anyone on the internet can get one with the
-    //    public web config. So an anonymous token only proves "someone opened
-    //    the app", never "this is an employee".
-    function signedIn() { return request.auth != null; }
-    function isStaff()  { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
+    //  • STAFF     = dispatch login (email + password).
+    //  • EMPLOYEE  = timesheet phone signed in through the server login
+    //                (timesheetLogin → custom sign-in carrying drvId, key, em,
+    //                employeeId, v:2). drvId = their drivers-collection id.
+    //  • ANONYMOUS = timesheet phone before login. Can only read events.
+    function signedIn()     { return request.auth != null; }
+    function isStaff()      { return signedIn() && request.auth.token.firebase.sign_in_provider == 'password'; }
+    function isEmp()        { return signedIn() && request.auth.token.firebase.sign_in_provider == 'custom'
+                                     && request.auth.token.v == 2 && request.auth.token.drvId is string; }
+    function myId()         { return request.auth.token.drvId; }
+    // Crew Entry permission, read live from dispatch (turning it off works immediately)
+    function isSupervisor() { return isEmp() && get(/databases/$(database)/documents/drivers/$(myId())).data.tsBulkEntry == true; }
+    function ownsDoc()      { return resource.data.drvId == myId(); }
+    function ownsNew()      { return request.resource.data.drvId == myId(); }
 
-    // ── What the timesheet phone app needs (anonymous for now) ──────────────
-    // Still open to any signed-in device. Phase B (PIN check moved to a Cloud
-    // Function that signs each phone in AS that employee) will scope these to
-    // each person's own records.
-    match /timesheets/{doc}         { allow read, write: if signedIn(); }
-    match /sessions/{doc}           { allow read, write: if signedIn(); }
-    match /expenses/{doc}           { allow read, write: if signedIn(); }
-    match /employees/{doc}          { allow read, write: if signedIn(); }
-    match /employee_documents/{doc} { allow read, write: if signedIn(); }
-    match /acknowledgments/{doc}    { allow read, write: if signedIn(); }
-    match /orders/{doc}             { allow read, write: if signedIn(); }   // driver Orders tab reads + updates
-    match /drivers/{doc}            { allow read, write: if signedIn(); }   // login lookup (Phase B removes this)
+    // ── Employee records: each person only sees and changes their own ─────────
+    match /timesheets/{id} {
+      allow read:   if isStaff() || (isEmp() && ownsDoc()) || isSupervisor();   // supervisors: Crew Entry duplicate check
+      allow create: if isStaff() || (isEmp() && ownsNew()) || isSupervisor();   // supervisors: entries for their crew
+      allow update: if isStaff() || (isEmp() && ownsDoc() && ownsNew());
+      allow delete: if isStaff() || (isEmp() && ownsDoc());
+    }
+    match /expenses/{id} {
+      allow read:   if isStaff() || (isEmp() && ownsDoc());
+      allow create: if isStaff() || (isEmp() && ownsNew());
+      allow update: if isStaff() || (isEmp() && ownsDoc() && ownsNew());
+      allow delete: if isStaff() || (isEmp() && ownsDoc());
+    }
+    match /employee_documents/{id} {
+      allow read:   if isStaff() || (isEmp() && ownsDoc());
+      allow write:  if isStaff();
+    }
+    // Clock-in state + profile docs are keyed by the employee key (e.g. "e042")
+    match /sessions/{key}  { allow read, write: if isStaff() || (isEmp() && key == request.auth.token.key); }
+    match /employees/{key} { allow read, write: if isStaff() || (isEmp() && key == request.auth.token.key); }
+    // Safety acknowledgments are stored per event + email
+    match /acknowledgments/{id} {
+      allow read:           if isStaff() || (isEmp() && (resource == null || resource.data.employeeEmail == request.auth.token.em));
+      allow create, update: if isStaff() || (isEmp() && request.auth.token.em != '' && request.resource.data.employeeEmail == request.auth.token.em);
+      allow delete:         if isStaff();
+    }
+    // Company → driver documents: only the person they were shared with
+    match /driver_shared_docs/{id} {
+      allow read:  if isStaff() || (isEmp() && resource.data.employeeId == request.auth.token.employeeId);
+      allow write: if isStaff();
+    }
 
-    // Phones only READ these; only staff (dispatch) may change them.
-    match /events/{doc}             { allow read: if signedIn(); allow write: if isStaff(); }
-    match /trucks/{doc}             { allow read: if signedIn(); allow write: if isStaff(); }
-    match /trailers/{doc}           { allow read: if signedIn(); allow write: if isStaff(); }
-    match /company_docs/{doc}       { allow read: if signedIn(); allow write: if isStaff(); }
-    match /driver_shared_docs/{doc} { allow read: if signedIn(); allow write: if isStaff(); }
+    // ── Orders: a driver sees only orders currently pushed to them ────────────
+    // (appDrvIds is maintained by the server). On the phone they may only
+    // update status, notes and proof-of-delivery fields.
+    match /orders/{id} {
+      allow read:   if isStaff() || (isEmp() && myId() in resource.data.appDrvIds);
+      allow update: if isStaff() || (isEmp() && myId() in resource.data.appDrvIds
+                        && request.resource.data.diff(resource.data).affectedKeys()
+                             .hasOnly(['status', 'notes', 'podBy', 'podDate', 'podTime', 'podNote', 'pickStops', 'delStops'])
+                        && request.resource.data.status in ['assigned', 'in-transit', 'ready-to-bill']);
+      allow create, delete: if isStaff();
+    }
 
-    // ── Everything else — clients, quotes, settings, letters, IFTA, stickers,
-    // locations, maintenance, config… — dispatch staff only.
-    // (Previously ANY signed-in device, including anonymous ones.)
+    // ── Roster: an employee can read only their own record (never others' PINs)
+    match /drivers/{id} {
+      allow read:  if isStaff() || (isEmp() && id == myId());
+      allow write: if isStaff();
+    }
+
+    // ── Shared reference data ─────────────────────────────────────────────────
+    match /events/{id}       { allow read: if signedIn();            allow write: if isStaff(); }   // needed before login
+    match /trucks/{id}       { allow read: if isStaff() || isEmp();  allow write: if isStaff(); }
+    match /trailers/{id}     { allow read: if isStaff() || isEmp();  allow write: if isStaff(); }
+    match /company_docs/{id} { allow read: if isStaff() || isEmp();  allow write: if isStaff(); }
+
+    // ── Everything else (clients, quotes, settings, letters, IFTA, …): dispatch staff only
     match /{document=**} {
       allow read, write: if isStaff();
     }
