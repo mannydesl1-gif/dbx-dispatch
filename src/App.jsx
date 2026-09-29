@@ -97,6 +97,8 @@ async function backupAllData() {
     "iftaFuelCards","iftaRates","iftaReports","iftaUploads",
     // Equipment maintenance/repairs
     "maintenance",
+    // Timesheet app: uploaded-document records, safety acknowledgments, clock-in sessions
+    "employee_documents","acknowledgments","sessions",
   ];
   const backup = {
     _meta: {
