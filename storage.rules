@@ -1,0 +1,35 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Same split as the Firestore rules:
+    //  • STAFF = signed in to dispatch with an email + password.
+    //  • TIMESHEET PHONES = anonymous sign-in (anyone who opens the app —
+    //    or any outsider who knows how — can get one).
+    function signedIn()  { return request.auth != null; }
+    function isStaff()   { return signedIn() && request.auth.token.firebase.sign_in_provider != 'anonymous'; }
+    function sizeOk()    { return request.resource.size < 25 * 1024 * 1024; }   // 25 MB per file
+
+    // Timesheet phones upload their own documents (licence, void cheque, headshot).
+    // "get" (not "read") = they can fetch the file they just uploaded, but can't
+    // LIST the folder to browse other people's documents.
+    match /employee_docs/{allPaths=**} {
+      allow get:    if signedIn();
+      allow create: if signedIn() && sizeOk();
+    }
+
+    // Timesheet phones upload expense receipts, and delete one when an expense is withdrawn.
+    match /expenses/{allPaths=**} {
+      allow get:    if signedIn();
+      allow create: if signedIn() && sizeOk();
+      allow delete: if signedIn();
+    }
+
+    // Everything else — order attachments, BOLs, cert documents, quote attachments,
+    // company docs, documents shared with drivers — dispatch staff only.
+    // (Phones open shared files through their download links, which don't need this.)
+    match /{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+  }
+}
