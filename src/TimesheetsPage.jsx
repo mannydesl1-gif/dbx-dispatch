@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { db, storage } from "./firebase.js";
+import { db, storage, auth } from "./firebase.js";
 import { collection, query, where, getDocs, orderBy, updateDoc, addDoc, deleteDoc, doc, setDoc } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 
@@ -1028,6 +1028,282 @@ function EmpDocUpload({ empId, empEmail, event, onSaved }) {
   );
 }
 
+// ─── CREW ENTRY (bulk) ───────────────────────────────────────────────────────
+// Same entries as the timesheet app's Crew Entry, from dispatch: pick an event,
+// a date or date range, Drivers or Employees, the people, one day type + add-ons.
+// Each person gets a normal timesheet entry (same shape as a self-entered one),
+// tagged drvId / enteredBy / onBehalf / batchId. Rules match the phone:
+// no future dates, one day type per person per date, per diem + trips stack,
+// anyone who already has that entry is skipped. "Recent batches" can delete a
+// whole batch (phone supervisor batches too).
+const CREW_PRIMARY = ["hours", "working-day", "non-working", "travel-day"];
+const CREW_TYPES = [
+  ["hours", "Hours", ev => !ev || ev.allowHours !== false],
+  ["working-day", "Working Day", ev => !!(ev && ev.allowDaily)],
+  ["non-working", "Non-Working", ev => !!(ev && ev.allowNwDays)],
+  ["travel-day", "Travel Day", ev => !!(ev && ev.allowTravelDays)],
+  ["per-diem", "Per Diem", ev => !!(ev && ev.allowPerDiem)],
+  ["trip", "Trips", ev => !!(ev && ev.allowTrips)],
+];
+const crewTypeLabel = ty => (CREW_TYPES.find(t => t[0] === ty) || [0, ty])[1];
+const crewDays = (from, to) => {
+  const out = []; if (!from || !to || from > to) return out;
+  for (let d = new Date(from + "T12:00:00"); d <= new Date(to + "T12:00:00"); d.setDate(d.getDate() + 1)) out.push(d.toISOString().slice(0, 10));
+  return out;
+};
+
+function CrewEntryModal({ events = [], eventDocs = [], selectedEvent, onClose, onDone }) {
+  const todayStr = today();
+  const [tab, setTab] = useState("new");                 // new | batches
+  const [event, setEvent] = useState(selectedEvent && selectedEvent !== "__all__" ? selectedEvent : "");
+  const [subEvent, setSubEvent] = useState("");
+  const [dateFrom, setDateFrom] = useState(todayStr);
+  const [dateTo, setDateTo] = useState(todayStr);
+  const [category, setCategory] = useState("drivers");
+  const [people, setPeople] = useState([]);
+  const [loadingPeople, setLoadingPeople] = useState(true);
+  const [selected, setSelected] = useState({});
+  const [search, setSearch] = useState("");
+  const [showAll, setShowAll] = useState(false);
+  const [primaryType, setPrimaryType] = useState("");
+  const [addPerDiem, setAddPerDiem] = useState(false);
+  const [addTrip, setAddTrip] = useState(false);
+  const [startTime, setStartTime] = useState("08:00");
+  const [endTime, setEndTime] = useState("17:00");
+  const [tripCount, setTripCount] = useState("1");
+  const [notes, setNotes] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState(null);            // { created, skipped, failed, batchId }
+  const [batches, setBatches] = useState(null);
+
+  const evObj = eventDocs.find(e => e.name === event) || null;
+  const subOptions = evObj && Array.isArray(evObj.subEvents) ? evObj.subEvents.filter(s => !(evObj.archivedSubEvents || []).includes(s)) : [];
+  const allowed = CREW_TYPES.filter(t => t[2](evObj));
+  const primaryAllowed = allowed.filter(t => CREW_PRIMARY.includes(t[0]));
+  const perDiemOk = allowed.some(t => t[0] === "per-diem");
+  const tripOk = allowed.some(t => t[0] === "trip");
+
+  useEffect(() => { (async () => {
+    try {
+      const snap = await getDocs(collection(db, "drivers"));
+      setPeople(snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(p => p.archived !== true && !p.isSupplier && p.name)
+        .sort((a, b) => a.name.localeCompare(b.name)));
+    } catch (e) { console.error(e); }
+    setLoadingPeople(false);
+  })(); }, []);
+  // Drop choices the newly picked event doesn't allow
+  useEffect(() => {
+    if (primaryType && !primaryAllowed.some(t => t[0] === primaryType)) setPrimaryType("");
+    if (addPerDiem && !perDiemOk) setAddPerDiem(false);
+    if (addTrip && !tripOk) setAddTrip(false);
+    setShowAll(false);
+  }, [event]); // eslint-disable-line
+
+  const inCat = p => category === "drivers" ? p.isDriver !== false : (p.isEmployee === true && p.isDriver !== true);
+  const crewSet = new Set(evObj && Array.isArray(evObj.crewIds) ? evObj.crewIds : []);
+  const roster = people.filter(inCat);
+  const crewInCat = roster.filter(p => crewSet.has(p.id));
+  const crewOnly = crewInCat.length > 0 && !showAll;
+  const pool = crewOnly ? crewInCat : roster;
+  const q = search.trim().toLowerCase();
+  const shown = pool.filter(p => !q || p.name.toLowerCase().includes(q));
+  const chosen = roster.filter(p => selected[p.id]);
+  const allShown = shown.length > 0 && shown.every(p => selected[p.id]);
+  const days = crewDays(dateFrom, dateTo);
+  const toCreate = [primaryType, addPerDiem && "per-diem", addTrip && "trip"].filter(Boolean);
+
+  const submit = async () => {
+    if (!event) return alert("Pick an event.");
+    if (!dateFrom || !dateTo) return alert("Pick the date(s).");
+    if (dateTo < dateFrom) return alert("The end date is before the start date.");
+    if (dateTo > todayStr) return alert("You can't log entries for a future date.");
+    if (days.length > 31) return alert("Please log at most 31 days at a time.");
+    if (!chosen.length) return alert("Select at least one person.");
+    if (!toCreate.length) return alert("Pick a day type or an add-on.");
+    if (primaryType === "hours" && (!startTime || !endTime)) return alert("Enter a start and end time.");
+    if (evObj && evObj.locked && !window.confirm(`"${event}" is locked. Add these entries anyway?`)) return;
+    const what = toCreate.map(crewTypeLabel).join(" + ");
+    const when = days.length === 1 ? days[0] : `${days[0]} → ${days[days.length - 1]} (${days.length} days)`;
+    if (!window.confirm(`Log "${what}" for ${chosen.length} person(s)\n${when} — ${event}${subEvent ? " / " + subEvent : ""}?\n\nAnyone who already has a conflicting entry is skipped.`)) return;
+
+    setBusy(true); setResult(null);
+    const batchId = `bulk_${Date.now()}`;
+    const enteredBy = (auth.currentUser && auth.currentUser.email) || "dispatch";
+    let created = 0, skipped = 0, failed = 0;
+    try {
+      for (const day of days) {
+        // What each person already has that day on this event (by id, email or name — older entries may lack the id)
+        const snap = await getDocs(query(collection(db, "timesheets"), where("date", "==", day), where("event", "==", event)));
+        const have = {};
+        const add = (k, ty) => { if (k) (have[k] || (have[k] = new Set())).add(ty); };
+        snap.docs.forEach(d => { const x = d.data();
+          add(x.drvId && "id:" + x.drvId, x.dayType); add(x.employeeEmail && "em:" + String(x.employeeEmail).toLowerCase(), x.dayType); add(x.employeeName && "nm:" + String(x.employeeName).toLowerCase(), x.dayType); });
+        for (const p of chosen) {
+          const mine = new Set([...(have["id:" + p.id] || []), ...(have["em:" + String(p.email || "").toLowerCase()] || []), ...(p.name ? have["nm:" + p.name.toLowerCase()] || [] : [])]);
+          for (const ty of toCreate) {
+            const clash = CREW_PRIMARY.includes(ty) ? CREW_PRIMARY.some(t => mine.has(t)) : mine.has(ty);
+            if (clash) { skipped++; continue; }
+            const rec = {
+              drvId: p.id, employeeName: p.name, employeePhone: p.phone || "", employeeEmail: p.email || "",
+              event, subEvent: subEvent || null, date: day,
+              startTime: ty === "hours" ? startTime : "00:00", endTime: ty === "hours" ? endTime : "00:00",
+              hours: ty === "hours" ? calcHours(startTime, endTime) : 0,
+              notes: notes.trim() || (ty === "hours" ? "" : ty === "trip" ? `${parseInt(tripCount) || 1} trip(s)` : crewTypeLabel(ty)),
+              dayType: ty, submittedAt: new Date().toISOString(),
+              enteredBy, onBehalf: true, batchId, source: "dispatch-crew",
+            };
+            if (ty === "working-day") rec.numDays = 1;
+            if (ty === "per-diem") rec.numPerDiem = 1;
+            if (ty === "travel-day") rec.numTravelDays = 1;
+            if (ty === "trip") rec.numTrips = parseInt(tripCount) || 1;
+            try { await addDoc(collection(db, "timesheets"), rec); created++; mine.add(ty); }
+            catch (e) { console.error(e); failed++; }
+          }
+        }
+      }
+    } catch (e) { console.error(e); alert("Something went wrong: " + e.message); }
+    setResult({ created, skipped, failed, batchId });
+    setBusy(false);
+    if (created) { setSelected({}); onDone && onDone(); }
+  };
+
+  const loadBatches = async () => {
+    setBatches(null);
+    try {
+      const snap = await getDocs(query(collection(db, "timesheets"), where("batchId", ">=", "bulk_"), where("batchId", "<=", "bulk_\uf8ff")));
+      const g = {};
+      snap.docs.forEach(d => { const x = d.data(); const b = g[x.batchId] || (g[x.batchId] = { id: x.batchId, ids: [], people: new Set(), dates: new Set(), types: new Set(), event: x.event, by: x.enteredBy || "" });
+        b.ids.push(d.id); b.people.add(x.employeeName); b.dates.add(x.date); b.types.add(x.dayType); });
+      setBatches(Object.values(g).sort((a, b) => b.id.localeCompare(a.id)).slice(0, 20));
+    } catch (e) { console.error(e); setBatches([]); alert("Couldn't load batches: " + e.message); }
+  };
+  useEffect(() => { if (tab === "batches") loadBatches(); }, [tab]); // eslint-disable-line
+
+  const deleteBatch = async b => {
+    const dates = [...b.dates].sort();
+    if (!window.confirm(`Delete this whole batch?\n\n${b.ids.length} entr${b.ids.length === 1 ? "y" : "ies"} · ${b.people.size} people · ${b.event}\n${dates[0]}${dates.length > 1 ? " → " + dates[dates.length - 1] : ""} · ${[...b.types].map(crewTypeLabel).join(", ")}\n\nThis can't be undone.`)) return;
+    setBusy(true);
+    let n = 0;
+    for (const id of b.ids) { try { await deleteDoc(doc(db, "timesheets", id)); n++; } catch (e) { console.error(e); } }
+    setBusy(false);
+    alert(`Deleted ${n} of ${b.ids.length} entries.`);
+    loadBatches(); onDone && onDone();
+  };
+
+  const bS = { padding: "8px 14px", borderRadius: 7, border: `1px solid ${T.border}`, background: "transparent", color: T.muted, fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" };
+  const chip = on => ({ ...bS, padding: "7px 12px", ...(on ? { border: `1px solid ${T.green}`, color: T.green, background: T.greenDim } : {}) });
+  const sec = { fontSize: 10, fontWeight: 700, letterSpacing: "0.06em", textTransform: "uppercase", color: T.muted, margin: "14px 0 6px" };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, width: "100%", maxWidth: 680, maxHeight: "92vh", overflow: "auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 20px", borderBottom: `1px solid ${T.border}` }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, color: T.text, marginRight: 8 }}>👥 Crew Entry</div>
+            <button style={chip(tab === "new")} onClick={() => setTab("new")}>New entries</button>
+            <button style={chip(tab === "batches")} onClick={() => setTab("batches")}>Recent batches</button>
+          </div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: T.muted, cursor: "pointer", fontSize: 20, lineHeight: 1 }}>×</button>
+        </div>
+
+        {tab === "batches" ? (
+          <div style={{ padding: 20 }}>
+            <div style={{ fontSize: 12, color: T.muted, marginBottom: 10 }}>The last 20 crew batches, from dispatch and from supervisors' phones. Deleting a batch removes every entry it created.</div>
+            {batches === null ? <div style={{ fontSize: 12, color: T.dim }}>Loading…</div>
+              : batches.length === 0 ? <div style={{ fontSize: 12, color: T.dim }}>No crew batches yet.</div>
+              : batches.map(b => { const dates = [...b.dates].sort(); return (
+                <div key={b.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, padding: "10px 12px", border: `1px solid ${T.border}`, borderRadius: 8, marginBottom: 8 }}>
+                  <div style={{ fontSize: 12, color: T.text, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700 }}>{b.event} · {[...b.types].map(crewTypeLabel).join(" + ")}</div>
+                    <div style={{ color: T.muted, marginTop: 2 }}>{fd(dates[0])}{dates.length > 1 ? " → " + fd(dates[dates.length - 1]) : ""} · {b.people.size} people · {b.ids.length} entries{b.by ? " · by " + b.by : ""}</div>
+                    <div style={{ color: T.dim, marginTop: 2, fontSize: 11 }}>Entered {new Date(parseInt(b.id.slice(5)) || 0).toLocaleString("en-CA", { dateStyle: "medium", timeStyle: "short" })}</div>
+                  </div>
+                  <button disabled={busy} onClick={() => deleteBatch(b)} style={{ ...bS, color: T.red, borderColor: T.red, whiteSpace: "nowrap" }}>Delete batch</button>
+                </div>); })}
+          </div>
+        ) : (
+          <div style={{ padding: 20 }}>
+            <div style={{ display: "grid", gridTemplateColumns: subOptions.length ? "2fr 1fr" : "1fr", gap: 10 }}>
+              <div><label style={lbl}>Event *</label>
+                <select style={inp} value={event} onChange={e => { setEvent(e.target.value); setSubEvent(""); setSelected({}); setResult(null); }}>
+                  <option value="">— Select —</option>
+                  {events.map(name => { const d = eventDocs.find(e => e.name === name); return <option key={name} value={name}>{name}{d && d.locked ? " 🔒" : ""}</option>; })}
+                </select></div>
+              {subOptions.length > 0 && <div><label style={lbl}>Sub-event</label>
+                <select style={inp} value={subEvent} onChange={e => setSubEvent(e.target.value)}>
+                  <option value="">— None —</option>{subOptions.map(s => <option key={s} value={s}>{s}</option>)}
+                </select></div>}
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+              <div><label style={lbl}>From *</label><input type="date" style={inp} value={dateFrom} max={todayStr} onChange={e => { const v = e.target.value; setDateFrom(v); if (!dateTo || dateTo < v) setDateTo(v); }} /></div>
+              <div><label style={lbl}>To *</label><input type="date" style={inp} value={dateTo} max={todayStr} min={dateFrom} onChange={e => setDateTo(e.target.value)} /></div>
+            </div>
+            {days.length > 1 && <div style={{ fontSize: 11, color: T.muted, marginTop: 4 }}>{days.length} days — one entry per person per day.</div>}
+
+            <div style={sec}>Category</div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button style={{ ...chip(category === "drivers"), flex: 1 }} onClick={() => { setCategory("drivers"); setSelected({}); setSearch(""); setShowAll(false); }}>🚚 Drivers</button>
+              <button style={{ ...chip(category === "employees"), flex: 1 }} onClick={() => { setCategory("employees"); setSelected({}); setSearch(""); setShowAll(false); }}>👷 Employees</button>
+            </div>
+
+            <div style={{ ...sec, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>Who {chosen.length > 0 && <span style={{ color: T.green }}>· {chosen.length} selected</span>}{crewOnly && <span style={{ color: T.dim, textTransform: "none", letterSpacing: 0, fontWeight: 400 }}> — event crew ({crewInCat.length})</span>}</span>
+              {shown.length > 0 && <button onClick={() => setSelected(s => { const n = { ...s }; shown.forEach(p => { if (allShown) delete n[p.id]; else n[p.id] = true; }); return n; })}
+                style={{ background: "none", border: "none", color: T.green, fontSize: 11, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", textTransform: "none", letterSpacing: 0 }}>{allShown ? "Clear shown" : "Select shown"}</button>}
+            </div>
+            <input style={{ ...inp, marginBottom: 6 }} value={search} onChange={e => setSearch(e.target.value)} placeholder={crewOnly ? `Search event crew (${crewInCat.length})…` : "Search a name…"} />
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 2, maxHeight: 220, overflowY: "auto", border: `1px solid ${T.border}`, borderRadius: 7, padding: 6 }}>
+              {loadingPeople ? <div style={{ fontSize: 12, color: T.dim, padding: 6 }}>Loading…</div>
+                : shown.length === 0 ? <div style={{ fontSize: 12, color: T.dim, padding: 6 }}>No match.</div>
+                : shown.map(p => (
+                  <label key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, padding: "5px 6px", borderRadius: 5, cursor: "pointer", background: selected[p.id] ? T.greenDim : "transparent" }}>
+                    <input type="checkbox" checked={!!selected[p.id]} style={{ accentColor: T.green }}
+                      onChange={e => { const on = e.target.checked; setSelected(s => { const n = { ...s }; if (on) n[p.id] = true; else delete n[p.id]; return n; }); }} />
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
+                    {!crewOnly && crewSet.has(p.id) && <span style={{ marginLeft: "auto", fontSize: 9, color: T.green, fontWeight: 700 }}>★ crew</span>}
+                  </label>))}
+            </div>
+            {crewInCat.length > 0 && <button onClick={() => setShowAll(v => !v)} style={{ background: "none", border: "none", color: T.muted, fontSize: 11, fontWeight: 600, cursor: "pointer", fontFamily: "inherit", padding: "4px 0" }}>
+              {showAll ? "← Event crew only" : "Someone else? Show everyone"}</button>}
+
+            {event && <>
+              {primaryAllowed.length > 0 && <><div style={sec}>Day type (one)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {primaryAllowed.map(t => <button key={t[0]} style={chip(primaryType === t[0])} onClick={() => setPrimaryType(primaryType === t[0] ? "" : t[0])}>{t[1]}</button>)}
+                </div></>}
+              {primaryType === "hours" && <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr auto", gap: 10, marginTop: 10, alignItems: "end" }}>
+                <div><label style={lbl}>Start</label><input type="time" style={inp} value={startTime} onChange={e => setStartTime(e.target.value)} /></div>
+                <div><label style={lbl}>End</label><input type="time" style={inp} value={endTime} onChange={e => setEndTime(e.target.value)} /></div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: T.green, paddingBottom: 10 }}>{fh(calcHours(startTime, endTime))}</div>
+              </div>}
+              {(perDiemOk || tripOk) && <><div style={sec}>Add-ons (stackable)</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                  {perDiemOk && <button style={chip(addPerDiem)} onClick={() => setAddPerDiem(v => !v)}>{addPerDiem ? "✓ " : ""}Per Diem</button>}
+                  {tripOk && <button style={chip(addTrip)} onClick={() => setAddTrip(v => !v)}>{addTrip ? "✓ " : ""}Trips</button>}
+                  {addTrip && <input type="number" min="1" style={{ ...inp, width: 90 }} value={tripCount} onChange={e => setTripCount(e.target.value)} title="Trips per person per day" />}
+                </div></>}
+              <div style={{ marginTop: 10 }}><label style={lbl}>Notes (optional — applies to everyone)</label>
+                <input style={inp} value={notes} onChange={e => setNotes(e.target.value)} /></div>
+            </>}
+
+            {result && <div style={{ marginTop: 14, padding: "10px 12px", borderRadius: 8, fontSize: 12, background: result.failed ? T.redDim : T.greenDim, border: `1px solid ${result.failed ? T.red : T.green}`, color: T.text }}>
+              ✓ Created {result.created} · Skipped {result.skipped}{result.failed ? ` · Failed ${result.failed}` : ""}
+              {result.skipped > 0 && <div style={{ color: T.muted, marginTop: 3 }}>Skipped = that person already had a conflicting entry that day.</div>}
+            </div>}
+
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 16 }}>
+              <button style={bS} onClick={onClose} disabled={busy}>Close</button>
+              <button style={{ ...bS, background: T.greenDim, border: `1px solid ${T.green}`, color: T.green, opacity: busy ? 0.6 : 1 }} disabled={busy} onClick={submit}>
+                {busy ? "Saving…" : `Log for ${chosen.length} person(s)${days.length > 1 ? ` × ${days.length} days` : ""}`}</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function TimesheetsPage() {
   const [selectedEvent, setSelectedEvent] = useState("__all__");
   const [events, setEvents] = useState([]);
@@ -1049,6 +1325,7 @@ export default function TimesheetsPage() {
   const [editVendorEntry, setEditVendorEntry] = useState(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [showVendorModal, setShowVendorModal] = useState(false);
+  const [showCrewModal, setShowCrewModal] = useState(false);
   const [sendingRecap, setSendingRecap] = useState(null);
   const [showRecapModal, setShowRecapModal] = useState(false);
   const [recapEmp, setRecapEmp] = useState(null);
@@ -1976,6 +2253,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
           </div>
         </div>
       </div>}
+      {showCrewModal && <CrewEntryModal events={events} eventDocs={eventDocs} selectedEvent={selectedEvent} onClose={()=>setShowCrewModal(false)} onDone={loadData}/>}
       {showAddModal && <EntryModal events={events} eventDocs={eventDocs} employees={employees} selectedEvent={selectedEvent} allEntries={entries} onClose={()=>setShowAddModal(false)} onSave={handleEntrySaved}/>}
 
       {/* Header */}
@@ -1986,6 +2264,7 @@ Le paiement pour cet événement est actuellement en cours de traitement. Bien q
         </div>
         <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
           <button style={bG} onClick={()=>setShowAddModal(true)}><Ic n="plus" s={13}/> Add Entry</button>
+          <button style={bG} onClick={()=>setShowCrewModal(true)}>👥 Crew Entry</button>
           <button style={{...bG,background:"rgba(139,92,246,0.15)",border:"1px solid #8b5cf6",color:"#8b5cf6"}} onClick={()=>setShowVendorModal(true)}><Ic n="plus" s={13}/> Vendor Charge</button>
           <button style={bS} onClick={loadData} disabled={loading}><Ic n="refresh" s={13}/> Refresh</button>
           <button style={bS} onClick={exportCSV} disabled={!entries.length}><Ic n="download" s={13}/> Hours CSV</button>
