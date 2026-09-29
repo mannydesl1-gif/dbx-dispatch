@@ -36,6 +36,7 @@ export const CLOUD_FUNCTIONS = {
   sendInvoiceEmail:     "https://sendinvoiceemail-lmhvg7gefa-uc.a.run.app",
   downloadBolPdf:       "https://downloadbolpdf-lmhvg7gefa-uc.a.run.app",
   sendRecapEmail:       "https://sendrecapemail-lmhvg7gefa-uc.a.run.app",
+  adminUsers:           "https://adminusers-lmhvg7gefa-uc.a.run.app",
 };
 
 export const BOL_COMPANY_LABEL = "Diamond Back Express Inc.";

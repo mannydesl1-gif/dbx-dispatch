@@ -16,6 +16,7 @@ const app = initializeApp(firebaseConfig);
 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 export const db = initializeFirestore(app, {
   experimentalForceLongPolling: isSafari,
+  ignoreUndefinedProperties: true,
 });
 export const storage = getStorage(app);
 export const auth = getAuth(app);

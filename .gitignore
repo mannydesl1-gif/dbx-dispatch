@@ -3,3 +3,8 @@ dist/
 .firebase/
 .DS_Store
 *.log
+
+# local timestamped backups (Git history replaces these)
+src/backup/
+src/backups/
+functions/index_backup_*

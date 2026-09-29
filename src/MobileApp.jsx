@@ -80,7 +80,7 @@ const uid = () => Math.random().toString(36).slice(2,10);
 // ════════════════════════════════════════════════════════════════
 //  ORDERS TAB
 // ════════════════════════════════════════════════════════════════
-function OrdersTab({ db, savOrd }) {
+function OrdersTab({ db, savOrd, hidePricing }) {
   const [view, setView]       = useState("list");
   const [search, setSearch]   = useState("");
   const [selOrder, setSelOrder] = useState(null);
@@ -132,7 +132,7 @@ function OrdersTab({ db, savOrd }) {
     return <OrderForm db={db} order={view==="edit"?selOrder:null} customBol={view==="new"?customBol:null} savOrd={savOrd} onBack={()=>{ if(view==="edit"){setView("detail");}else{setView("list");} }} onSaved={o=>{ setSelOrder(o); setView("detail"); }}/>;
 
   if (view === "detail" && selOrder)
-    return <OrderDetail order={(db.orders||[]).find(x=>x.id===selOrder.id)||selOrder} db={db} savOrd={savOrd} onBack={()=>setView("list")} onEdit={()=>setView("edit")} onStatusChange={o=>{setSelOrder(o);}}/>;
+    return <OrderDetail order={(db.orders||[]).find(x=>x.id===selOrder.id)||selOrder} db={db} savOrd={savOrd} onBack={()=>setView("list")} onEdit={()=>setView("edit")} onStatusChange={o=>{setSelOrder(o);}} hidePricing={hidePricing}/>;
 
   return (
     <div style={{ padding:16 }}>
@@ -223,7 +223,7 @@ function OrdersTab({ db, savOrd }) {
 }
 
 // ── Order Detail (mobile) ──
-function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusChange }) {
+function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusChange, hidePricing }) {
   const [o, setO] = useState(initOrder);
   const [updatingStatus, setUpdatingStatus] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -252,7 +252,7 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
   const advanceStatus = async () => {
     if(!nextStatus) return;
     // Require pricing before ready-to-bill
-    if(nextStatus==="ready-to-bill" && !(parseFloat(o.price?.base)>0)) {
+    if(nextStatus==="ready-to-bill" && !hidePricing && !(parseFloat(o.price?.base)>0)) {
       alert("Please add pricing (Base Price) before marking as Ready to Bill."); return;
     }
     // Warn if PO required but missing
@@ -369,7 +369,7 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
       </div>}
 
       {/* Pricing card */}
-      <div style={{...card,marginBottom:12}}>
+      {!hidePricing && <div style={{...card,marginBottom:12}}>
         <div style={{fontSize:12,fontWeight:700,color:T.muted,textTransform:"uppercase",marginBottom:10}}>Pricing</div>
         {fullPricingTotal>0 && <div style={{marginBottom:12,padding:"10px 12px",background:"rgba(34,197,94,0.08)",border:`1px solid ${T.green}`,borderRadius:8}}>
           <div style={{fontSize:11,color:T.muted,marginBottom:2}}>Price on file{(_orderOther>0||_stopSurcharges>0)?" (incl. accessorials/surcharges)":""}</div>
@@ -404,7 +404,7 @@ function OrderDetail({ order: initOrder, db, savOrd, onBack, onEdit, onStatusCha
         {baseAmt>0 && fuelAmt===0 && <div style={{fontSize:13,fontWeight:700,color:T.green}}>Total: {sym}{baseAmt.toFixed(2)} {o.price?.cur||"CAD"}</div>}
         <button onClick={()=>saveChanges()} disabled={saving}
           style={{...btn(T.red),marginTop:8,borderRadius:8,padding:"10px",fontSize:13}}>{saving?"Saving...":"Save Pricing"}</button>
-      </div>
+      </div>}
 
       {/* POD section */}
       <div style={{...card,marginBottom:12}}>
@@ -1077,7 +1077,7 @@ function QuotesTab({ db }) {
   </div>;
 }
 
-export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }) {
+export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile, hidePricing = false }) {
 
   const [tab, setTab] = useState("orders");
   const [db, setDb] = useState(dbProp||{orders:[],clients:[],locations:[],trucks:[],trailers:[],events:[]});
@@ -1131,7 +1131,7 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
     { id:"clients",   l:"Clients",   icon:"clients"   },
     { id:"equipment", l:"Equipment", icon:"equipment" },
     { id:"docs",      l:"Docs",      icon:"docs"      },
-  ];
+  ].filter(t => !(hidePricing && t.id==="quotes"));
 
   return (
     <div style={{ display:"flex", flexDirection:"column", height:"100vh", background:T.bg, color:T.text, fontFamily:"'IBM Plex Sans',system-ui,sans-serif", overflow:"hidden", paddingTop:"env(safe-area-inset-top)" }}>
@@ -1163,8 +1163,8 @@ export default function MobileApp({ db: dbProp, savOrd, saveColl, onExitMobile }
 
       {/* Content */}
       {!loadingData && <div style={{ flex:1, overflowY:"auto", overflowX:"hidden", paddingBottom:"calc(env(safe-area-inset-bottom, 0px) + 70px)" }}>
-        {tab==="orders"    && <OrdersTab    db={db} savOrd={savOrd}/>}
-        {tab==="quotes"    && <QuotesTab    db={db}/>}
+        {tab==="orders"    && <OrdersTab    db={db} savOrd={savOrd} hidePricing={hidePricing}/>}
+        {tab==="quotes"    && !hidePricing && <QuotesTab    db={db}/>}
         {tab==="clients"   && <ClientsTab   db={db} saveColl={saveColl}/>}
         {tab==="equipment" && <EquipmentTab db={db}/>}
         {tab==="docs"      && <DocsTab/>}

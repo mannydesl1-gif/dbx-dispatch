@@ -493,7 +493,7 @@ async function generateBolPdf(order, client = null, includePricing = false) {
       // address may contain real newlines — expand them
       const addrExpanded = (s.addr || "—").split("\n").flatMap(seg => wrapLines(seg, cardW - 16, helvetica, 9));
       const noteLines = (s.notes && String(s.notes).trim())
-        ? wrapLines(String(s.notes), cardW - 24, helvetica, 8) : [];
+        ? wrapLines(String(s.notes), cardW - 24 - helveticaBold.widthOfTextAtSize("Notes:  ", 7), helvetica, 8) : [];
       const items = stopItemsList(s, isFirstPick);
       let h = 14 /*label*/ ;
       if (s.co) h += 14;
@@ -524,9 +524,11 @@ async function generateBolPdf(order, client = null, includePricing = false) {
       if (meas.noteLines.length) {
         const nH = meas.noteLines.length * 11 + 8;
         page.drawRectangle({ x: bx + 10, y: ly - nH + 6, width: cardW - 20, height: nH, color: rgb(1.0, 0.984, 0.922), borderColor: rgb(0.99, 0.9, 0.55), borderWidth: 0.8 });
-        page.drawText("Notes:", { x: bx + 14, y: ly - 3, size: 7, font: helveticaBold, color: rgb(0.71, 0.33, 0.0) }); ly -= 12;
-        for (const ln of meas.noteLines) { page.drawText(ln, { x: bx + 40, y: ly + 1, size: 8, font: helvetica, color: rgb(0.55, 0.33, 0.05) }); ly -= 11; }
-        ly -= 4;
+        const nBaseY = ly - 3;
+        const nLabelW = helveticaBold.widthOfTextAtSize("Notes:  ", 7);
+        page.drawText("Notes:", { x: bx + 14, y: nBaseY, size: 7, font: helveticaBold, color: rgb(0.71, 0.33, 0.0) });
+        meas.noteLines.forEach((ln, i) => { page.drawText(ln, { x: bx + 14 + nLabelW, y: nBaseY - i * 11, size: 8, font: helvetica, color: rgb(0.55, 0.33, 0.05) }); });
+        ly -= (nH + 6);
       }
       if (meas.items.length) {
         ly -= 4; // gap between contact/notes and the items table
@@ -1261,8 +1263,8 @@ async function generateInvoicePdf(order, pricing, isBolSummary = false, client =
 
 // ═══ BUILD BOL HTML — same layout as dispatch UI (clean white format) ═══
 const LOGO_URL = "https://firebasestorage.googleapis.com/v0/b/dbx-prod.firebasestorage.app/o/assets%2Fdbx%20logo.jpg?alt=media&token=d8372047-6d1d-470a-9f72-7352cfa4d410";
-const CA_DIV = { name:"Diamond Back Express Canada", addr:"4515 Ebenezer Rd Unit 212\nBrampton, Ontario, L6P 2K7" };
-const US_DIV = { name:"Diamond Back Express LLC",    addr:"Suite 400-K-175, 1110 Brickell Ave\nMiami, FL 33131" };
+const CA_DIV = { id:"ca", name:"Diamond Back Express Canada", addr:"4515 Ebenezer Rd Unit 212\nBrampton, Ontario, L6P 2K7" };
+const US_DIV = { id:"us", name:"Diamond Back Express LLC",    addr:"Suite 400-K-175, 1110 Brickell Ave\nMiami, FL 33131" };
 const DIVS_CF = [CA_DIV, US_DIV];
 
 function fdCF(d) { return d ? new Date(d+"T12:00:00").toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "—"; }
@@ -1279,7 +1281,7 @@ function buildBolHtmlCF(o, includePod=false, includePricing=false, client=null) 
   // Blank signature line = paper POD; show it only when no digital POD exists.
   const hasPod = !!o.podBy || ((o.delStops||[]).concat(o.pickStops||[])).some(st => st && st.pod && st.pod.by);
   const drv = { drvName:o.drvName, trkUnit:o.trkUnit, trkPlate:o.trkPlate, trlUnit:o.trlUnit, trlPlate:o.trlPlate };
-  const billingDiv = DIVS_CF.find(d=>d.id===o.divId) || DIVS_CF[0];
+  const billingDiv = DIVS_CF.find(d=>d.id===o.divId) || DIVS_CF.find(d=>d.name===o.divName) || DIVS_CF[0];
   const safeRef = typeof o.ref === "string" ? o.ref : (o.ref?.value || "");
   const p = o.price||{}; const sym = ({CAD:"$",USD:"$",EUR:"€",GBP:"£"})[p.cur||"CAD"]||"$";
   const items = (o.items||[]).filter(i=>i.desc||i.pcs||i.wt);
@@ -1542,14 +1544,97 @@ exports.sendInvoiceEmail = onRequest({ cors: true, secrets: ["GMAIL_APP_PASSWORD
       }
     }
 
+    const divLabel = order.divName || (DIVS_CF.find(d=>d.id===order.divId)||{}).name || "";
     await getTransporter().sendMail({
       from: '"DBX Dispatch" <manny@diamondbackexpress.com>', to: toEmail,
       subject: subject || `Invoice — BOL ${order.bol} — ${order.cliName || "DBX"}`,
-      html: `<h2>Invoice — BOL ${order.bol}</h2><p>${order.cliName ? `<b>Client:</b> ${order.cliName}<br>` : ""}${order.billTo ? `<b>Bill To:</b> ${order.billTo}<br>` : ""}${order.ref ? `<b>Reference #:</b> ${order.ref}<br>` : ""}${order.drvName ? `<b>Driver:</b> ${order.drvName}<br>` : ""}</p>${podHtml}${order.orderType !== "event" && p.base ? `<h3>Pricing (${p.cur || "CAD"})</h3><p>Base: ${sym}${baseAmt.toFixed(2)}${fuelPct ? `<br>Fuel (${fuelPct}%): ${sym}${fuelAmt.toFixed(2)}` : ""}${(p.other || []).filter(c => c.desc || c.amt).map(c => `<br>${c.desc || "Other"}: ${sym}${(parseFloat(c.amt) || 0).toFixed(2)}`).join("")}${taxAmt > 0 ? `<br>Tax (${taxPct}%): ${sym}${taxAmt.toFixed(2)}` : ""}</p><p><b>TOTAL: ${sym}${total.toFixed(2)} ${p.cur || "CAD"}</b></p>` : ""}${emailMsg && emailMsg.trim() ? `<div style="margin:16px 0;padding:14px 16px;background:#fff8f0;border-left:4px solid #b45309;border-radius:4px"><p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.05em">Message to Accounting</p><p style="margin:0;font-size:13px;color:#1a1a1a;white-space:pre-wrap">${emailMsg.trim()}</p></div>` : ""}<p>See attached PDF for full details.</p>${fileListHtml}<hr><p style="font-size:10px;color:#888">DBX Dispatch</p>`,
+      html: `<h2>Invoice — BOL ${order.bol}</h2>${divLabel ? `<p style="margin:2px 0 12px;font-size:15px;font-weight:700;color:#000">${divLabel}</p>` : ""}<p>${order.cliName ? `<b>Client:</b> ${order.cliName}<br>` : ""}${order.billTo ? `<b>Bill To:</b> ${order.billTo}<br>` : ""}${order.ref ? `<b>Reference #:</b> ${order.ref}<br>` : ""}${order.drvName ? `<b>Driver:</b> ${order.drvName}<br>` : ""}</p>${podHtml}${order.orderType !== "event" && p.base ? `<h3>Pricing (${p.cur || "CAD"})</h3><p>Base: ${sym}${baseAmt.toFixed(2)}${fuelPct ? `<br>Fuel (${fuelPct}%): ${sym}${fuelAmt.toFixed(2)}` : ""}${(p.other || []).filter(c => c.desc || c.amt).map(c => `<br>${c.desc || "Other"}: ${sym}${(parseFloat(c.amt) || 0).toFixed(2)}`).join("")}${taxAmt > 0 ? `<br>Tax (${taxPct}%): ${sym}${taxAmt.toFixed(2)}` : ""}</p><p><b>TOTAL: ${sym}${total.toFixed(2)} ${p.cur || "CAD"}</b></p>` : ""}${emailMsg && emailMsg.trim() ? `<div style="margin:16px 0;padding:14px 16px;background:#fff8f0;border-left:4px solid #b45309;border-radius:4px"><p style="margin:0 0 6px;font-size:10px;font-weight:700;color:#b45309;text-transform:uppercase;letter-spacing:0.05em">Message to Accounting</p><p style="margin:0;font-size:13px;color:#1a1a1a;white-space:pre-wrap">${emailMsg.trim()}</p></div>` : ""}<p>See attached PDF for full details.</p>${fileListHtml}<hr><p style="font-size:10px;color:#888">DBX Dispatch</p>`,
       attachments,
     });
     res.json({ success: true });
   } catch (error) { console.error(error); res.status(500).json({ error: error.message }); }
+});
+
+// ═══ ADMIN USER MANAGEMENT (create / list / reset password / delete / role) ═══
+// Locked to owner accounts. Powers the dispatch Admin → Users tab so logins can
+// be created/managed without opening the Firebase console. The "hide pricing"
+// role is stored as a custom claim {hidePricing:true}; the app reads it from the
+// user's ID token (no Firestore rule needed) and hides all pricing/pay surfaces.
+// The claim also lets future Firestore security rules enforce it at the data layer.
+const ADMIN_USER_EMAILS = ["manny@diamondbackexpress.com"];
+const isOwnerEmail = e => ADMIN_USER_EMAILS.map(x=>x.toLowerCase()).includes(String(e||"").toLowerCase());
+
+exports.adminUsers = onRequest({ cors: true }, async (req, res) => {
+  if (req.method !== "POST") { res.status(405).send("Method not allowed"); return; }
+  try {
+    // Verify the caller is an owner (via their Firebase ID token)
+    const authHeader = req.get("Authorization") || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : ((req.body && req.body.idToken) || "");
+    if (!idToken) { res.status(401).json({ error: "Not authenticated." }); return; }
+    let decoded;
+    try { decoded = await admin.auth().verifyIdToken(idToken); }
+    catch (e) { res.status(401).json({ error: "Invalid session — please sign in again." }); return; }
+    if (!isOwnerEmail(decoded.email)) { res.status(403).json({ error: "You are not authorized to manage users." }); return; }
+
+    const { action } = req.body || {};
+
+    if (action === "list") {
+      const result = await admin.auth().listUsers(1000);
+      const users = result.users
+        .filter(u => u.email)
+        .map(u => ({
+          uid: u.uid,
+          email: u.email,
+          disabled: u.disabled,
+          hidePricing: !!(u.customClaims && u.customClaims.hidePricing),
+          isOwner: isOwnerEmail(u.email),
+          lastSignIn: (u.metadata && u.metadata.lastSignInTime) || null,
+        }))
+        .sort((a,b) => (a.email||"").localeCompare(b.email||""));
+      res.json({ success: true, users }); return;
+    }
+
+    if (action === "create") {
+      const email = String(req.body.email || "").trim();
+      const password = String(req.body.password || "");
+      const hidePricing = !!req.body.hidePricing;
+      if (!email || password.length < 6) { res.status(400).json({ error: "Email and a password of at least 6 characters are required." }); return; }
+      const u = await admin.auth().createUser({ email, password });
+      await admin.auth().setCustomUserClaims(u.uid, { hidePricing });
+      res.json({ success: true, uid: u.uid }); return;
+    }
+
+    if (action === "resetPassword") {
+      const uid = req.body.uid;
+      const password = String(req.body.password || "");
+      if (!uid || password.length < 6) { res.status(400).json({ error: "A password of at least 6 characters is required." }); return; }
+      await admin.auth().updateUser(uid, { password });
+      res.json({ success: true }); return;
+    }
+
+    if (action === "setHidePricing") {
+      const { uid, hidePricing } = req.body;
+      if (!uid) { res.status(400).json({ error: "Missing user id." }); return; }
+      const target = await admin.auth().getUser(uid).catch(()=>null);
+      if (target && isOwnerEmail(target.email)) { res.status(400).json({ error: "Owner accounts always keep full access." }); return; }
+      await admin.auth().setCustomUserClaims(uid, { hidePricing: !!hidePricing });
+      res.json({ success: true }); return;
+    }
+
+    if (action === "delete") {
+      const uid = req.body.uid;
+      if (!uid) { res.status(400).json({ error: "Missing user id." }); return; }
+      const target = await admin.auth().getUser(uid).catch(()=>null);
+      if (target && isOwnerEmail(target.email)) { res.status(400).json({ error: "Cannot delete an owner account." }); return; }
+      await admin.auth().deleteUser(uid);
+      res.json({ success: true }); return;
+    }
+
+    res.status(400).json({ error: "Unknown action." });
+  } catch (error) {
+    console.error("[adminUsers]", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ═══ DAILY PICKUP REMINDER (runs every day at 7:00 AM ET) ═══

@@ -25,9 +25,12 @@
 // existing acrDocs / hazmatDocs convention.
 // ═══════════════════════════════════════════════════════════════════════════
 import { useState, useEffect } from "react";
-import { db } from "./firebase.js";
+import { db, auth } from "./firebase.js";
 import { doc, getDoc, setDoc } from "firebase/firestore";
-import { DEFAULT_TERMS } from "./client.config.js";
+import { DEFAULT_TERMS, CLOUD_FUNCTIONS } from "./client.config.js";
+
+const OWNER_EMAILS = ["manny@diamondbackexpress.com"];
+const isOwner = () => OWNER_EMAILS.map(e=>e.toLowerCase()).includes((auth.currentUser?.email||"").toLowerCase());
 
 const T = {
   bg: "#0a0f1a", card: "#111827", border: "#1f2937", hover: "#1a2332",
@@ -109,7 +112,7 @@ export default function AdminPage() {
       </div>
 
       <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
-        {[["fields","Custom Fields"],["columns","Report Columns"],["alerts","Alert Recipients"],["terms","Terms & Conditions"]]
+        {[["fields","Custom Fields"],["columns","Report Columns"],["alerts","Alert Recipients"],["terms","Terms & Conditions"],...(isOwner()?[["users","Users"]]:[])]
           .map(([k, l]) => (
           <button key={k} onClick={() => setTab(k)} style={{
             padding: "7px 14px", borderRadius: 6,
@@ -125,6 +128,7 @@ export default function AdminPage() {
       {tab === "columns" && <ReportColumns />}
       {tab === "alerts"  && <AlertRecipients />}
       {tab === "terms"   && <TermsEditor />}
+      {tab === "users"   && isOwner() && <UsersTab />}
     </div>
   );
 }
@@ -683,5 +687,126 @@ function TermsEditor() {
         </>
       )}
     </Section>
+  );
+}
+
+// ─── USERS (create logins, reset passwords, hide-pricing role) ──────────────
+// Owner-only. Talks to the adminUsers Cloud Function with the caller's ID token.
+function UsersTab() {
+  const [users, setUsers] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const [newHide, setNewHide] = useState(true);
+
+  const call = async (body) => {
+    const token = await auth.currentUser.getIdToken();
+    const res = await fetch(CLOUD_FUNCTIONS.adminUsers, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.success) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
+  };
+
+  const load = async () => {
+    setErr("");
+    try { const d = await call({ action: "list" }); setUsers(d.users || []); setLoaded(true); }
+    catch (e) { setErr(e.message); setLoaded(true); }
+  };
+  useEffect(() => { load(); }, []);
+
+  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(""), 3500); };
+
+  const addUser = async () => {
+    setErr("");
+    if (!email.trim() || pw.length < 6) { setErr("Enter an email and a password of at least 6 characters."); return; }
+    setBusy(true);
+    try {
+      await call({ action: "create", email: email.trim(), password: pw, hidePricing: newHide });
+      setEmail(""); setPw(""); setNewHide(true); flash("Login created ✓"); await load();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const toggleHide = async (u) => {
+    setErr(""); setBusy(true);
+    try {
+      await call({ action: "setHidePricing", uid: u.uid, hidePricing: !u.hidePricing });
+      flash("Updated ✓ — takes effect next time they sign in"); await load();
+    } catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const resetPw = async (u) => {
+    const np = window.prompt(`New password for ${u.email} (min 6 characters):`);
+    if (np == null) return;
+    if (np.length < 6) { setErr("Password must be at least 6 characters."); return; }
+    setErr(""); setBusy(true);
+    try { await call({ action: "resetPassword", uid: u.uid, password: np }); flash("Password reset ✓"); }
+    catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  const del = async (u) => {
+    if (!window.confirm(`Delete the login ${u.email}? This cannot be undone.`)) return;
+    setErr(""); setBusy(true);
+    try { await call({ action: "delete", uid: u.uid }); flash("User deleted ✓"); await load(); }
+    catch (e) { setErr(e.message); } finally { setBusy(false); }
+  };
+
+  return (
+    <div>
+      <Section title="Add a login"
+        subtitle="Creates a dispatch account. Tick “Hide pricing” for staff who shouldn’t see any pricing, invoices, or pay information.">
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div style={{ flex: "1 1 220px" }}><Field l="Email"><input style={sIn} value={email} onChange={e => setEmail(e.target.value)} placeholder="person@diamondbackexpress.com" autoComplete="off" /></Field></div>
+          <div style={{ flex: "1 1 160px" }}><Field l="Temporary Password"><input style={sIn} value={pw} onChange={e => setPw(e.target.value)} placeholder="min 6 characters" autoComplete="new-password" /></Field></div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, marginBottom: 10, cursor: "pointer" }}>
+            <input type="checkbox" checked={newHide} onChange={e => setNewHide(e.target.checked)} /> Hide pricing
+          </label>
+          <button style={{ ...bP, marginBottom: 10 }} disabled={busy} onClick={addUser}>{busy ? "Working…" : "+ Create login"}</button>
+        </div>
+        {err && <div style={{ fontSize: 11, color: T.red, marginTop: 4 }}>{err}</div>}
+        {msg && <div style={{ fontSize: 11, color: "#22c55e", marginTop: 4 }}>{msg}</div>}
+      </Section>
+
+      <Section title="Existing logins" right={<button style={bS} disabled={busy} onClick={load}>↻ Refresh</button>}>
+        {!loaded ? <div style={{ fontSize: 12, color: T.dim }}>Loading…</div>
+          : users.length === 0 ? <div style={{ fontSize: 12, color: T.dim }}>No users found.</div>
+            : <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead><tr style={{ textAlign: "left", color: T.muted, borderBottom: `1px solid ${T.border}` }}>
+                    <th style={{ padding: "6px 8px" }}>Email</th>
+                    <th style={{ padding: "6px 8px" }}>Access</th>
+                    <th style={{ padding: "6px 8px" }}>Last sign-in</th>
+                    <th style={{ padding: "6px 8px", textAlign: "right" }}>Actions</th>
+                  </tr></thead>
+                  <tbody>
+                    {users.map(u => (
+                      <tr key={u.uid} style={{ borderBottom: `1px solid ${T.border}` }}>
+                        <td style={{ padding: "7px 8px", color: T.text }}>{u.email}{u.isOwner && <span style={{ marginLeft: 6, fontSize: 9, color: "#eab308", border: "1px solid #eab308", borderRadius: 4, padding: "1px 5px" }}>OWNER</span>}</td>
+                        <td style={{ padding: "7px 8px" }}>
+                          {u.isOwner ? <span style={{ color: T.dim }}>Full</span>
+                            : <span style={{ color: u.hidePricing ? "#f59e0b" : "#22c55e", fontWeight: 600 }}>{u.hidePricing ? "No pricing" : "Full"}</span>}
+                        </td>
+                        <td style={{ padding: "7px 8px", color: T.dim, fontSize: 11 }}>{u.lastSignIn ? new Date(u.lastSignIn).toLocaleDateString() : "—"}</td>
+                        <td style={{ padding: "7px 8px", textAlign: "right", whiteSpace: "nowrap" }}>
+                          {!u.isOwner && <button style={{ ...bS, padding: "4px 9px", fontSize: 11, marginLeft: 4 }} disabled={busy} onClick={() => toggleHide(u)}>{u.hidePricing ? "Show pricing" : "Hide pricing"}</button>}
+                          <button style={{ ...bS, padding: "4px 9px", fontSize: 11, marginLeft: 4 }} disabled={busy} onClick={() => resetPw(u)}>Reset password</button>
+                          {!u.isOwner && <button style={{ ...bS, padding: "4px 9px", fontSize: 11, marginLeft: 4, color: T.red, borderColor: T.red }} disabled={busy} onClick={() => del(u)}>Delete</button>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>}
+        <div style={{ fontSize: 10, color: T.dim, marginTop: 10 }}>
+          “Hide pricing” removes Quotes, order pricing, invoicing, the revenue report, pay configuration and Timesheets for that user. It applies in the interface; it takes effect the next time they sign in.
+        </div>
+      </Section>
+    </div>
   );
 }

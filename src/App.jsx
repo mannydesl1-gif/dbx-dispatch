@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo, useRef, useEffect, lazy, Suspense } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect, lazy, Suspense, createContext, useContext } from "react";
 import { db, storage, auth } from "./firebase.js";
 import { collection, doc, getDocs, addDoc, updateDoc, deleteDoc, getDoc, setDoc, increment, onSnapshot, where, query } from "firebase/firestore";
 import { ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
@@ -12,10 +12,16 @@ const QuotesPage = lazy(() => import("./QuotesPage.jsx"));
 const LettersPage = lazy(() => import("./LettersPage.jsx"));
 const IFTAPage = lazy(() => import("./IFTAPage.jsx"));
 const AdminPage = lazy(() => import("./AdminPage.jsx"));
+const ManifestPage = lazy(() => import("./ManifestPage.jsx"));
 import { APP_NAME, APP_VERSION, COMPANY_NAME, DIVISIONS, ACCT_EMAILS as CFG_ACCT_EMAILS, REPORTS_EMAIL, CLOUD_FUNCTIONS, BOL_COMPANY_LABEL, DEFAULT_TERMS } from "./client.config.js";
 
 // ═══ CLOUD FUNCTION URLS (2nd Gen) ═══
 const CF_URLS = CLOUD_FUNCTIONS;
+
+// Hide-pricing role: true for employees flagged in Admin → Users. Provided once
+// at the app root and consumed by any component that shows pricing/pay, so we
+// don't prop-drill it everywhere. Source of truth is the user's custom claim.
+const PricingCtx = createContext(false);
 async function callCloudFn(name, data) {
   const senderEmail = auth?.currentUser?.email || "manny@diamondbackexpress.com";
   const res = await fetch(CF_URLS[name], {
@@ -893,6 +899,16 @@ export default function App() {
   // Demo mode — read-only access for prospects
   const isDemo = user?.email === "demo@cargodx.ca";
 
+  // Hide-pricing role — read from the signed-in user's custom claim (set by the
+  // adminUsers function). Owners/managers have no claim → full access.
+  const [hidePricing, setHidePricing] = useState(false);
+  useEffect(() => {
+    if (!user) { setHidePricing(false); return; }
+    user.getIdTokenResult(true)
+      .then(r => setHidePricing(!!(r.claims && r.claims.hidePricing)))
+      .catch(() => setHidePricing(false));
+  }, [user]);
+
   // App state — must be declared before any returns
   const [dbData, setDbData] = useState({ clients:[], drivers:[], trucks:[], trailers:[], locations:[], orders:[], stickers:[], events:[], nBol:2000 });
   const [pg, setPg] = useState("dashboard");
@@ -1267,7 +1283,7 @@ export default function App() {
   }).sort((a,b)=>new Date(b.created)-new Date(a.created));
 
   const cnt = s => dbData.orders.filter(o=>o.status===s).length;
-  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"cl",l:"Clients",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"eq",l:"Equipment",i:"truck"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"ts",l:"Timesheets",i:"calendar"},{id:"sf",l:"Safety",i:"shield"},{id:"ifta",l:"IFTA Fuel Tax",i:"chart"},{id:"ev",l:"Events",i:"calendar"},{id:"qt",l:"Quotes",i:"file"},{id:"lt",l:"Letters",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sr",l:"Search",i:"search"},{id:"cd",l:"Documents",i:"file"},{id:"ed",l:"Employee Docs",i:"users"},{id:"xp",l:"Expirations",i:"warn"},{id:"ad",l:"Admin",i:"settings"}];
+  const nav = [{id:"dashboard",l:"Dashboard",i:"dash"},{id:"ol",l:"Orders",i:"file"},{id:"ad",l:"Admin",i:"settings"},{id:"cl",l:"Clients",i:"users"},{id:"cd",l:"Documents",i:"file"},{id:"dr",l:"Drivers / Employees / Suppliers",i:"users"},{id:"ed",l:"Employee Docs",i:"users"},{id:"eq",l:"Equipment",i:"truck"},{id:"ev",l:"Events",i:"calendar"},{id:"xp",l:"Expirations",i:"warn"},{id:"ifta",l:"IFTA Fuel Tax",i:"chart"},{id:"lt",l:"Letters",i:"file"},{id:"cr",l:"Live Crew",i:"users"},{id:"lo",l:"Locations",i:"map"},{id:"mf",l:"Manifest",i:"file"},{id:"pp",l:"PAPS / PARS",i:"barcode"},{id:"qt",l:"Quotes",i:"file"},{id:"rp",l:"Reports",i:"chart"},{id:"sf",l:"Safety",i:"shield"},{id:"sr",l:"Search",i:"search"},{id:"ts",l:"Timesheets",i:"calendar"}].filter(n => !(hidePricing && (n.id==="qt" || n.id==="ts")));
   const isOrd = pg.startsWith("o");
 
 
@@ -1302,7 +1318,7 @@ export default function App() {
   // On mobile: show MobileApp immediately without waiting for full desktop load
   if (isMobile && user) return (
     <div style={{position:"fixed",inset:0,zIndex:99999,background:"#0f172a"}}>
-      <Suspense fallback={<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,color:T.muted,fontSize:14}}>Loading...</div>}><MobileApp db={dbData} savOrd={savOrdMobile} saveColl={saveColl} onExitMobile={()=>setIsMobile(false)}/></Suspense>
+      <Suspense fallback={<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,color:T.muted,fontSize:14}}>Loading...</div>}><MobileApp db={dbData} savOrd={savOrdMobile} saveColl={saveColl} onExitMobile={()=>setIsMobile(false)} hidePricing={hidePricing}/></Suspense>
     </div>
   );
 
@@ -1316,6 +1332,7 @@ export default function App() {
   </div>;
 
   return (
+    <PricingCtx.Provider value={hidePricing}>
     <div className="dbx-app" style={{display:"flex",flexDirection:"column",height:"100vh",fontFamily:"'IBM Plex Sans',system-ui,sans-serif",background:T["bg"],color:T.text,overflow:"hidden"}}>
       {isDemo && <div style={{background:"linear-gradient(135deg,#dc2626,#7f1d1d)",padding:"8px 20px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,zIndex:100}}>
         <div style={{fontSize:13,fontWeight:600,color:"#fff"}}>👀 Demo Mode — Read Only &nbsp;·&nbsp; <span style={{fontWeight:400,opacity:0.9}}>You're exploring CargoDX. No changes can be saved.</span></div>
@@ -1366,11 +1383,11 @@ export default function App() {
         {pg==="od" && sub && <OrderDetail o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} go={go} setStat={setStat} delOrd={delOrd} savOrd={savOrd} dupOrd={dupOrd}/>}
         {pg==="oa" && sub && <AssignOrder o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} savOrd={savOrd} go={go}/>}
         {pg==="op" && sub && <PodEntry o={dbData.orders.find(x=>x.id===sub.id)||sub} savOrd={savOrd} go={go}/>}
-        {pg==="opr" && sub && <PricingEntry o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} savOrd={savOrd} go={go}/>}
+        {pg==="opr" && sub && !hidePricing && <PricingEntry o={dbData.orders.find(x=>x.id===sub.id)||sub} db={dbData} savOrd={savOrd} go={go}/>}
         {pg==="cl" && <CrudPage title="Clients" items={dbData.clients} fields={[{k:"name",l:"Company Name"},{k:"street",l:"Street Address"},{k:"city",l:"City"},{k:"provState",l:"Province / State"},{k:"country",l:"Country"},{k:"postalZip",l:"Postal / Zip Code"},{k:"contact",l:"Contact Person"},{k:"phone",l:"Phone"},{k:"email",l:"Email"},{k:"billingEmail",l:"Billing Email"},{k:"preferredCurrency",l:"Preferred Invoicing Currency",tp:"select",opts:["","CAD","USD","EUR","GBP"]},{k:"poRequired",l:"Purchase Order",tp:"checkbox",cbLabel:"PO required before invoicing"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} save={l=>saveColl("clients",l)} orders={dbData.orders} orderKey="cliId"/>}
         {pg==="lo" && <CrudPage title="Locations" items={dbData.locations} fields={[{k:"company",l:"Company Name"},{k:"street",l:"Street Address"},{k:"city",l:"City"},{k:"provState",l:"Province / State"},{k:"country",l:"Country"},{k:"postalZip",l:"Postal / Zip Code"},{k:"distanceKm",l:"Distance from Base (km)",tp:"number"},{k:"contact",l:"Contact Person"},{k:"phone",l:"Phone"},{k:"notes",l:"Internal Notes",tp:"textarea"}]} save={l=>saveColl("locations",l)}/>}
         {pg==="dr" && <DriversPage items={dbData.drivers} save={l=>saveColl("drivers",l)} col="drivers"/>}
-        {pg==="ts" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><TimesheetsPage/></Suspense>}
+        {pg==="ts" && !hidePricing && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><TimesheetsPage/></Suspense>}
         {pg==="sf" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><SafetyPage/></Suspense>}
         {pg==="ev" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><EventsPage/></Suspense>}
         {pg==="cr" && <CrewPage fireDb={db}/>}
@@ -1378,8 +1395,9 @@ export default function App() {
         {pg==="cd" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><CompanyDocsPage/></Suspense>}
         {pg==="ed" && <EmployeeDocsPage/>}
         {pg==="rp" && <ReportsPage db={dbData} go={go}/>}
-        {pg==="qt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]} onConvertToOrder={convertQuoteToOrder}/></Suspense>}
+        {pg==="qt" && !hidePricing && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><QuotesPage clients={dbData.clients||[]} onConvertToOrder={convertQuoteToOrder}/></Suspense>}
         {pg==="lt" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><LettersPage/></Suspense>}
+        {pg==="mf" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><ManifestPage db={dbData}/></Suspense>}
         {pg==="ifta" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><IFTAPage trucks={db.trucks}/></Suspense>}
         {pg==="ad" && <Suspense fallback={<div style={{padding:20,color:T.muted,fontSize:13}}>Loading...</div>}><AdminPage/></Suspense>}
         {pg==="eq" && <EquipPage db={dbData} saveColl={saveColl}/>}
@@ -1389,9 +1407,10 @@ export default function App() {
     </div>
     {/* Mobile overlay */}
     {isMobile && <div style={{position:"fixed",top:0,left:0,right:0,bottom:0,zIndex:99999}}>
-      <Suspense fallback={<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,color:T.muted,fontSize:14}}>Loading...</div>}><MobileApp db={dbData} savOrd={savOrdMobile} saveColl={saveColl} onExitMobile={()=>setIsMobile(false)}/></Suspense>
+      <Suspense fallback={<div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",background:T.bg,color:T.muted,fontSize:14}}>Loading...</div>}><MobileApp db={dbData} savOrd={savOrdMobile} saveColl={saveColl} onExitMobile={()=>setIsMobile(false)} hidePricing={hidePricing}/></Suspense>
     </div>}
     </div>
+    </PricingCtx.Provider>
   );
 }
 
@@ -1576,6 +1595,7 @@ function BackupButton() {
 }
 
 function Dashboard({db, cnt, go, newOrd}) {
+  const hidePricing = useContext(PricingCtx);
   const [dashFilter, setDashFilter] = useState([]);
   const [divFilter, setDivFilter] = useState("all");
   const [cliFilter, setCliFilter] = useState("all");
@@ -1693,7 +1713,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}>{o.orderType==="event"&&o.eventName ? <><span style={{color:"#8b5cf6",fontWeight:600}}>{o.eventName}</span>{o.ref?<span style={{color:"#94a3b8",fontSize:10}}> · {o.ref}</span>:""}</> : o.ref||"—"}</td>
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -1708,7 +1728,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
         <td style={{padding:6,fontSize:12}}>{o.drvName||"—"}</td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -1723,7 +1743,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
         <td style={{padding:6,fontSize:12}}>{o.drvName||"—"}</td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -1738,7 +1758,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
         <td style={{padding:6,fontSize:12}}>{o.drvName||"—"}</td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -1753,7 +1773,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
         <td style={{padding:6,fontSize:11}}>{o.billingType==="no-charge"?<span style={{color:"#14b8a6",fontWeight:600}}>No Charge</span>:o.price?.base?<span style={{color:"#22c55e",fontWeight:600}}>{csym(o.price.cur)}{parseFloat(o.price.base).toFixed(2)} {o.price.cur||"CAD"}</span>:"—"}</td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -1768,7 +1788,7 @@ function Dashboard({db, cnt, go, newOrd}) {
         <td style={{padding:6,fontSize:11}}><div>{o.pickCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.pickDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><div>{o.delCo||"—"}</div><div style={{fontSize:11,color:T.text}}>{fd(o.delDate)}</div></td>
         <td style={{padding:6,fontSize:11}}><span style={{color:"#14b8a6",fontWeight:600}}>No Charge</span></td>
-        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{o.price?.pricingNotes||""}</td>
+        <td style={{padding:6,fontSize:11,fontWeight:600,color:"#f97316"}}>{hidePricing?"":(o.price?.pricingNotes||"")}</td>
         <td style={{padding:6}}><Badge s={o.status} billingType={o.billingType} poRequired={o.poRequired} poNumber={o.poNumber} orderType={o.orderType}/></td>
       </tr>}/>
     </DashSection>}
@@ -3538,7 +3558,7 @@ function PricingEntry({o:io, db, savOrd, go}) {
             adjLabel: p.adjLabel||"Adjustment", adjAmount, grand,
             fxDate: snapDate, multi: evtCurrenciesUsed().length>1,
             rates: snapRates, rateBase: "USD", cur: p.cur || "CAD",
-            locked: isLocked || undefined, lockedAt: isLocked ? (priorSnap.lockedAt || priorSnap.fxDate) : undefined,
+            ...(isLocked ? { locked: true, lockedAt: priorSnap.lockedAt || priorSnap.fxDate } : {}),
             applies: (Object.keys(byCur).length > 1) || (adjVal !== 0)
               || (Object.keys(byCur).length === 1 && Object.keys(byCur)[0] !== target),
           };
@@ -4000,6 +4020,7 @@ function DispatchNotesCard({o, savOrd}) {
 
 // ═══ ORDER DETAIL ═══
 function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
+  const hidePricing = useContext(PricingCtx);
   const [sending, setSending] = useState(false);
   const [showEmailModal, setShowEmailModal] = useState(false);
   const [showReasonModal, setShowReasonModal] = useState(false);
@@ -4135,9 +4156,9 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         return allDrv.map((d,i)=><span key={i} style={{display:"inline-flex",gap:4,flexWrap:"wrap"}}>
           {hasMulti && <span style={{fontSize:10,color:T.muted,alignSelf:"center",whiteSpace:"nowrap"}}>{d.drvName||`Driver ${i+1}`}:</span>}
           <button style={bS} onClick={()=>downloadBolPdf(o,div,false,false,i,cli)}><Ic n="pdf" s={13}/> PDF</button>
-          {hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,false,true,i,cli)}><Ic n="pdf" s={13}/> +Price</button>}
+          {!hidePricing && hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,false,true,i,cli)}><Ic n="pdf" s={13}/> +Price</button>}
           {hasAnyPod && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,false,i,cli)}><Ic n="pdf" s={13}/> +POD</button>}
-          {hasAnyPod && hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,true,i,cli)}><Ic n="pdf" s={13}/> +POD+Price</button>}
+          {!hidePricing && hasAnyPod && hasAnyPricing && <button style={bS} onClick={()=>downloadBolPdf(o,div,true,true,i,cli)}><Ic n="pdf" s={13}/> +POD+Price</button>}
         </span>);
       })()}
       <button style={bS} onClick={()=>go("oe",{o:{...o,items:[...o.items.map(i=>({...i}))]},mode:"edit"})}><Ic n="edit" s={13}/> Edit</button>
@@ -4146,8 +4167,8 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
       {o.status==="unassigned" && <>
         {!isEvent && <button style={{...sBtn,background:"#3b82f6"}} onClick={()=>go("oa",o)}><Ic n="truck" s={13}/> Assign</button>}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="edit" s={13}/> Enter POD</button>}
-        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
-        {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
+        {!isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
+        {isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#f59e0b",color:"#000"}} onClick={()=>confirmStatus("assigned",`Mark BOL ${o.bol} as In Progress?`)}>▶ In Progress</button>}
       </>}
 
@@ -4157,8 +4178,8 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         {!isEvent && <button style={{...sBtn,background:"#8b5cf6"}} onClick={()=>confirmStatus("in-transit",`Move BOL ${o.bol} to In Transit?`)}>In Transit</button>}
         {!isEvent && allOrderDrivers.map((d,i)=><button key={i} style={bS} disabled={sending} onClick={()=>emailDriver(i)}><Ic n="mail" s={13}/> Email {allOrderDrivers.length>1?d.drvName||`Driver ${i+1}`:"Driver"}</button>)}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="edit" s={13}/> Enter POD</button>}
-        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
-        {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
+        {!isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
+        {isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#f97316"}} onClick={()=>confirmStatus("ready-to-bill",`Mark BOL ${o.bol} as Ready to Bill?`)}>Ready to Bill</button>}
       </>}
 
@@ -4173,8 +4194,8 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         }}>Ready to Bill</button>}
         {!isEvent && <button style={bS} onClick={()=>go("op",o)}><Ic n="check" s={13}/> {o.podBy?"Edit POD":"Enter POD"}</button>}
         {!isEvent && allOrderDrivers.map((d,i)=><button key={i} style={bS} disabled={sending} onClick={()=>emailDriver(i)}><Ic n="mail" s={13}/> {allOrderDrivers.length>1?`Email ${d.drvName||`Driver ${i+1}`}`:"Email Driver"}</button>)}
-        {!isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
-        {isEvent && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
+        {!isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {hasAnyPricing?"Edit Pricing":"+ Add Pricing"}</button>}
+        {isEvent && !hidePricing && <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> {o.price?.base?"Edit Pricing":"+ Add Pricing"}</button>}
         {isEvent && <button style={{...sBtn,background:"#0ea5e9"}} onClick={()=>confirmStatus("ready-to-bill",`Mark BOL ${o.bol} as Ready to Bill?`)}>Ready to Bill</button>}
       </>}
 
@@ -4204,9 +4225,9 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
       </>}
 
       {/* CLOSED */}
-      {o.status==="closed" && o.billingType!=="no-charge" && <button style={{...sBtn,background:"#0ea5e9",color:"#fff",border:"none"}} onClick={()=>setShowInvoicedModal(true)}><Ic n="check" s={13}/> Mark as Invoiced</button>}
-      {o.status==="invoiced" && <button onClick={()=>setShowInvoicedModal(true)} style={{padding:"6px 12px",borderRadius:6,background:"rgba(14,165,233,0.1)",color:"#0ea5e9",fontSize:11,fontWeight:600,border:"1px solid #0ea5e9",cursor:"pointer",fontFamily:"inherit"}}>✓ Invoiced{o.invoiceNum?" — #"+o.invoiceNum:""}{o.invoiceDate?" on "+o.invoiceDate:""} ✎</button>}
-      {(o.status==="closed"||o.status==="invoiced") && o.billingType!=="no-charge" && (()=>{
+      {!hidePricing && o.status==="closed" && o.billingType!=="no-charge" && <button style={{...sBtn,background:"#0ea5e9",color:"#fff",border:"none"}} onClick={()=>setShowInvoicedModal(true)}><Ic n="check" s={13}/> Mark as Invoiced</button>}
+      {!hidePricing && o.status==="invoiced" && <button onClick={()=>setShowInvoicedModal(true)} style={{padding:"6px 12px",borderRadius:6,background:"rgba(14,165,233,0.1)",color:"#0ea5e9",fontSize:11,fontWeight:600,border:"1px solid #0ea5e9",cursor:"pointer",fontFamily:"inherit"}}>✓ Invoiced{o.invoiceNum?" — #"+o.invoiceNum:""}{o.invoiceDate?" on "+o.invoiceDate:""} ✎</button>}
+      {!hidePricing && (o.status==="closed"||o.status==="invoiced") && o.billingType!=="no-charge" && (()=>{
         const p = o.price||{};
         if(!hasAnyPricing) return null;
         return <button style={{...sBtn,background:"#00B5D8",color:"#fff",border:"none"}} onClick={()=>{
@@ -4218,7 +4239,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
         }}>🔗 Xero</button>;
       })()}
       {["closed","invoiced","no-charge"].includes(o.status) && <>
-        {o.billingType!=="no-charge" && o.status!=="no-charge" && <>
+        {!hidePricing && o.billingType!=="no-charge" && o.status!=="no-charge" && <>
           <button style={bS} onClick={()=>go("opr",o)}><Ic n="dollar" s={13}/> Edit Pricing</button>
           <button style={{...sBtn,background:"#06b6d4"}} disabled={sending} onClick={()=>setShowEmailModal(true)}><Ic n="mail" s={13}/> {sending?"Sending...":"Email Accounting"}</button>
         </>}
@@ -4310,7 +4331,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
     {o.podBy && <div style={{...sCrd,borderColor:"#22c55e"}}><div style={{fontSize:10,fontWeight:600,color:"#22c55e",textTransform:"uppercase",marginBottom:4}}>Proof of Delivery</div><div style={{fontSize:12}}>Received by: <strong>{o.podBy}</strong> — {fd(o.podDate)} {o.podTime}</div>{o.podNote&&<div style={{fontSize:11,color:T.muted,marginTop:4}}>Note: {o.podNote}</div>}</div>}
     {o.noInvoiceReason && !["ready-to-bill","closed"].includes(o.status) || (o.noInvoiceReason && o.status==="closed" && o.billingType==="no-charge") ? <div style={{...sCrd,borderColor:"#eab308"}}><div style={{fontSize:10,fontWeight:600,color:"#eab308",textTransform:"uppercase",marginBottom:4}}>No Charge Reason</div><div style={{fontSize:12}}>{o.noInvoiceReason}</div></div> : null}
 
-    {(p.base||isEvent) && (parseFloat(p.base)>0 || (p.eventLines||[]).some(l=>l.desc||parseFloat(l.unitPrice)>0)) && <div style={{...sCrd,borderColor:"#dc2626"}}>
+    {!hidePricing && (p.base||isEvent) && (parseFloat(p.base)>0 || (p.eventLines||[]).some(l=>l.desc||parseFloat(l.unitPrice)>0)) && <div style={{...sCrd,borderColor:"#dc2626"}}>
       <div style={{fontSize:10,fontWeight:600,color:"#dc2626",textTransform:"uppercase",marginBottom:8}}>Pricing ({p.cur||"CAD"})</div>
       {(()=>{
         const baseAmt=parseFloat(p.base)||0;
@@ -4449,13 +4470,13 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
       }
     </div>
   </div>
-  {showEmailModal && <AccountingEmailModal
+  {showEmailModal && !hidePricing && <AccountingEmailModal
     showCsvOption={!!(p.base && parseFloat(p.base)>0) || (p.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0) || (p.eventLines||[]).some(l=>l.desc&&parseFloat(l.unitPrice)>0) || ((o.pickStops||[]).concat(o.delStops||[])).some(st=>st&&st.price&&(parseFloat(st.price.base)>0||(st.price.other||[]).some(c=>c.desc||parseFloat(c.amt)>0||parseFloat(c.unitPrice)>0)))}
     onSend={async(emails,msg,attachCsv)=>{setShowEmailModal(false);await emailAcctFromDetail(emails,msg,attachCsv);if(["ready-to-bill","pod-received","completed","completed-noinvoice"].includes(o.status)){await savOrd({...o,status:"closed",billingType:"invoiced"});go("ol",null,{highlightBol:o.bol});}}}
     onSkipEmail={async()=>{setShowEmailModal(false);await savOrd({...o,status:"closed",billingType:"invoiced"});go("ol",null,{highlightBol:o.bol});}}
     onCancel={()=>setShowEmailModal(false)}
   />}
-  {showInvoicedModal && <InvoicedModal
+  {showInvoicedModal && !hidePricing && <InvoicedModal
     initNum={o.invoiceNum||""}
     initDate={o.invoiceDate||""}
     clientBillingEmail={db.clients.find(c=>c.id===o.cliId)?.billingEmails || (db.clients.find(c=>c.id===o.cliId)?.billingEmail ? [db.clients.find(c=>c.id===o.cliId).billingEmail] : [])}
@@ -5267,6 +5288,7 @@ function cfColsFor(defs, target) {
 
 // ═══ DRIVERS PAGE (with certifications + expiry tracking) ═══
 function DriversPage({items, save, col}) {
+  const hidePricing = useContext(PricingCtx);
   const [ed, setEd] = useState(null);
   const [fm, setFm] = useState({});
   const [pinSaved, setPinSaved] = useState(false);
@@ -5300,7 +5322,7 @@ function DriversPage({items, save, col}) {
   const fH = k => fieldHidden(layout, k);
 
   const normalizePhone = p => (p||"").replace(/[\s\-().+]/g,"");
-  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", conductDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", certSnooze:{}, logRestricted:false, driverLog:false, archived:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], conductDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
+  const startNew = () => { setFm({ name:"", phone:"", email:"", license:"", isDriver:true, isEmployee:false, isSupplier:false, contactPerson:"", street:"", city:"", provState:"", postalZip:"", country:"", serviceType:"", acrDate:"", hazmatDate:"", crimDate:"", bgDate:"", conductDate:"", licenseExpiry:"", alertsMuted:false, alertsMutedUntil:"", alertsMutedReason:"", certSnooze:{}, logRestricted:false, driverLog:false, tsBulkEntry:false, archived:false, acrDocs:[], hazmatDocs:[], crimDocs:[], bgDocs:[], conductDocs:[], licenseDocs:[], docs:[], employeeId:"", pin:"" }); setEd("new"); setTimeout(() => formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100); };
   const startEdit = item => {
     setCertsOpen(false);
     setFm({ ...item, acrDocs:item.acrDocs||[], hazmatDocs:item.hazmatDocs||[], crimDocs:item.crimDocs||[], bgDocs:item.bgDocs||[], conductDocs:item.conductDocs||[], licenseDocs:item.licenseDocs||[], docs:item.docs||[] });
@@ -5642,7 +5664,7 @@ function DriversPage({items, save, col}) {
         </div>
       </div>
 
-      {/* Pay Configuration */}
+      {!hidePricing && <>{/* Pay Configuration */}
       <div style={{borderTop:`1px solid ${T.border}`,paddingTop:12,marginTop:4,marginBottom:12}}>
         <div style={{fontSize:10,fontWeight:600,color:"#22c55e",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:10}}>💰 Pay Configuration</div>
         <div style={{fontSize:11,color:T.dim,marginBottom:12}}>Default pay rates for timesheets. Can be overridden per event in the Timesheets page.</div>
@@ -5691,6 +5713,7 @@ function DriversPage({items, save, col}) {
           </div>
         <button style={{...bP,padding:"5px 14px",fontSize:10,marginTop:4}} disabled={saving} onClick={doSaveStay}>{saving?"Saving...":"Save Pay Config"}</button>
       </div>
+      </>}
 
       {!fm.isSupplier && <div style={{ borderTop: `1px solid ${T.border}`, marginTop: 14, paddingTop: 12 }}>
         <div style={{ fontSize: 11, fontWeight: 700, color: T.muted, textTransform: "uppercase", marginBottom: 8 }}>Portal Access</div>
@@ -5713,6 +5736,15 @@ function DriversPage({items, save, col}) {
           <div style={{ fontSize: 10, color: T.dim, marginTop: 4, marginLeft: 24 }}>
             In the daily log, hides the Expenses and Summary steps so this person only sees Registration
             and the clock in/out. Everything else in their portal stays the same.
+          </div>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: T.text, cursor: "pointer", marginTop: 12 }}>
+            <input type="checkbox" checked={fm.tsBulkEntry === true} style={{ accentColor: "#16a34a" }}
+              onChange={e => setFm(p => ({ ...p, tsBulkEntry: e.target.checked }))} />
+            <span style={{ fontWeight: 600 }}>Timesheet bulk entry (supervisor)</span>
+          </label>
+          <div style={{ fontSize: 10, color: T.dim, marginTop: 4, marginLeft: 24 }}>
+            Lets this person enter timesheet entries for a whole crew at once in the timesheet app
+            (Hours, Per Diem, Working Day, etc.). Takes effect next time they open the app.
           </div>
           <button style={{ ...bP, padding: "5px 14px", fontSize: 10, marginTop: 8 }} disabled={saving} onClick={doSaveStay}>
             {saving ? "Saving..." : "Save Portal Access"}
@@ -5909,7 +5941,7 @@ function DriversPage({items, save, col}) {
           )) && <div style={{fontSize:10,marginTop:4,padding:"3px 8px",borderRadius:5,background:"rgba(239,68,68,0.08)",border:"1px solid rgba(239,68,68,0.3)",color:"#ef4444",display:"inline-block"}}>
             ⚠️ Possible duplicate
           </div>}
-          {!item.isSupplier && item.payCfg && <div style={{fontSize:10,marginTop:4,padding:"3px 8px",borderRadius:5,background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.3)",color:"#22c55e",display:"inline-block"}}>
+          {!hidePricing && !item.isSupplier && item.payCfg && <div style={{fontSize:10,marginTop:4,padding:"3px 8px",borderRadius:5,background:"rgba(34,197,94,0.08)",border:"1px solid rgba(34,197,94,0.3)",color:"#22c55e",display:"inline-block"}}>
             💰 {(() => {
                 const cfg = item.payCfg;
                 const parts = [];
@@ -7760,7 +7792,8 @@ function MaintenanceReport({ db: data }) {
 }
 
 function ReportsPage({db, go}) {
-  const [rptView, setRptView] = useState("orders"); // orders | roster
+  const hidePricing = useContext(PricingCtx);
+  const [rptView, setRptView] = useState(hidePricing?"roster":"orders"); // orders | roster
   const [period, setPeriod] = useState("month"); // day, week, month, year, custom, all
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
@@ -8067,14 +8100,14 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
 
   return <div style={{ padding: 20 }}>
     <PageHdr title="Reports">
-      {rptView==="orders" && <>
+      {rptView==="orders" && !hidePricing && <>
         <button style={bP} onClick={()=>downloadReport("csv")}><Ic n="dl" s={14}/> CSV</button>
         <button style={{...bP,background:"#7c3aed"}} onClick={()=>downloadReport("pdf")}><Ic n="pdf" s={14}/> PDF</button>
       </>}
     </PageHdr>
 
     <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
-      {[["orders","Orders & Revenue"],["roster","Equipment & Roster"],["maintenance","Maintenance & Repairs"]].map(([k,l])=>
+      {[["orders","Orders & Revenue"],["roster","Equipment & Roster"],["maintenance","Maintenance & Repairs"]].filter(([k])=>!(hidePricing&&k==="orders")).map(([k,l])=>
         <button key={k} onClick={()=>setRptView(k)} style={{padding:"6px 14px",borderRadius:6,
           background:rptView===k?T.border:"transparent",border:`1px solid ${rptView===k?"#334155":T.border}`,
           color:rptView===k?T.text:T.muted,fontSize:12,cursor:"pointer",fontFamily:"inherit",
@@ -8083,7 +8116,7 @@ ${pricedOrders.length>0?`<h3>Order Details</h3><table><thead><tr><th>BOL</th><th
 
     {rptView==="roster" && <RosterEquipReports db={db}/>}
     {rptView==="maintenance" && <MaintenanceReport db={db}/>}
-    {rptView==="orders" && <>
+    {rptView==="orders" && !hidePricing && <>
 
     {/* Filters row 1 — Period */}
     <div style={filterBox}>
