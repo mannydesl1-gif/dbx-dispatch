@@ -177,6 +177,14 @@ async function uploadFile(file, folder) {
   return { name: file.name, type: file.type, url, path };
 }
 
+// Files attached to invoice / accounting emails: the order's attachments plus any
+// POD documents (hard-copy POD scans etc.), the latter prefixed "POD - " so accounting
+// can tell them apart.
+const orderFilesForEmail = (o) => [
+  ...(o.files || []).map(f => ({ name: f.name, url: f.url || f.data })),
+  ...(o.podFiles || []).map(f => ({ name: `POD - ${f.name}`, url: f.url })),
+];
+
 // ═══ FX: live rate fetch + snapshot builder (module-level so invoice-time can
 // recompute today's rate, matching the in-editor pricing logic exactly) ═══
 async function fetchFxRatesLive() {
@@ -2809,25 +2817,80 @@ function PodEntry({o:io, savOrd, go}) {
   const setStopPod=(i,k,v)=>setO(p=>{const arr=[...(p[podSide]||[])]; arr[i]={...arr[i],pod:{...(arr[i].pod||{}),[k]:v}}; return {...p,[podSide]:arr};});
   const stampNow=(i)=>setO(p=>{const arr=[...(p[podSide]||[])]; arr[i]={...arr[i],pod:{...(arr[i].pod||{}),date:arr[i].pod?.date||td(),time:tn()}}; return {...p,[podSide]:arr};});
 
+  // ── POD documents (hard-copy POD scans, photos, any related file) ──
+  // Uploaded straight to Storage; saved on the order (podFiles) when the POD is submitted/saved.
+  // Cancel deletes files uploaded in this visit; removing a saved file only deletes it on save.
+  const [podUploading,setPodUploading] = useState(false);
+  const [newPaths,setNewPaths] = useState([]);       // uploaded this visit (not saved yet)
+  const [removed,setRemoved] = useState([]);         // saved files the user removed
+  const addPodFiles = async (fileList) => {
+    const files = Array.from(fileList||[]); if (!files.length) return;
+    setPodUploading(true);
+    try {
+      for (const file of files) {
+        if (file.size > 25*1024*1024) { alert(`"${file.name}" is over 25 MB — skipped.`); continue; }
+        const r = await uploadFile(file, `orders/${io.id||"new"}/pod`);
+        const rec = { ...r, uploadedAt: new Date().toISOString() };
+        setO(p => ({ ...p, podFiles: [...(p.podFiles||[]), rec] }));
+        setNewPaths(p => [...p, r.path]);
+      }
+    } catch (e) { console.error(e); alert("Upload failed: " + e.message); }
+    setPodUploading(false);
+  };
+  const removePodFile = (idx) => {
+    const f = (o.podFiles||[])[idx]; if (!f) return;
+    if (!window.confirm(`Remove "${f.name}"?`)) return;
+    if (newPaths.includes(f.path)) { deleteObject(storageRef(storage, f.path)).catch(()=>{}); setNewPaths(p=>p.filter(x=>x!==f.path)); }
+    else setRemoved(p => [...p, f]);
+    setO(p => ({ ...p, podFiles: (p.podFiles||[]).filter((_,j)=>j!==idx) }));
+  };
+  const finishPod = async (orderToSave) => {
+    for (const f of removed) { if (f.path) { try { await deleteObject(storageRef(storage, f.path)); } catch {} } }
+    savOrd(orderToSave);
+  };
+  const cancelPod = async () => {
+    for (const p of newPaths) { try { await deleteObject(storageRef(storage, p)); } catch {} }
+    go("od", { ...o, podFiles: io.podFiles || [] });
+  };
+  const podDocs = (
+    <div style={{...sCrd, marginTop:10}}>
+      <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:6}}>POD documents <span style={{textTransform:"none",fontWeight:400}}>— signed hard copy, photos, any related file · sent with the invoice to accounting</span></div>
+      <label onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault(); addPodFiles(e.dataTransfer.files);}}
+        style={{display:"block",border:`1.5px dashed ${T.border}`,borderRadius:8,padding:"14px 10px",textAlign:"center",fontSize:12,color:T.muted,cursor:podUploading?"wait":"pointer"}}>
+        <input type="file" multiple style={{display:"none"}} disabled={podUploading} onChange={e=>{ addPodFiles(e.target.files); e.target.value=""; }}/>
+        {podUploading ? "Uploading…" : <>📎 <b style={{color:T.text}}>Click to choose</b> or drop files here <span style={{opacity:0.7}}>(PDF, photo, any type · max 25 MB each)</span></>}
+      </label>
+      {(o.podFiles||[]).map((f,i)=>(
+        <div key={f.path||i} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 10px",background:T.surface,borderRadius:6,marginTop:6,fontSize:12}}>
+          <Ic n="file" s={13}/>
+          <a href={f.url} target="_blank" rel="noopener noreferrer" style={{flex:1,minWidth:0,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",color:T.text,textDecoration:"none"}}>{f.name}</a>
+          <a href={f.url} target="_blank" rel="noopener noreferrer" style={{fontSize:11,color:T.muted}}>View</a>
+          <button onClick={()=>removePodFile(i)} style={{background:"none",border:"none",color:"#ef4444",cursor:"pointer",fontSize:11}}>Remove</button>
+        </div>
+      ))}
+    </div>
+  );
+
   if(!isMultiStop) {
     return <div style={{padding:20,maxWidth:500}}>
-      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}><button onClick={()=>go("od",o)} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",display:"flex"}}><Ic n="back"/></button><h1 style={{fontSize:18,fontWeight:700,margin:0}}>POD — BOL {o.bol}</h1></div>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:16}}><button onClick={cancelPod} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",display:"flex"}}><Ic n="back"/></button><h1 style={{fontSize:18,fontWeight:700,margin:0}}>POD — BOL {o.bol}</h1></div>
       <div style={sCrd}>
         <Field l="Received By (Name)"><input style={sIn} value={o.podBy} onChange={e=>set("podBy",e.target.value)} placeholder="Full name"/></Field>
         <Field l="Date Received"><DatePicker value={o.podDate} onChange={v=>set("podDate",v)} placeholder="Select date received..."/></Field>
         <Field l="Time Received"><input style={sIn} type="time" value={o.podTime} onChange={e=>set("podTime",e.target.value)}/></Field>
         <div style={{display:"flex",gap:8,marginTop:12}}>
-          <button style={{...sBtn,background:"#22c55e"}} onClick={()=>savOrd({...o,status:"ready-to-bill"})}><Ic n="check" s={13}/> Submit POD</button>
-          <button style={bS} onClick={()=>go("od",o)}>Cancel</button>
+          <button style={{...sBtn,background:"#22c55e",opacity:podUploading?0.6:1}} disabled={podUploading} onClick={()=>finishPod({...o,status:"ready-to-bill"})}><Ic n="check" s={13}/> Submit POD</button>
+          <button style={bS} onClick={cancelPod}>Cancel</button>
         </div>
       </div>
+      {podDocs}
     </div>;
   }
 
   const stops = o[podSide]||[];
   const doneCount = stops.filter(s=>s.pod?.by).length;
   return <div style={{padding:20,maxWidth:560}}>
-    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><button onClick={()=>go("od",o)} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",display:"flex"}}><Ic n="back"/></button><h1 style={{fontSize:18,fontWeight:700,margin:0}}>POD — BOL {o.bol}</h1></div>
+    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}><button onClick={cancelPod} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",display:"flex"}}><Ic n="back"/></button><h1 style={{fontSize:18,fontWeight:700,margin:0}}>POD — BOL {o.bol}</h1></div>
     <div style={{fontSize:12,color:T.muted,marginBottom:14}}>Enter proof of delivery for each stop. <b style={{color:doneCount===stops.length?"#22c55e":T.text}}>{doneCount} of {stops.length}</b> recorded.</div>
     {stops.map((s,i)=>{
       const done=!!s.pod?.by;
@@ -2844,9 +2907,10 @@ function PodEntry({o:io, savOrd, go}) {
         <button style={{...bS,marginTop:4,fontSize:11}} onClick={()=>stampNow(i)}>Stamp now</button>
       </div>;
     })}
+    {podDocs}
     <div style={{display:"flex",gap:8,marginTop:6}}>
-      <button style={{...sBtn,background:"#22c55e"}} onClick={()=>savOrd({...o})}><Ic n="check" s={13}/> Save POD</button>
-      <button style={bS} onClick={()=>go("od",o)}>Cancel</button>
+      <button style={{...sBtn,background:"#22c55e",opacity:podUploading?0.6:1}} disabled={podUploading} onClick={()=>finishPod({...o})}><Ic n="check" s={13}/> Save POD</button>
+      <button style={bS} onClick={cancelPod}>Cancel</button>
     </div>
     <div style={{fontSize:11,color:T.muted,marginTop:10}}>Saving POD does not change the order status — move to Ready to Bill from the order screen when you decide.</div>
   </div>;
@@ -3157,7 +3221,7 @@ function PricingEntry({o:io, db, savOrd, go}) {
           client: cli ? { name:cli.name||"", street:cli.street||"", city:cli.city||"", provState:cli.provState||"", postalZip:cli.postalZip||"", country:cli.country||"", email:cli.billingEmail||cli.email||"" } : null,
           toEmail: email,
           subject: `Invoice — BOL ${o.bol} — ${o.cliName}`,
-          orderFiles: (o.files||[]).map(f=>({name:f.name, url:f.url||f.data})),
+          orderFiles: orderFilesForEmail(o),
           emailMsg: message,
           xeroCSVBase64,
           xeroCSVFilename: `Xero_BOL${o.bol}.csv`,
@@ -4122,7 +4186,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
           } : null,
           toEmail: email,
           subject: `Invoice — BOL ${o.bol} — ${o.cliName}`,
-          orderFiles: (o.files||[]).map(f=>({name:f.name, url:f.url||f.data})),
+          orderFiles: orderFilesForEmail(o),
           emailMsg: message,
           xeroCSVBase64,
           xeroCSVFilename: `Xero_BOL${o.bol}.csv`,
@@ -4455,6 +4519,14 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
     </div>}
     {!isEvent && o.notes && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:4}}>Notes</div><div style={{fontSize:12,whiteSpace:"pre-line"}}>{o.notes}</div></div>}
 
+    {((o.podFiles||[]).length>0 || hasAnyPod) && <div style={sCrd} className="no-print">
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+        <div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase"}}>POD documents{(o.podFiles||[]).length ? ` (${o.podFiles.length})` : ""}</div>
+        <button onClick={()=>go("op",o)} style={{background:"none",border:"none",color:T.muted,cursor:"pointer",fontSize:11,fontWeight:600}}>{(o.podFiles||[]).length ? "Add / manage" : "+ Upload POD document"}</button>
+      </div>
+      {(o.podFiles||[]).length>0 && <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{o.podFiles.map((a,i)=><a key={i} href={a.url} target="_blank" rel="noopener noreferrer" title="Open" style={{padding:"4px 8px",background:T["bg"],borderRadius:5,fontSize:11,display:"flex",alignItems:"center",gap:4,color:T.text,textDecoration:"none"}}><Ic n="file" s={11}/>{a.name}</a>)}</div>}
+    </div>}
+
     {(o.files||[]).length>0 && <div style={sCrd}><div style={{fontSize:10,fontWeight:600,color:T.muted,textTransform:"uppercase",marginBottom:4}}>Attachments</div>
       <div style={{display:"flex",flexWrap:"wrap",gap:6}}>{o.files.map((a,i)=><a key={i} href={a.url||a.data} download={a.name} target="_blank" rel="noopener noreferrer" style={{padding:"4px 8px",background:T["bg"],borderRadius:5,fontSize:11,display:"flex",alignItems:"center",gap:4,color:T.text,textDecoration:"none"}}><Ic n="dl" s={11}/>{a.name}</a>)}</div></div>}
 
@@ -4497,7 +4569,7 @@ function OrderDetail({o, db, go, setStat, delOrd, savOrd, dupOrd}) {
               client:db.clients.find(c=>c.id===o.cliId)||null,
               toEmail:email,
               subject:`Invoice — BOL ${o.bol} — ${o.cliName}`,
-              orderFiles:(o.files||[]).map(f=>({name:f.name,url:f.url||f.data})),
+              orderFiles:orderFilesForEmail(o),
               xeroInvoiceUrl:xeroUrl||null,
               xeroInvoiceFileName:xeroFileName||null,
               emailMsg:emailMsg||"",
